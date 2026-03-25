@@ -1,0 +1,29 @@
+services:
+  agent:
+    build:
+      context: ../..
+      dockerfile: sandbox_agent/docker/Dockerfile
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=100M
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - agent_data:/app/data
+    ports:
+      - "7860:7860"
+    environment:
+      - TOOLS_API_BASE=http://host.docker.internal:8080
+      - VLLM_BASE=http://192.168.4.66:8000/v1
+      - OLLAMA_BASE=http://192.168.4.88:11434/v1
+      - DATA_DIR=/app/data
+      - HEARTBEAT_INTERVAL_SECONDS=1800
+      - QWEN_AGENT_DEFAULT_WORKSPACE=/app/data/workspace
+      - GRADIO_SERVER_TIMEOUT=3600
+
+volumes:
+  agent_data:

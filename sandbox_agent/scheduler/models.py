@@ -1,0 +1,46 @@
+"""Pydantic models for the task scheduling system."""
+
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+
+class Task(BaseModel):
+    """A scheduled task with support for one-shot, interval, and cron scheduling."""
+
+    id: str
+    name: str
+    description: str
+
+    # Schedule type (OpenClaw-style)
+    schedule_type: Literal["at", "every", "cron"] = "at"
+    cron: Optional[str] = None             # cron expression (e.g., "*/30 * * * *")
+    interval_seconds: Optional[int] = None  # for "every" type
+    run_at: Optional[datetime] = None       # for "at" type (one-shot)
+    next_run: Optional[datetime] = None     # computed next execution time
+
+    # Project scope (optional — None means global task)
+    project: Optional[str] = None
+
+    # Dependencies
+    depends_on: List[str] = Field(default_factory=list)
+
+    # Status
+    status: Literal["pending", "running", "completed", "failed"] = "pending"
+    result: Optional[str] = None
+    priority: int = 0  # higher = more urgent
+
+    # Long-running task support
+    total_steps: Optional[int] = None
+    current_step: int = 0
+    checkpoint: Optional[Dict[str, Any]] = None
+
+    # Retry with exponential backoff (OpenClaw pattern)
+    retry_count: int = 0
+    max_retries: int = 3
+    last_error: Optional[str] = None
+
+    # Timestamps
+    created_at: datetime = Field(default_factory=datetime.now)
+    updated_at: Optional[datetime] = None
