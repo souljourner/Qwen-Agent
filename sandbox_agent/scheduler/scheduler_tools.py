@@ -247,3 +247,34 @@ class UpdateTaskCheckpoint(BaseTool):
             "task_id": task_id,
             "step": step,
         }, ensure_ascii=False)
+
+
+@register_tool("cancel_task")
+class CancelTask(BaseTool):
+    """Cancel a task permanently — removes it from the queue."""
+
+    name = "cancel_task"
+    description = (
+        "Cancel and remove a task from the queue. Works for both one-shot and recurring tasks. "
+        "Use this to stop recurring cron/interval tasks that are no longer needed."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "The task ID to cancel.",
+            },
+        },
+        "required": ["task_id"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        tq = get_task_queue()
+        task = tq.get_task(params["task_id"])
+        if not task:
+            return json.dumps({"error": f"Task {params['task_id']} not found"})
+        name = task.name
+        tq.remove_task(params["task_id"])
+        return json.dumps({"status": "cancelled", "task_id": params["task_id"], "name": name})

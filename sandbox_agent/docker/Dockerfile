@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libsndfile1 git
 COPY setup.py README.md /app/Qwen-Agent/
 COPY qwen_agent/ /app/Qwen-Agent/qwen_agent/
 RUN pip install --no-cache-dir "/app/Qwen-Agent[gui]" croniter numpy soundfile \
-    ipykernel jupyter_client pandas requests Pillow
+    ipykernel jupyter_client pandas requests Pillow beautifulsoup4 lxml
 
 # Copy sandbox_agent
 COPY sandbox_agent/ /app/sandbox_agent/

@@ -1,6 +1,8 @@
 """Custom tools that call the local API on port 8080 for web search, URL fetch, and stock data."""
 
 import json
+import threading
+import time
 from typing import Union
 
 import requests
@@ -12,6 +14,22 @@ from sandbox_agent.tools.sanitizer import sanitize_web_content
 
 # Timeout for API calls to port 8080 (seconds)
 API_TIMEOUT = 120
+
+# Brave Search rate limit: 1 request per second
+_brave_search_lock = threading.Lock()
+_brave_search_last_call = 0.0
+BRAVE_SEARCH_MIN_INTERVAL = 2.0  # seconds (Brave Search rate limit)
+
+
+def _rate_limit_brave_search():
+    """Enforce 1 request/second rate limit for Brave Search."""
+    global _brave_search_last_call
+    with _brave_search_lock:
+        now = time.monotonic()
+        elapsed = now - _brave_search_last_call
+        if elapsed < BRAVE_SEARCH_MIN_INTERVAL:
+            time.sleep(BRAVE_SEARCH_MIN_INTERVAL - elapsed)
+        _brave_search_last_call = time.monotonic()
 
 
 def _call_tool_api(tool_name: str, arguments: dict, timeout: int = API_TIMEOUT) -> str:
@@ -97,6 +115,7 @@ class BraveWebSearch(BaseTool):
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
         params = self._verify_json_format_args(params)
+        _rate_limit_brave_search()
         raw_result = _call_tool_api("web_search", {"query": params["query"]})
         return sanitize_web_content(raw_result)
 

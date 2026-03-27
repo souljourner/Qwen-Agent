@@ -42,13 +42,13 @@ def ensure_git_repo() -> None:
 
 def autocommit(filename: str, message: str) -> None:
     """Stage and commit a file change in the DATA_DIR git repo."""
-    # Validate filename is a simple basename (no path traversal)
-    basename = os.path.basename(filename)
-    if basename != filename or "/" in filename or "\\" in filename or ".." in filename:
+    # Block path traversal but allow relative subdirectory paths (e.g., projects/name/file.md)
+    normalized = os.path.normpath(filename)
+    if ".." in normalized or normalized.startswith("/") or normalized.startswith("\\"):
         logger.warning(f"Rejected autocommit for invalid filename: {filename}")
         return
     ensure_git_repo()
-    _run_git("add", basename)
+    _run_git("add", normalized)
     # Check if there are staged changes
     status = _run_git("diff", "--cached", "--name-only")
     if not status:

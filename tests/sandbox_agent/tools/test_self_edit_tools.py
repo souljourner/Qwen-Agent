@@ -7,10 +7,9 @@ import tempfile
 import pytest
 
 from sandbox_agent.tools.self_edit_tools import (
-    ReadHeartbeat,
-    ReadSoul,
     UpdateHeartbeat,
     UpdateSoul,
+    _patch_section,
     _read_file,
     _write_file,
 )
@@ -38,50 +37,106 @@ class TestReadWrite:
         assert _read_file("NONEXISTENT.md") == ""
 
     def test_read_falls_back_to_bundled(self):
-        """Without monkeypatching DATA_DIR, SOUL.md should read the bundled default."""
-        tool = ReadSoul()
-        result = tool.call("{}")
+        tool = UpdateSoul()
+        result = tool.call("{}")  # No args = read
         assert "Core Identity" in result
+
+
+class TestPatchSection:
+
+    def test_replace_existing_section(self):
+        content = "# Title\n\n## Foo\nold content\n\n## Bar\nbar content\n"
+        result = _patch_section(content, "Foo", "new content")
+        assert "new content" in result
+        assert "old content" not in result
+        assert "bar content" in result
+
+    def test_append_new_section(self):
+        content = "# Title\n\n## Foo\nfoo content\n"
+        result = _patch_section(content, "NewSection", "new stuff")
+        assert "## NewSection" in result
+        assert "new stuff" in result
+        assert "foo content" in result
+
+    def test_replace_last_section(self):
+        content = "# Title\n\n## First\nfirst\n\n## Last\nold last\n"
+        result = _patch_section(content, "Last", "new last")
+        assert "new last" in result
+        assert "old last" not in result
+        assert "first" in result
 
 
 class TestSoulTools:
 
     def test_read_soul(self, tmp_data_dir):
-        _write_file("SOUL.md", "# My Identity\nI am a test agent.")
-        tool = ReadSoul()
-        result = tool.call("{}")
+        _write_file("SOUL.md", "# My Identity\n\n## Core\nI am a test agent.")
+        tool = UpdateSoul()
+        result = tool.call("{}")  # No args = read
         assert "test agent" in result
 
-    def test_update_soul(self, tmp_data_dir):
+    def test_patch_section(self, tmp_data_dir):
+        _write_file("SOUL.md", "# Soul\n\n## Boundaries\n- old rule\n\n## Capabilities\n- cap1\n")
         tool = UpdateSoul()
-        result = tool.call('{"content": "# New Soul\\nI am updated."}')
-        assert "updated" in result
-        assert _read_file("SOUL.md") == "# New Soul\nI am updated."
+        result = tool.call('{"section": "Boundaries", "content": "- new rule 1\\n- new rule 2"}')
+        assert "updated" in result.lower()
+        content = _read_file("SOUL.md")
+        assert "- new rule 1" in content
+        assert "- old rule" not in content
+        assert "- cap1" in content  # Other section preserved
+
+    def test_append_to_section(self, tmp_data_dir):
+        _write_file("SOUL.md", "# Soul\n\n## Capabilities\n- cap1\n")
+        tool = UpdateSoul()
+        result = tool.call('{"append_to_section": "Capabilities", "line": "- cap2"}')
+        assert "cap2" in result
+        content = _read_file("SOUL.md")
+        assert "- cap1" in content
+        assert "- cap2" in content
+
+    def test_append_to_new_section(self, tmp_data_dir):
+        _write_file("SOUL.md", "# Soul\n\n## Existing\ncontent\n")
+        tool = UpdateSoul()
+        result = tool.call('{"append_to_section": "NewSection", "line": "- new item"}')
+        content = _read_file("SOUL.md")
+        assert "## NewSection" in content
+        assert "- new item" in content
 
     def test_read_empty_soul(self, tmp_data_dir):
-        tool = ReadSoul()
+        tool = UpdateSoul()
         result = tool.call("{}")
-        # Should fall back to bundled or show empty message
-        assert result  # Not empty
+        assert result  # Falls back to bundled
 
 
 class TestHeartbeatTools:
 
     def test_read_heartbeat(self, tmp_data_dir):
         _write_file("HEARTBEAT.md", "# Checklist\n- [ ] Check stuff")
-        tool = ReadHeartbeat()
-        result = tool.call("{}")
+        tool = UpdateHeartbeat()
+        result = tool.call("{}")  # No args = read
         assert "Check stuff" in result
 
-    def test_update_heartbeat(self, tmp_data_dir):
+    def test_replace_heartbeat(self, tmp_data_dir):
         tool = UpdateHeartbeat()
         result = tool.call('{"content": "# Checklist\\n- [ ] New item\\n- [x] Done item"}')
-        assert "updated" in result
+        assert "replaced" in result.lower()
         content = _read_file("HEARTBEAT.md")
         assert "- [ ] New item" in content
         assert "- [x] Done item" in content
 
-    def test_update_then_read(self, tmp_data_dir):
-        UpdateHeartbeat().call('{"content": "# Updated\\n- [ ] Task A"}')
-        result = ReadHeartbeat().call("{}")
+    def test_add_item(self, tmp_data_dir):
+        _write_file("HEARTBEAT.md", "# Checklist\n- [ ] Existing\n")
+        tool = UpdateHeartbeat()
+        result = tool.call('{"add_item": "Check disk space"}')
+        assert "Check disk space" in result
+        content = _read_file("HEARTBEAT.md")
+        assert "- [ ] Existing" in content
+        assert "- [ ] Check disk space" in content
+
+    def test_add_then_read(self, tmp_data_dir):
+        _write_file("HEARTBEAT.md", "# Checklist\n")
+        tool = UpdateHeartbeat()
+        tool.call('{"add_item": "Task A"}')
+        tool.call('{"add_item": "Task B"}')
+        result = tool.call("{}")  # Read
         assert "Task A" in result
+        assert "Task B" in result

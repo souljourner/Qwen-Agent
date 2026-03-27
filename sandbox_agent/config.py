@@ -41,13 +41,14 @@ DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data")
 
 TOOL_LIST = [
     "web_search", "web_url_fetch", "stock_price",
-    "schedule_task", "list_tasks", "complete_task", "update_task_checkpoint",
-    "read_soul", "update_soul", "read_heartbeat", "update_heartbeat",
+    "schedule_task", "list_tasks", "complete_task", "cancel_task", "update_task_checkpoint",
+    "update_soul", "update_heartbeat",
     "read_memories", "add_memory",
     "code_interpreter",
     "list_chat_logs", "read_chat_log",
     "create_project", "list_projects", "project_write_file",
     "project_read_file", "project_list_files", "project_delete_file",
+    "request_user", "view_requests", "resolve_request",
 ]
 
 SYSTEM_PROMPT_SUFFIX = (
@@ -58,17 +59,30 @@ SYSTEM_PROMPT_SUFFIX = (
 
 
 def load_system_message() -> str:
-    """Load SOUL.md and combine with system prompt suffix.
+    """Load SOUL.md + MEMORIES.md and combine with system prompt suffix.
 
     This is the base system message used for all sessions (main, heartbeat, cron).
-    It is static to maximize KV cache hits.
+    MEMORIES.md is included so the agent always has its learnings without needing
+    to call read_memories as a tool.
     """
     soul_path = Path(__file__).parent / "SOUL.md"
     if soul_path.exists():
         soul = soul_path.read_text().strip()
     else:
         soul = "You are a capable research and task management assistant."
-    return soul + "\n\n" + SYSTEM_PROMPT_SUFFIX
+
+    # Load memories from DATA_DIR (agent-edited) or bundled default
+    memories = ""
+    memories_data = Path(DATA_DIR) / "MEMORIES.md"
+    memories_bundled = Path(__file__).parent / "MEMORIES.md"
+    for mp in [memories_data, memories_bundled]:
+        if mp.exists():
+            content = mp.read_text().strip()
+            if content:
+                memories = f"\n\n## Your Memories (auto-loaded from MEMORIES.md)\n\n{content}"
+            break
+
+    return soul + memories + "\n\n" + SYSTEM_PROMPT_SUFFIX
 
 
 def session_metadata() -> str:

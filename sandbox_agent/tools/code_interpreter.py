@@ -261,8 +261,11 @@ class LocalCodeInterpreter(BaseTool):
 
     name = "code_interpreter"
     description = (
-        "Execute Python code. Has numpy, pandas, requests, and llm_call(prompt, system='') "
-        "for background LLM calls. Variables persist between calls. "
+        "Execute Python code. Has numpy, pandas, requests, and "
+        "llm_call(prompt, system='', think=False) for background LLM calls. "
+        "Use think=False (default) for fast extraction/classification. "
+        "Use think=True for complex analysis, synthesis, or multi-step reasoning. "
+        "Variables persist between calls. "
         "CRITICAL RULES: "
         "1) Write intermediate data to files (use DATA_DIR=os.getenv('DATA_DIR','data')), never to stdout. "
         "2) For multiple URLs: ONE script, for-loop, save raw content to .jsonl file, process from file with llm_call(). "

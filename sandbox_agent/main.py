@@ -25,7 +25,9 @@ from sandbox_agent.config import (
     load_system_message,
     session_metadata,
 )
+from sandbox_agent.activity_log import clear_state, get_recent_events, log_event, set_state
 from sandbox_agent.chat_logger import log_background_task, log_turn
+from sandbox_agent.daily_digest import add_digest_entry, cleanup_old_digests
 from sandbox_agent.heartbeat.heartbeat_runner import HeartbeatRunner
 from sandbox_agent.scheduler.task_queue import TaskQueue
 from sandbox_agent.token_budget import compute_request_timeout, estimate_messages_tokens, trim_to_budget
@@ -36,13 +38,17 @@ import sandbox_agent.tools.self_edit_tools  # noqa: F401
 import sandbox_agent.tools.code_interpreter  # noqa: F401
 import sandbox_agent.chat_logger  # noqa: F401 (registers list_chat_logs, read_chat_log)
 import sandbox_agent.tools.project_tools  # noqa: F401
+import sandbox_agent.tools.notification_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-# Lock for the primary vLLM model — held while any lane is actively running on it.
-# Background lanes try to acquire non-blocking: if free, use primary; if held, fall back to Ollama.
+# Lock for the primary vLLM model — held while the user is chatting.
+# Background tasks check this to decide: vLLM (idle) or Ollama (busy).
 _primary_model_lock = Lock()
+
+# Lock for background work — ensures heartbeat and cron tasks run one at a time, never colliding.
+_background_work_lock = Lock()
 
 
 def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent") -> Assistant:
@@ -61,9 +67,13 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
     def _logged_call_tool(tool_name, tool_args='{}', **kwargs):
         args_preview = str(tool_args)[:200]
         logger.info(f"Tool call: {tool_name}({args_preview})")
+        set_state(current_tool=tool_name)
+        log_event("tool_call", tool_name=tool_name, tool_args=args_preview)
         result = original_call_tool(tool_name, tool_args, **kwargs)
         result_preview = str(result)[:200]
         logger.info(f"Tool result: {tool_name} -> {result_preview}")
+        log_event("tool_result", tool_name=tool_name, tool_result=result_preview)
+        set_state(current_tool=None)
         return result
 
     agent._call_tool = _logged_call_tool
@@ -71,76 +81,152 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
 
 
 class LockingAgent(Assistant):
-    """Wraps an Assistant so that run() holds the primary model lock.
+    """Wraps an Assistant with smart model routing.
 
-    This lets the Gradio WebUI (which calls agent.run() directly) automatically
-    hold the lock, causing background tasks to fall back to Ollama.
+    Tries the primary vLLM model first. If a background task is currently
+    using vLLM (lock is held), routes to the Ollama backup agent instead
+    so the user gets an immediate response.
     """
 
-    def __init__(self, inner: Assistant, lock: Lock):
-        # Bypass Assistant.__init__ — we delegate everything to inner
-        self._inner = inner
+    def __init__(self, inner: Assistant, backup: Assistant, lock: Lock):
+        self._inner = inner      # Primary agent (vLLM)
+        self._backup = backup    # Backup agent (Ollama)
         self._lock = lock
 
     def run(self, *args, **kwargs) -> Iterator[List[Message]]:
-        # Extract the user message for logging (Gradio passes history as first positional arg)
         messages = args[0] if args else kwargs.get("messages", [])
         user_msg = None
         if messages:
-            # Set dynamic request timeout based on payload size
             msg_list = [m if isinstance(m, Message) else Message(**m) for m in messages]
             timeout = compute_request_timeout(msg_list)
             self._inner.llm.generate_cfg["request_timeout"] = timeout
+            self._backup.llm.generate_cfg["request_timeout"] = timeout
 
             for m in reversed(msg_list):
                 if m.role == "user":
                     user_msg = m
                     break
 
-        with self._lock:
-            response = []
-            for response in self._inner.run(*args, **kwargs):
-                yield response
+        got_lock = self._lock.acquire(blocking=False)
+        if got_lock:
+            agent = self._inner
+            model_name = PRIMARY_LLM_CFG["model"]
+            log_event("chat_start", detail=f"[primary] {str(user_msg.content)[:180]}" if user_msg else "[primary]")
+        else:
+            agent = self._backup
+            model_name = BACKGROUND_LLM_CFG["model"]
+            log_event("chat_start", detail=f"[ollama fallback] {str(user_msg.content)[:160]}" if user_msg else "[ollama fallback]")
+            logger.info("Chat routed to Ollama (vLLM busy with background task)")
 
-        # Log the turn after completion
+        set_state(status="chatting", model_in_use=model_name)
+        try:
+            response = []
+            for response in agent.run(*args, **kwargs):
+                yield response
+        finally:
+            if got_lock:
+                self._lock.release()
+        log_event("chat_complete")
+        clear_state()
+
         if user_msg and response:
             try:
                 log_turn(user_msg, response)
             except Exception:
-                pass  # Logging is best-effort
+                pass
 
     def run_nonstream(self, *args, **kwargs):
-        with self._lock:
-            return self._inner.run_nonstream(*args, **kwargs)
+        got_lock = self._lock.acquire(blocking=False)
+        agent = self._inner if got_lock else self._backup
+        try:
+            return agent.run_nonstream(*args, **kwargs)
+        finally:
+            if got_lock:
+                self._lock.release()
 
-    # Delegate attribute access to inner agent
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+def _summarize_task_result(task_name: str, result_text: str, tool_calls: List[dict], project: str = "") -> str:
+    """Use Ollama to write a concise summary of a completed task for the daily digest."""
+    try:
+        import requests as _req
+        ollama_base = BACKGROUND_LLM_CFG["model_server"].replace("/v1", "")
+        project_ctx = f" (project: {project})" if project else ""
+
+        # Build a factual record of what happened from tool calls
+        actions = []
+        for tc in tool_calls:
+            tool = tc.get("tool", "")
+            args = tc.get("args", "")
+            result = tc.get("result", "")
+            if tool == "web_search":
+                actions.append(f"Searched: {args}")
+            elif tool == "web_url_fetch":
+                actions.append(f"Fetched URL: {args}")
+            elif tool == "project_write_file":
+                actions.append(f"Wrote file: {args}")
+            elif tool == "code_interpreter":
+                actions.append(f"Ran code → {result[:100]}")
+            elif tool == "schedule_task":
+                actions.append(f"Scheduled: {result[:100]}")
+            elif tool == "add_memory":
+                actions.append(f"Saved memory: {args[:100]}")
+            elif tool:
+                actions.append(f"{tool}: {args[:80]}")
+
+        actions_text = "\n".join(actions[-20:]) if actions else "No tool calls recorded."
+
+        resp = _req.post(
+            f"{ollama_base}/api/chat",
+            json={
+                "model": BACKGROUND_LLM_CFG["model"],
+                "messages": [
+                    {"role": "system", "content": "Summarize what this task accomplished in 2-3 sentences. Focus on: what was searched, what files were created/updated, what was scheduled, and key findings. Be factual and specific. No filler or planning language."},
+                    {"role": "user", "content": f"Task: {task_name}{project_ctx}\n\nActions taken:\n{actions_text}\n\nAgent's final message:\n{result_text[:500]}"},
+                ],
+                "think": False,
+                "stream": False,
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        summary = resp.json().get("message", {}).get("content", "")
+        return summary if summary else result_text[:500]
+    except Exception as e:
+        logger.warning(f"Failed to summarize task result: {e}")
+        return result_text[:500] if result_text else "Completed"
 
 
 def run_on_best_available(system_message: str, messages: List[Message]) -> List[Message]:
     """Run an isolated agent session, preferring the primary model if it's free.
 
     Tries to acquire the primary model lock non-blocking:
-    - If free: runs on primary vLLM (better quality)
-    - If busy (main lane is chatting): falls back to Ollama
-    Sets dynamic request timeout based on message payload size.
+    - If free: runs on primary vLLM (better quality). Does NOT hold the lock
+      during execution — releases it immediately so the main conversation
+      can still use vLLM. Both will queue on vLLM but the user only waits
+      for one background call (~30s), not the entire task.
+    - If busy (main lane is chatting): falls back to Ollama.
     """
     timeout = compute_request_timeout(messages)
 
+    # Check if user is currently chatting — if not, use primary
     if _primary_model_lock.acquire(blocking=False):
-        try:
-            logger.info(f"Background task using primary model (idle, timeout={timeout}s)")
-            agent = create_agent(system_message, llm_cfg=PRIMARY_LLM_CFG)
-            agent.llm.generate_cfg["request_timeout"] = timeout
-            response: List[Message] = []
-            for response in agent.run(messages=messages):
-                pass
-            return response
-        finally:
-            _primary_model_lock.release()
+        _primary_model_lock.release()  # Release immediately — don't hold during execution
+        logger.info(f"Background task using primary model (idle, timeout={timeout}s)")
+        set_state(model_in_use=PRIMARY_LLM_CFG["model"])
+        log_event("model_select", detail="primary (idle)", model=PRIMARY_LLM_CFG["model"])
+        agent = create_agent(system_message, llm_cfg=PRIMARY_LLM_CFG)
+        agent.llm.generate_cfg["request_timeout"] = timeout
+        response: List[Message] = []
+        for response in agent.run(messages=messages):
+            pass
+        return response
     else:
         logger.info(f"Background task using Ollama (primary model busy, timeout={timeout}s)")
+        set_state(model_in_use=BACKGROUND_LLM_CFG["model"])
+        log_event("model_select", detail="ollama (primary busy)", model=BACKGROUND_LLM_CFG["model"])
         agent = create_agent(system_message, llm_cfg=BACKGROUND_LLM_CFG)
         agent.llm.generate_cfg["request_timeout"] = timeout
         response: List[Message] = []
@@ -156,37 +242,68 @@ def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 6
         try:
             due_tasks = task_queue.get_due_tasks()
             for task in due_tasks:
-                logger.info(f"Cron: executing task [{task.id}] {task.name}")
-                task_queue.update_task(task.id, status="running")
-                try:
-                    # Build task prompt with project and checkpoint context
-                    prompt_parts = [f"Execute this scheduled task:\n\n**{task.name}**: {task.description}"]
-                    if task.project:
-                        prompt_parts.append(
-                            f"\nThis task belongs to project '{task.project}'. "
-                            f"Save any results to the project using project_write_file. "
-                            f"You can read existing project files with project_read_file."
+                # Acquire background work lock — prevents collision with heartbeat
+                logger.info(f"Cron: waiting for background work lock for [{task.id}] {task.name}")
+                with _background_work_lock:
+                    logger.info(f"Cron: executing task [{task.id}] {task.name}")
+                    set_state(status="cron_task", current_task=f"[{task.id}] {task.name}")
+                    log_event("cron_start", task_id=task.id, task_name=task.name)
+                    task_queue.update_task(task.id, status="running")
+                    # Snapshot event count before execution to capture tool calls
+                    events_before = len(get_recent_events(500))
+                    try:
+                        # Build task prompt with project and checkpoint context
+                        prompt_parts = [f"Execute this scheduled task:\n\n**{task.name}**: {task.description}"]
+                        if task.project:
+                            prompt_parts.append(
+                                f"\nThis task belongs to project '{task.project}'. "
+                                f"Save any results to the project using project_write_file. "
+                                f"You can read existing project files with project_read_file."
+                            )
+                        if task.checkpoint:
+                            prompt_parts.append(
+                                f"\nThis task was previously interrupted at step {task.current_step}. "
+                                f"Resume from checkpoint: {task.checkpoint}"
+                            )
+                        messages = [Message(role="user", content="\n".join(prompt_parts))]
+                        logger.info(f"Cron: task [{task.id}] prompt: {prompt_parts[0][:200]}...")
+                        response = run_on_best_available(system_message, messages)
+                        # Extract result text
+                        result_text = ""
+                        for msg in response:
+                            if msg.role == "assistant" and isinstance(msg.content, str):
+                                result_text += msg.content
+                        logger.info(f"Cron: task [{task.id}] result ({len(result_text)} chars): {result_text[:200]}...")
+                        task_queue.update_task(task.id, status="completed", result=result_text[:1000])
+                        log_background_task(task.name, task.id, result_text[:1000])
+                        log_event("cron_complete", task_id=task.id, task_name=task.name)
+                        # Collect tool calls that happened during this task
+                        all_events = get_recent_events(500)
+                        task_tool_calls = [
+                            e for e in all_events[events_before:]
+                            if e.get("type") == "tool_call"
+                        ]
+                        # Summarize using tool call record + result text
+                        digest_summary = _summarize_task_result(task.name, result_text, task_tool_calls, task.project or "")
+                        add_digest_entry(
+                            project=task.project,
+                            task_name=task.name,
+                            summary=digest_summary,
+                            source="cron",
                         )
-                    if task.checkpoint:
-                        prompt_parts.append(
-                            f"\nThis task was previously interrupted at step {task.current_step}. "
-                            f"Resume from checkpoint: {task.checkpoint}"
+                        logger.info(f"Cron: task [{task.id}] completed")
+                        clear_state()
+                    except Exception as e:
+                        logger.exception(f"Cron: task [{task.id}] failed")
+                        log_event("cron_failed", task_id=task.id, task_name=task.name, detail=str(e)[:300])
+                        add_digest_entry(
+                            project=task.project,
+                            task_name=task.name,
+                            summary=f"FAILED: {str(e)[:400]}",
+                            source="cron",
                         )
-                    messages = [Message(role="user", content="\n".join(prompt_parts))]
-                    logger.info(f"Cron: task [{task.id}] prompt: {prompt_parts[0][:200]}...")
-                    response = run_on_best_available(system_message, messages)
-                    # Extract result text
-                    result_text = ""
-                    for msg in response:
-                        if msg.role == "assistant" and isinstance(msg.content, str):
-                            result_text += msg.content
-                    logger.info(f"Cron: task [{task.id}] result ({len(result_text)} chars): {result_text[:200]}...")
-                    task_queue.update_task(task.id, status="completed", result=result_text[:1000])
-                    log_background_task(task.name, task.id, result_text[:1000])
-                    logger.info(f"Cron: task [{task.id}] completed")
-                except Exception as e:
-                    logger.exception(f"Cron: task [{task.id}] failed")
-                    task_queue.update_task(task.id, status="failed", last_error=str(e)[:500])
+                        task_queue.update_task(task.id, status="failed", last_error=str(e)[:500])
+                        clear_state()
         except Exception:
             logger.exception("Cron loop error")
         time.sleep(poll_interval)
@@ -200,7 +317,11 @@ def _start_background_lanes(system_message: str, task_queue: TaskQueue) -> None:
     heartbeat = HeartbeatRunner(
         task_queue=task_queue,
         runner=bg_runner,
-        on_alert=lambda msg: logger.warning(f"HEARTBEAT ALERT: {msg}"),
+        on_alert=lambda msg: (
+            logger.warning(f"HEARTBEAT ALERT: {msg}"),
+            add_digest_entry(summary=msg[:500], source="heartbeat"),
+        ),
+        work_lock=_background_work_lock,
     )
     heartbeat_thread = Thread(target=heartbeat.loop, daemon=True, name="heartbeat")
     heartbeat_thread.start()
@@ -229,6 +350,17 @@ def main() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     from sandbox_agent.tools.git_autocommit import ensure_git_repo
     ensure_git_repo()
+    cleanup_old_digests(keep_days=3)
+
+    # Reset any tasks stuck in "running" from a previous crash
+    try:
+        tq_init = TaskQueue()
+        stuck = tq_init.list_tasks(status="running")
+        for task in stuck:
+            logger.warning(f"Resetting stuck task: [{task.id}] {task.name} (was running at shutdown)")
+            tq_init.update_task(task.id, status="pending")
+    except Exception:
+        pass
 
     # Load system messages
     # Base system message (static, used for background sessions — no metadata for KV cache stability)
@@ -251,13 +383,14 @@ def main() -> None:
     ci._llm_init_code = get_kernel_init_code(bridge_port)
     logger.info(f"LLM bridge started on port {bridge_port} -> {BACKGROUND_LLM_CFG['model']} @ {BACKGROUND_LLM_CFG['model_server']}")
 
-    # Pre-warm Ollama model (lazy-loads into GPU on first call)
+    # Pre-warm Ollama model via native API (lazy-loads into GPU on first call)
     try:
         import requests as _req
+        ollama_base = BACKGROUND_LLM_CFG["model_server"].replace("/v1", "")
         logger.info(f"Pre-warming Ollama model ({BACKGROUND_LLM_CFG['model']})...")
         _req.post(
-            f"{BACKGROUND_LLM_CFG['model_server']}/chat/completions",
-            json={"model": BACKGROUND_LLM_CFG["model"], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1},
+            f"{ollama_base}/api/chat",
+            json={"model": BACKGROUND_LLM_CFG["model"], "messages": [{"role": "user", "content": "hi"}], "think": False, "stream": False},
             timeout=120,
         )
         logger.info("Ollama model pre-warmed")
@@ -273,22 +406,26 @@ def main() -> None:
     # Start background lanes
     _start_background_lanes(system_message, task_queue)
 
+    # Backup agent on Ollama for when vLLM is busy
+    backup_agent = create_agent(main_system_message, llm_cfg=BACKGROUND_LLM_CFG)
+    logger.info(f"Backup agent created (model: {BACKGROUND_LLM_CFG['model']})")
+
     if args.mode == "gradio":
-        _run_gradio(inner_agent, args.host, args.port)
+        _run_gradio(inner_agent, backup_agent, args.host, args.port)
     else:
-        _run_repl(inner_agent)
+        _run_repl(inner_agent, backup_agent)
 
 
-def _run_gradio(inner_agent: Assistant, host: str, port: int) -> None:
+def _run_gradio(inner_agent: Assistant, backup_agent: Assistant, host: str, port: int) -> None:
     """Launch the Gradio WebUI."""
     from qwen_agent.gui import WebUI
 
-    # Wrap agent with lock so background tasks fall back to Ollama while user is chatting
-    agent = LockingAgent(inner_agent, _primary_model_lock)
+    # Wrap with smart routing: vLLM when free, Ollama when vLLM is busy
+    agent = LockingAgent(inner_agent, backup_agent, _primary_model_lock)
 
     chatbot_config = {
         "user.name": "User",
-        "input.placeholder": "Ask me anything...",
+        "input.placeholder": "Ask me anything... (Activity monitor: http://localhost:7861)",
         "prompt.suggestions": [
             "Search the web for latest Python news",
             "What's the current price of AAPL?",
@@ -299,11 +436,17 @@ def _run_gradio(inner_agent: Assistant, host: str, port: int) -> None:
     }
 
     logger.info(f"Starting Gradio WebUI on {host}:{port}")
+
+    # Start a separate lightweight status API on port+1
+    from sandbox_agent.status_server import start_status_server
+    start_status_server(port + 1)
+    logger.info(f"Status API started on {host}:{port + 1}/status")
+
     webui = WebUI(agent, chatbot_config=chatbot_config)
     webui.run(server_name=host, server_port=port)
 
 
-def _run_repl(inner_agent: Assistant) -> None:
+def _run_repl(inner_agent: Assistant, backup_agent: Assistant) -> None:
     """Run the terminal REPL."""
 
     class StreamPrinter:
@@ -348,10 +491,17 @@ def _run_repl(inner_agent: Assistant) -> None:
             messages = trim_to_budget(messages)
 
             printer = StreamPrinter()
-            with _primary_model_lock:
+            got_lock = _primary_model_lock.acquire(blocking=False)
+            agent = inner_agent if got_lock else backup_agent
+            if not got_lock:
+                print("  (vLLM busy — using Ollama)")
+            try:
                 response: List[Message] = []
-                for response in inner_agent.run(messages=messages):
+                for response in agent.run(messages=messages):
                     printer.update(response)
+            finally:
+                if got_lock:
+                    _primary_model_lock.release()
             printer.finish()
 
             log_turn(messages[-1], response)

@@ -189,6 +189,16 @@ class TaskQueue:
         with self._lock:
             return self._find_task(task_id)
 
+    def remove_task(self, task_id: str) -> bool:
+        """Remove a task from the queue entirely."""
+        with self._lock:
+            before = len(self._tasks)
+            self._tasks = [t for t in self._tasks if t.id != task_id]
+            if len(self._tasks) < before:
+                self._save()
+                return True
+            return False
+
     def _find_task(self, task_id: str) -> Optional[Task]:
         for task in self._tasks:
             if task.id == task_id:

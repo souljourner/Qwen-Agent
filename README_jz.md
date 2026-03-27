@@ -1,451 +1,214 @@
-# Sandbox Agent
+# Sandbox Agent — Knowledge Transfer Document
 
-A sandboxed, self-scheduling Qwen Agent with web tools, code execution, heartbeat monitoring, and vLLM KV cache optimization.
+A sandboxed, self-scheduling Qwen Agent built on [Qwen-Agent](https://github.com/QwenLM/Qwen-Agent), inspired by [OpenClaw](https://docs.openclaw.ai/) patterns.
 
-Built on top of [Qwen-Agent](https://github.com/QwenLM/Qwen-Agent), inspired by [OpenClaw](https://docs.openclaw.ai/) patterns.
+## Quick Start
+
+```bash
+# Build and run (Gradio WebUI on :7860, dashboard on :7861)
+cd sandbox_agent/docker && docker compose up --build
+
+# Terminal REPL mode
+docker compose run --rm -it agent --mode repl
+
+# Run tests
+cd /path/to/Qwen-Agent && source .venv/bin/activate && pytest tests/sandbox_agent/ -v
+```
+
+## Infrastructure
+
+| Service | Host | Model | Role |
+|---|---|---|---|
+| **vLLM** | 192.168.4.66:8000 | qwen3.5 (397B) | Main interactive conversation |
+| **Ollama** | 192.168.4.88:11434 | qwen3.5-9b-256k | Background tasks, `llm_call()` bridge, fallback when vLLM busy |
+| **Tools API** | localhost:8080 | — | Web search (Brave), URL fetch, stock prices via SSE |
+| **Gradio** | localhost:7860 | — | Chat WebUI |
+| **Dashboard** | localhost:7861 | — | Live activity monitor, digest, agent requests |
+| **Data** | ~/sandbox_agent_data/ | — | Bind-mounted volume, visible in Finder |
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────────────┐
-│  Docker Container (read_only, no-new-privileges, cap_drop: ALL)     │
-│                                                                      │
-│  ┌─────────────────┐  ┌──────────┐  ┌───────────────┐               │
-│  │   Main Lane     │  │ Heartbeat│  │   Cron Lane   │               │
-│  │ (Gradio WebUI)  │  │  Lane    │  │ (scheduled    │               │
-│  │                 │  │ (30 min) │  │  tasks)       │               │
-│  └────────┬────────┘  └────┬─────┘  └──────┬────────┘               │
-│           │                │               │                         │
-│     ┌─────┴────────────────┴───────────────┴──────┐                  │
-│     │         Primary Model Lock                   │                  │
-│     │  Main holds lock → background uses Ollama    │                  │
-│     │  Main idle → background uses primary vLLM    │                  │
-│     └──────────────────────────────────────────────┘                  │
-│           │                                                          │
-│  ┌────────┴──────────────────────────────────────────────────────┐   │
-│  │                    Shared Tool Registry (22 tools)             │   │
-│  │  web_search · web_url_fetch · stock_price                     │   │
-│  │  code_interpreter (with llm_call() bridge)                    │   │
-│  │  schedule_task · list_tasks · complete_task                   │   │
-│  │  update_task_checkpoint                                       │   │
-│  │  read_soul · update_soul · read_heartbeat · update_heartbeat  │   │
-│  │  read_memories · add_memory · list_chat_logs · read_chat_log  │   │
-│  │  create_project · list_projects · project_write_file          │   │
-│  │  project_read_file · project_list_files · project_delete_file │   │
-│  └──────┬──────────────┬──────────────┬──────────────────────────┘   │
-│         │              │              │                               │
-│  ┌──────┴──────┐ ┌─────┴──────┐ ┌────┴───────────┐                  │
-│  │ Tools API   │ │ Task Queue │ │ Jupyter Kernel  │                  │
-│  │ :8080 (SSE) │ │ (JSON)     │ │ (subprocess)    │                  │
-│  └─────────────┘ │ + Git repo │ │ + LLM Bridge    │                  │
-│                  └────────────┘ └─────────────────┘                  │
-└──────────────────────────────────────────────────────────────────────┘
-         │                │                    │
-    ┌────┴─────┐    ┌─────┴──────┐     ┌──────┴───────┐
-    │  vLLM    │    │  vLLM      │     │   Ollama     │
-    │ :8000    │    │ 192.168.   │     │  192.168.    │
-    │ localhost│    │ 4.66:8000  │     │  4.88:11434  │
-    │          │    │ qwen3.5    │     │  qwen3.5-9b  │
-    └──────────┘    │ (primary)  │     │ (background) │
-                    └────────────┘     └──────────────┘
+Docker Container (read_only, no-new-privileges, cap_drop: ALL)
+├── Main Lane (Gradio WebUI) → vLLM, falls back to Ollama when vLLM busy
+├── Heartbeat Lane (1 hour interval) → checks HEARTBEAT.md, uses Ollama
+├── Cron Lane (60s poll) → executes scheduled tasks, uses Ollama (or vLLM if idle)
+├── Status Server (separate process, port 7861) → reads activity.jsonl from disk
+└── LLM Bridge (HTTP server on localhost) → Ollama native API with think parameter
 ```
 
-### Dual-LLM Design
+### Smart Model Routing
 
-| Model | Hardware | Role | Why |
-|---|---|---|---|
-| `qwen3.5` via vLLM | 192.168.4.66:8000 | Interactive conversation | Best model, KV cache optimized |
-| `qwen3.5-9b-256k` via Ollama | 192.168.4.88:11434 | Heartbeat, cron, `llm_call()` | Separate hardware avoids queue contention |
+- **User sends message**: tries vLLM first. If vLLM lock is held (background task started on it), falls back to Ollama immediately.
+- **Background task starts**: checks lock. If free (user not chatting), uses vLLM. Releases lock immediately so it doesn't block user. If user is chatting, uses Ollama.
+- **`llm_call()` inside code_interpreter**: always Ollama native API (`/api/chat`) with `think` parameter.
 
-The vLLM server is single-queue — heartbeat/cron requests would block interactive use. The Ollama instance on a second machine handles all background work independently.
+### Key Design Decision: vLLM Never Blocks User
 
-### Smart Model Sharing
+The primary model lock is **non-blocking** for the main conversation. If a background task grabbed vLLM and is mid-tool-loop, the user's message either gets the lock (background released it) or proceeds to Ollama. The user is never stuck waiting.
 
-A lock controls access to the primary model:
-- **User is chatting** → main lane holds lock → heartbeat/cron fall back to Ollama
-- **User is idle** → lock is free → heartbeat/cron use the primary vLLM (better quality)
-- **No deadlocks** — background lanes never block on the lock, they fall back immediately
+Background tasks release the lock immediately after checking it — they don't hold it during the entire tool loop. This means vLLM may serve both user and background requests concurrently (queued), but the user waits at most ~30s for one background call, not the full 15-minute task.
 
-### Lane-Based Concurrency (OpenClaw Pattern)
+## Tools (23 registered)
 
-Three threads run independently:
-
-- **Main lane**: Persistent conversation via Gradio WebUI. Uses the primary vLLM model. Messages accumulate across turns.
-- **Heartbeat lane**: Every 30 minutes, creates a fresh isolated agent session. Reads `HEARTBEAT.md`, checks for issues, suppresses `HEARTBEAT_OK` responses silently.
-- **Cron lane**: Polls the task queue every 60 seconds. Executes due tasks in isolated sessions. Supports exponential backoff retry on failure.
-
-Isolated sessions mean heartbeat/cron never pollute the main conversation history and cost ~2-5K tokens each instead of replaying the full context.
-
-## Setup
-
-### Prerequisites
-
-- [uv](https://docs.astral.sh/uv/) for Python package management
-- vLLM running on 192.168.4.66:8000 with `qwen3.5`
-- Ollama running on 192.168.4.88:11434 with `qwen3.5-9b-256k:latest`
-- Tools API running on localhost:8080 (provides `web_search`, `web_url_fetch`, `stock_price`)
-- Docker (for sandboxed deployment)
-
-### Install
-
-```bash
-uv venv
-source .venv/bin/activate
-uv pip install -e ".[gui]" croniter numpy soundfile ipykernel jupyter_client pandas
-```
-
-### Run Locally (Development)
-
-```bash
-# Gradio WebUI (default) — opens browser at http://localhost:7860
-python -m sandbox_agent.main
-
-# Terminal REPL
-python -m sandbox_agent.main --mode repl
-
-# Custom port
-python -m sandbox_agent.main --port 8888
-```
-
-### Run in Docker Sandbox
-
-```bash
-cd sandbox_agent/docker
-
-# Gradio WebUI (default) — access at http://localhost:7860
-docker compose up --build
-
-# Terminal REPL (interactive)
-docker compose run --rm -it agent --mode repl
-
-# Background only (headless, heartbeat/cron)
-docker compose up -d
-```
-
-Note: `docker compose up` works for Gradio mode (no stdin needed). For REPL mode, use `docker compose run -it` to connect your terminal.
-
-### Run Tests
-
-```bash
-source .venv/bin/activate
-pytest tests/sandbox_agent/ -v
-```
-
-102 tests covering sanitizer, API tools, code interpreter, task queue, checkpoint, scheduler tools, heartbeat runner, self-edit tools, token budget, and chat logging.
-
-## Configuration
-
-All configuration is in `sandbox_agent/config.py` and can be overridden via environment variables:
-
-| Env Var | Default | Description |
+| Category | Tools | Description |
 |---|---|---|
-| `VLLM_BASE` | `http://192.168.4.66:8000/v1` | Primary vLLM endpoint |
-| `OLLAMA_BASE` | `http://192.168.4.88:11434/v1` | Background Ollama endpoint |
-| `TOOLS_API_BASE` | `http://localhost:8080` | Web tools API endpoint |
-| `HEARTBEAT_INTERVAL_SECONDS` | `1800` | Heartbeat check interval (30 min) |
-| `DATA_DIR` | `./data` (local) / `/app/data` (Docker) | Writable directory for task queue, checkpoints, git repo |
-| `MAX_CONTEXT_TOKENS` | `200000` | Token budget for conversation context (256k model limit) |
-| `MAX_TOOL_OUTPUT_TOKENS` | `8000` | Max tokens per tool result |
-| `MAX_CODE_OUTPUT_TOKENS` | `4000` | Max tokens per code_interpreter execution |
-
-## Components
-
-### SOUL.md — Agent Identity
-
-`sandbox_agent/SOUL.md` defines the agent's identity and is injected as the first part of every system prompt. Follows the OpenClaw SOUL.md pattern. Contains:
-
-- **Core identity** and personality
-- **Token efficiency rules** — teaches the agent to offload heavy content to code_interpreter, use `llm_call()` for per-item processing, and schedule heavy work as background tasks
-- **`llm_call()` usage patterns** — with examples of extraction, classification, and batch processing
-- **Capabilities list** — all 22 tools described
-- **When to save memories** — guidelines for what's worth persisting
-- **Boundaries** — including self-edit safety rules (never remove critical sections)
-
-The agent can update its own SOUL.md via the `update_soul` tool. Changes take effect on new background sessions and after restart, not the current conversation.
-
-### Web Tools (Port 8080)
-
-Three tools registered via `@register_tool` that call the local API:
-
-| Tool | Parameters | Description |
-|---|---|---|
-| `web_search` | `query: str` | Brave web search (overwrites built-in Serper-based tool) |
-| `web_url_fetch` | `url: str` | Fetch URL content as markdown |
-| `stock_price` | `symbol: str` | Stock price and market data (e.g., AAPL, GOOGL) |
-
-All tools communicate with the API via SSE (`POST /api/tools/execute` with `{"name": ..., "arguments": {...}}`).
-
-#### Content Sanitization
-
-All web tool outputs pass through `sandbox_agent/tools/sanitizer.py` before reaching the LLM:
-
-1. **Strip chat-template tokens** — removes `<|im_start|>`, `<|im_end|>`, `[INST]`, `### SYSTEM:`, etc. that could enable role-switching attacks
-2. **Remove invisible characters** — zero-width spaces, RTL overrides, BOM, and other formatting chars used to hide injected content
-3. **Strip delimiter injection** — removes `[TOOL_OUTPUT]`/`[/TOOL_OUTPUT]` from content to prevent breakout from the tool output wrapper
-4. **Truncate** — caps output to `MAX_TOOL_OUTPUT_TOKENS` (default 8000 tokens / ~32k chars)
-5. **Delimit** — wraps output in `[TOOL_OUTPUT]...[/TOOL_OUTPUT]` so the model treats it as tool output, not instructions
-
-### Code Interpreter
-
-A local Jupyter kernel running as a subprocess inside the container (no Docker-in-Docker). The agent can write and execute arbitrary Python code.
-
-**Pre-installed packages**: numpy, pandas, requests, Pillow
-
-**Persistent state**: Variables survive between calls within the same session.
-
-**`llm_call()` bridge**: Inside code_interpreter, the agent has access to `llm_call(prompt, system="")` which calls the background Ollama model. This enables:
-
-```python
-# The agent writes code like this:
-import requests
-
-urls = ["https://example.com/page1", "https://example.com/page2", ...]
-results = []
-for url in urls:
-    html = requests.get(url, timeout=30).text
-    # LLM processes each page with a task-specific prompt
-    extracted = llm_call(
-        f"Extract the product name and price from this page:\n{html[:4000]}",
-        system="Return JSON: {product_name, price}. Nothing else."
-    )
-    results.append({"url": url, "data": extracted})
-
-import json
-print(json.dumps(results, indent=2))  # Only this enters the conversation
-```
-
-Each `llm_call()` runs on the background model — it does NOT add tokens to the main conversation. The prompt can be anything: extraction, classification, translation, comparison, reformatting, etc.
-
-**Security**: The LLM bridge uses a shared secret token generated at startup (injected into the kernel). Only the kernel process can call it. Request body is capped at 1MB.
-
-**Output cap**: Code execution output is truncated to `MAX_CODE_OUTPUT_TOKENS` (default 4000 tokens).
-
-### Self-Edit Tools
-
-The agent can read and modify its own configuration files:
-
-| Tool | Description |
-|---|---|
-| `read_soul` | Read current SOUL.md |
-| `update_soul` | Replace SOUL.md content (auto-committed to git) |
-| `read_heartbeat` | Read current HEARTBEAT.md checklist |
-| `update_heartbeat` | Replace HEARTBEAT.md content (auto-committed to git) |
-
-Files are written to `DATA_DIR` (the writable Docker volume). Every update is automatically committed to a private git repo in `DATA_DIR` so the agent's edit history is tracked.
-
-Changes take effect on new background sessions (heartbeat/cron) and after restart, but NOT the current interactive conversation.
-
-**Safety**: SOUL.md instructs the agent to never remove the Token Efficiency Rules, Capabilities, or Boundaries sections.
-
-### Persistent Memory (MEMORIES.md)
-
-The agent has long-term memory that persists across sessions:
-
-| Tool | Description |
-|---|---|
-| `read_memories` | Read all saved memories |
-| `add_memory` | Append a concise learning under a specific section |
-
-Memories are organized into four sections:
-- **User Preferences** — how the user likes things done, topics of interest
-- **Facts & Knowledge** — important facts, domain knowledge, corrections
-- **Technical Notes** — system configurations, API quirks, what works/doesn't
-- **Task Learnings** — outcomes of tasks, useful data sources, patterns that worked
-
-Each entry is dated (e.g., `- [2026-03-24] User prefers concise bullet-point reports`) and auto-committed to git. The agent is instructed to save important learnings immediately during conversations, not wait until the end.
-
-### Chat Logs
-
-All conversations are logged daily as markdown files in `DATA_DIR/chat_logs/YYYY-MM-DD.md`. Background task results are also logged.
-
-| Tool | Description |
-|---|---|
-| `list_chat_logs` | List available log files by date |
-| `read_chat_log` | Read a specific day's log (`"today"` or `"2026-03-24"`) |
-
-The agent can use these to recall earlier conversations when the user references past sessions.
-
-### Session Metadata
-
-The main interactive agent receives one-time metadata in its system prompt at startup:
-- Current date and time
-- Location: San Mateo, California
-- Timezone: US/Pacific
-
-This is NOT included in background sessions (heartbeat/cron) to keep their system prompts static for KV cache efficiency.
-
-### Project Workspaces
-
-Persistent file storage organized by project for long-running, multi-session work.
-
-| Tool | Description |
-|---|---|
-| `create_project` | Create a named workspace with description |
-| `list_projects` | Show all projects with file counts |
-| `project_write_file` | Write/update files (supports subdirs like `research/competitors.md`) |
-| `project_read_file` | Read a project file |
-| `project_list_files` | List all files in a project |
-| `project_delete_file` | Remove a file |
-
-All writes are auto-committed to git. Projects live in `DATA_DIR/projects/<name>/`. The agent is taught to create a project at the start of any multi-session effort and save all artifacts there.
-
-### Task Scheduler
-
-The agent can schedule its own tasks, optionally scoped to a project:
-
-| Tool | Description |
-|---|---|
-| `schedule_task` | Create a new task (one-shot, interval, or cron), optionally scoped to a project |
-| `list_tasks` | List tasks, optionally filtered by status and/or project |
-| `complete_task` | Mark a task as done |
-| `update_task_checkpoint` | Save progress for long-running tasks |
-
-#### Schedule Types (OpenClaw Pattern)
-
-- **`at`** — One-shot: runs once at a specified time (or immediately if no `run_at`)
-- **`every`** — Interval: runs repeatedly every N seconds
-- **`cron`** — Cron expression: standard 5-field cron (e.g., `0 * * * *` for hourly)
-
-#### Task Dependencies
-
-Tasks can declare `depends_on: [task_id, ...]`. A task won't execute until all dependencies are completed.
-
-#### Exponential Backoff Retry
-
-Failed tasks retry with increasing delays: 30s → 1m → 5m → 15m → 60m. One-shot tasks stop after `max_retries` (default 3). Recurring tasks retry indefinitely.
-
-#### Checkpointing
-
-Long-running tasks can save intermediate state via `update_task_checkpoint`. On interruption, the checkpoint is loaded and injected into the task prompt so the agent can resume from where it left off.
-
-#### Persistence
-
-The task queue is backed by `DATA_DIR/tasks.json` with auto-commit to git. Survives container restarts via the Docker named volume.
-
-### Heartbeat (OpenClaw Pattern)
-
-**How it works:**
-
-1. 60-second startup delay, then every 30 minutes the heartbeat timer fires
-2. Loads `HEARTBEAT.md` (user-editable checklist) from `DATA_DIR`
-3. Also checks the task queue for due scheduled tasks
-4. If there are items to check: creates an isolated agent session with the prompt: *"Read the HEARTBEAT checklist. Follow it strictly. If nothing needs attention, reply HEARTBEAT_OK."*
-5. If the agent responds with `HEARTBEAT_OK` (≤300 chars): silently suppressed, user never sees it
-6. If the agent finds something: logs a `HEARTBEAT ALERT`
-
-The agent can also edit the checklist itself via `update_heartbeat`.
-
-**Editing the checklist:**
-
-```markdown
-# Heartbeat Checklist
-- [ ] Check for due scheduled tasks and execute them
-- [ ] Review task queue for failed tasks that should be retried
-- [ ] Check AAPL stock price and alert if below $200
-- [x] This item is done and will be skipped
-```
-
-## Token Budget Management
-
-All models have a 256k token limit. The system targets 200k to leave room for generation.
-
-| Layer | Budget | Mechanism |
-|---|---|---|
-| **Conversation context** | 200k tokens | `trim_to_budget()` drops oldest turns, preserves system prefix for KV cache. Inserts a note: *"[Note: N earlier messages were trimmed...]"* |
-| **Tool outputs** (web_search, web_url_fetch, stock_price) | 8k tokens (~32k chars) | Sanitizer truncates |
-| **Code interpreter output** | 4k tokens (~16k chars) | Output capped after execution |
-| **llm_call() prompt** | 200k tokens | Bridge truncates oversized prompts |
-| **Request timeout** | 10-30 min (dynamic) | Scales linearly with payload: 10 min at ~0 tokens, 30 min at full 200k context |
-| **Code interpreter timeout** | 10 min - 2 hr (dynamic) | Scales with code size to accommodate `llm_call()` loops |
-
-Token estimation uses **1 token ≈ 4 characters** (conservative heuristic, no expensive tokenization). All limits configurable via env vars.
-
-## KV Cache Optimization (vLLM Prefix Caching)
-
-The configuration is tuned to maximize vLLM prefix cache hits during the agent's function-calling loop:
-
-| Setting | Value | Why |
-|---|---|---|
-| `max_input_tokens` | `0` | Disables Qwen-Agent's client-side truncation. Without this, truncation removes messages from the middle, breaking the prefix. |
-| Prompt-based function calling | `use_raw_api=False` (default) | vLLM does not support native OpenAI `tool_calls`. Qwen-Agent injects tool definitions into the system message and parses calls from text output. The system message is stable within a `_run()` loop. |
-| Static system message | SOUL.md + fixed suffix | No dynamic content in the base system message. Session metadata (date/time) is only added once for the main agent. |
-| Append-only message loop | (built into FnCallAgent) | Only appends to the message list — never modifies or reorders earlier messages. |
-| Conversation trimming | Drops oldest turns | When trimming for token budget, removes from the front (after system message), preserving the most recent prefix. |
-
-**Net effect**: Within a single agent `_run()` loop (e.g., search → read result → search again), each successive LLM call reuses the full KV cache of all previous messages.
-
-## Tool Call Logging
-
-Every tool invocation is logged with the tool name, arguments (first 200 chars), and result (first 200 chars):
-
-```
-Tool call: project_read_file({"project": "flatsixai", "path": "TODO.md"})
-Tool result: project_read_file -> # FlatSixAI - Active TODOs...
-
-Tool call: web_search({"query": "AI governance 2026"})
-Tool result: web_search -> [TOOL_OUTPUT] [1]"JetStream raises $34M..."...
-```
-
-This applies to all agents — main conversation, heartbeat, and cron tasks. View via `docker compose logs`.
-
-## Gradio Timeout
-
-`GRADIO_SERVER_TIMEOUT=3600` (1 hour) is set in docker-compose to prevent "Connection errored out" errors during long-running tasks. The default Gradio timeout is too short for code_interpreter sessions that process many URLs with `llm_call()`.
-
-## Docker Security
-
-The container runs with:
-- `read_only: true` — cannot write to the host filesystem
-- `no-new-privileges: true` — prevents privilege escalation
-- `cap_drop: ALL` — drops all Linux capabilities
-- `tmpfs` on `/tmp` with 100M limit
-- Non-root `agent` user
-- Named volume `agent_data` on `/app/data` — only writable persistent storage
-- Port 7860 exposed for Gradio WebUI
-
-## File Structure
+| **Web** | `web_search`, `web_url_fetch`, `stock_price` | Call port 8080 API via SSE. All outputs sanitized. Brave Search rate-limited to 1 req/2s. |
+| **Code** | `code_interpreter` | Local Jupyter kernel (subprocess, no Docker-in-Docker). Has `llm_call(prompt, system="", think=False)`. Variables persist. Output capped at 4k tokens. Dynamic timeout (10min-2hr). |
+| **Scheduling** | `schedule_task`, `list_tasks`, `complete_task`, `cancel_task`, `update_task_checkpoint` | JSON-backed task queue. Cron/interval/one-shot. Project-scoped. Exponential backoff retry. `cancel_task` permanently removes (including recurring). |
+| **Self-edit** | `update_soul`, `update_heartbeat` | Patch a section or append a line (not full file replacement). Auto-committed to git. |
+| **Memory** | `read_memories`, `add_memory` | MEMORIES.md with dated entries in 4 sections. Auto-loaded into system prompt. |
+| **Projects** | `create_project`, `list_projects`, `project_write_file`, `project_read_file`, `project_list_files`, `project_delete_file` | Persistent file workspaces at `DATA_DIR/projects/<name>/`. Auto-committed to git. |
+| **Chat** | `list_chat_logs`, `read_chat_log` | Daily markdown logs at `DATA_DIR/chat_logs/YYYY-MM-DD.md`. |
+| **Notifications** | `request_user`, `view_requests`, `resolve_request` | Structured JSON requests with pending/resolved status. Deduplication on pending subjects. |
+
+## Key Files
 
 ```
 sandbox_agent/
-├── __init__.py
-├── config.py                         # Dual-LLM config, token budgets, env vars
-├── main.py                           # Gradio/REPL entry, 3 lanes, model lock
-├── token_budget.py                   # Token estimation, conversation trimming
-├── chat_logger.py                   # Daily chat logs + list/read tools
-├── SOUL.md                           # Agent identity + token efficiency rules
+├── config.py                 # LLM configs, tool list, token budgets, load_system_message()
+├── main.py                   # Entry point: LockingAgent, run_on_best_available, cron_loop, create_agent
+├── SOUL.md                   # Agent identity + token efficiency rules (bundled default)
+├── MEMORIES.md               # Agent memories (bundled default)
+├── token_budget.py           # estimate_tokens, trim_to_budget, compute_request_timeout, truncate_output
+├── activity_log.py           # Structured event logging to activity.jsonl + in-memory state
+├── chat_logger.py            # Daily chat logs + list/read tools
+├── daily_digest.py           # Rolling 3-day digest, updated after each cron task
+├── status_server.py          # Separate process: /status, /dashboard, /digest, /requests on port 7861
 ├── tools/
-│   ├── __init__.py
-│   ├── api_tools.py                  # 3 tools calling port 8080 via SSE
-│   ├── sanitizer.py                  # Prompt injection defense
-│   ├── code_interpreter.py           # Local Jupyter kernel (no Docker-in-Docker)
-│   ├── llm_bridge.py                 # HTTP bridge for llm_call() in kernel
-│   ├── self_edit_tools.py            # read/update SOUL.md, HEARTBEAT.md, MEMORIES.md
-│   ├── project_tools.py             # Project workspace CRUD (6 tools)
-│   └── git_autocommit.py            # Auto-commit data changes to git
+│   ├── api_tools.py          # web_search, web_url_fetch, stock_price (port 8080 SSE)
+│   ├── sanitizer.py          # Prompt injection defense: strip tokens, invisible chars, delimiters
+│   ├── code_interpreter.py   # Local Jupyter kernel with llm_call() bridge
+│   ├── llm_bridge.py         # HTTP server → Ollama native API with think=true/false
+│   ├── self_edit_tools.py    # update_soul (section patch), update_heartbeat, read/add memory
+│   ├── project_tools.py      # Project workspace CRUD (6 tools)
+│   ├── notification_tools.py # request_user, view_requests, resolve_request + read_digest
+│   └── git_autocommit.py     # Auto-commit file changes in DATA_DIR git repo
 ├── heartbeat/
-│   ├── __init__.py
-│   ├── heartbeat_runner.py           # Isolated-session heartbeat loop
-│   ├── HEARTBEAT.md                  # Default checklist template
-│   └── MEMORIES.md                   # Default persistent memory file
+│   ├── heartbeat_runner.py   # Isolated sessions, HEARTBEAT_OK suppression, background work lock
+│   └── HEARTBEAT.md          # Default checklist
 ├── scheduler/
-│   ├── __init__.py
-│   ├── models.py                     # Task pydantic model
-│   ├── task_queue.py                 # JSON-backed queue with cron + backoff
-│   ├── scheduler_tools.py           # 4 registered tools for self-scheduling
-│   └── checkpoint.py                 # Long-running task state persistence
+│   ├── models.py             # Task pydantic model (cron, project, checkpoint, backoff)
+│   ├── task_queue.py         # JSON-backed queue with dependencies, backoff, remove_task
+│   ├── scheduler_tools.py    # schedule/list/complete/cancel/checkpoint tools
+│   └── checkpoint.py         # Task state persistence for long-running work
 └── docker/
-    ├── Dockerfile                    # Sandboxed container with Gradio + Jupyter
-    └── docker-compose.yml            # Security-hardened compose config
-
-tests/sandbox_agent/
-├── tools/
-│   ├── test_sanitizer.py             # 20 tests
-│   ├── test_api_tools.py             # 12 tests
-│   ├── test_code_interpreter.py      # 13 tests
-│   └── test_self_edit_tools.py       # 10 tests
-├── scheduler/
-│   └── test_scheduler.py             # 23 tests
-├── heartbeat/
-│   └── test_heartbeat.py             # 15 tests
-└── test_token_budget.py              # 9 tests
+    ├── Dockerfile            # Python 3.12, Qwen-Agent[gui], Jupyter, beautifulsoup4, lxml
+    └── docker-compose.yml    # Security-hardened, bind mount, env vars
 ```
+
+## Configuration (docker-compose.yml environment)
+
+| Env Var | Value | Purpose |
+|---|---|---|
+| `VLLM_BASE` | `http://192.168.4.66:8000/v1` | Primary model |
+| `OLLAMA_BASE` | `http://192.168.4.88:11434/v1` | Background model |
+| `TOOLS_API_BASE` | `http://host.docker.internal:8080` | Web tools |
+| `DATA_DIR` | `/app/data` | Writable volume (bind-mounted to ~/sandbox_agent_data/) |
+| `HEARTBEAT_INTERVAL_SECONDS` | `3600` | 1 hour |
+| `QWEN_AGENT_MAX_LLM_CALL_PER_RUN` | `50` | Max tool iterations per agent run |
+| `GRADIO_SERVER_TIMEOUT` | `3600` | 1 hour (prevents connection timeout on long tasks) |
+| `TZ` | `America/Los_Angeles` | Pacific time |
+| `QWEN_AGENT_DEFAULT_WORKSPACE` | `/app/data/workspace` | Qwen-Agent RAG workspace |
+
+## Token Budget & Timeouts
+
+| Layer | Budget/Limit | Mechanism |
+|---|---|---|
+| Conversation context | 200k tokens | `trim_to_budget()` drops oldest turns, preserves system prefix |
+| Tool outputs | 8k tokens | Sanitizer truncates |
+| Code interpreter output | 4k tokens | `truncate_output()` with corrective message |
+| Request timeout | 10-30 min (dynamic) | Linear scale based on payload size |
+| Code interpreter timeout | 10 min - 2 hr (dynamic) | Scales with code size |
+| `llm_call()` prompt | 200k tokens / 1MB | Bridge truncates |
+| Tool call loop | 50 iterations | `QWEN_AGENT_MAX_LLM_CALL_PER_RUN` |
+
+## System Prompt Assembly
+
+```
+load_system_message():
+  SOUL.md (from DATA_DIR or bundled default)
+  + "## Your Memories (auto-loaded from MEMORIES.md)" + MEMORIES.md content
+  + SYSTEM_PROMPT_SUFFIX (token efficiency reminder)
+
+Main agent only:
+  + session_metadata() (date, time, location: San Mateo CA, US/Pacific)
+```
+
+Background sessions use the base system message without metadata (static for KV cache).
+
+## Known Issues & Deferred Work
+
+### Active Issues
+- **vLLM thinking tokens**: Model outputs "Thinking Process: ..." inline. Fix requires vLLM server restart with `--chat-template-kwargs '{"enable_thinking": false}'` or passing `chat_template_kwargs: {"enable_thinking": false}` as a **top-level** field in the API request (not nested in `extra_body`).
+- **Context bloat stalls**: When the agent makes many tool calls with large outputs (web_url_fetch), the context grows until vLLM becomes very slow or hangs. Need token-based loop limit.
+- **Invalid JSON tool arguments**: The model sometimes generates malformed JSON with escaped quotes in `schedule_task` descriptions, causing tool call failures.
+
+### Deferred Work (saved in memory)
+- **Token-based loop limit**: Replace 50-iteration cap with ~200k token budget check per iteration.
+- **User notifications**: Slack/webhook integration for real-time alerts (currently file-based).
+- **Git commit on ALL file writes**: code_interpreter, chat_logger, checkpoints not yet auto-committed.
+- **Conversation state persistence**: Save messages to disk so agent can resume after Gradio crash.
+- **Disable vLLM thinking**: Needs server-side flag change.
+
+### Operational Notes
+- **Stuck tasks on restart**: Startup code resets any `running` tasks to `pending`.
+- **Brave Search rate limit**: 2-second minimum between requests (enforced in api_tools.py).
+- **Ollama `llm_call()` think parameter**: `think=False` (default) for extraction/classification, `think=True` for complex analysis. Uses Ollama native API, not OpenAI-compat.
+- **Dashboard process**: Runs as a separate `multiprocessing.Process` to avoid GIL blocking. Reads all data from files (activity.jsonl, digest, requests) — no shared memory.
+- **Daily digest**: After each cron task, Ollama summarizes the tool call record (not the raw result text) into 2-3 sentences for the digest.
+
+## Data Directory Layout (~/sandbox_agent_data/)
+
+```
+~/sandbox_agent_data/
+├── MEMORIES.md                    # Agent's persistent memory (auto-loaded into system prompt)
+├── SOUL.md                        # Agent-edited identity (if modified from bundled default)
+├── HEARTBEAT.md                   # Agent-edited heartbeat checklist
+├── tasks.json                     # Task queue (all scheduled/completed/recurring tasks)
+├── agent_requests.json            # Structured requests (pending/resolved)
+├── agent_requests.md              # Human-readable request view
+├── activity.jsonl                 # Structured event log (tool calls, cron, chat)
+├── chat_logs/
+│   └── YYYY-MM-DD.md             # Daily conversation logs
+├── digest/
+│   ├── YYYY-MM-DD.md             # Daily digest entries
+│   └── latest.md                 # Rolling 3-day view
+├── projects/
+│   └── flatsixai/                # Example project workspace
+│       ├── .project.json
+│       ├── README.md
+│       ├── TODO.md
+│       ├── research/             # Research files
+│       └── demos/                # Demo artifacts
+├── code_interpreter/              # Jupyter kernel files
+├── checkpoints/                   # Task checkpoint state
+└── workspace/                     # Qwen-Agent RAG workspace
+```
+
+## Docker Security
+
+- `read_only: true` — cannot write to host filesystem
+- `no-new-privileges: true` — prevents privilege escalation
+- `cap_drop: ALL` — drops all Linux capabilities
+- `tmpfs /tmp:size=100M` — temp files only
+- Non-root `agent` user
+- Bind mount only on `~/sandbox_agent_data/`
+- LLM bridge secured with per-startup auth token + 1MB request size limit
+- Content sanitizer strips chat-template tokens, invisible chars, delimiter injection
+
+## Cron Schedule (current)
+
+| Task | Schedule | Project | Description |
+|---|---|---|---|
+| `flatsixai-heartbeat-research` | `30 * * * *` (hourly at :30) | flatsixai | Research and advance project |
+| `flatsixai-deep-research-sprint` | `0 */2 * * *` (every 2hr) | flatsixai | Deep research sessions |
+| `Daily Trading Ideas Report` | `30 9 * * 1-5` (9:30am PT weekdays) | — | Trading report saved to `/data/trading_reports/` |
+| Main heartbeat (HEARTBEAT.md) | Every 1 hour (thread, not cron) | — | System health check |
+
+## Memory References
+
+See `~/.claude/projects/-Users-johnzhu-code-Qwen-Agent/memory/` for:
+- `reference_infrastructure.md` — LAN IPs and services
+- `feedback_thinking_tokens.md` — How to disable Qwen 3.5 thinking (verified methods)
+- `project_future_work.md` — Deferred improvements (token limits, notifications, git diffs)

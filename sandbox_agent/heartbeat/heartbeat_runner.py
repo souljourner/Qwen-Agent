@@ -3,6 +3,7 @@
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -79,6 +80,7 @@ class HeartbeatRunner:
         data_dir: Optional[str] = None,
         interval: Optional[int] = None,
         on_alert: Optional[Callable[[str], None]] = None,
+        work_lock: Optional["threading.Lock"] = None,
     ):
         """
         Args:
@@ -90,6 +92,7 @@ class HeartbeatRunner:
             data_dir: Directory containing HEARTBEAT.md.
             interval: Heartbeat interval in seconds (default from config).
             on_alert: Callback for when the heartbeat finds something that needs attention.
+            work_lock: Optional lock shared with cron loop to prevent concurrent background work.
         """
         self.agent_factory = agent_factory
         self.runner = runner
@@ -97,6 +100,7 @@ class HeartbeatRunner:
         self.data_dir = data_dir or DATA_DIR
         self.interval = interval or HEARTBEAT_INTERVAL_SECONDS
         self.on_alert = on_alert or (lambda msg: logger.info(f"HEARTBEAT ALERT: {msg}"))
+        self.work_lock = work_lock
 
     def run_once(self) -> Optional[str]:
         """Run a single heartbeat check. Returns alert text or None if OK."""
@@ -165,7 +169,12 @@ class HeartbeatRunner:
         time.sleep(min(self.interval, 60))
         while True:
             try:
-                alert = self.run_once()
+                if self.work_lock:
+                    logger.debug("Heartbeat: waiting for background work lock")
+                    with self.work_lock:
+                        alert = self.run_once()
+                else:
+                    alert = self.run_once()
                 if alert:
                     self.on_alert(alert)
             except Exception:
