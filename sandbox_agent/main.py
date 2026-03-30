@@ -6,6 +6,7 @@ Lane-based concurrency (OpenClaw pattern):
 - Cron lane: scheduled task execution using background Ollama model
 """
 
+import json
 import logging
 import os
 import sys
@@ -107,16 +108,18 @@ class LockingAgent(Assistant):
                     user_msg = m
                     break
 
+        # Try primary model first, fall back to 27B backup if busy
         got_lock = self._lock.acquire(blocking=False)
         if got_lock:
             agent = self._inner
             model_name = PRIMARY_LLM_CFG["model"]
             log_event("chat_start", detail=f"[primary] {str(user_msg.content)[:180]}" if user_msg else "[primary]")
         else:
+            # Primary busy with background task — use 27B backup (reserved for user)
             agent = self._backup
             model_name = BACKGROUND_LLM_CFG["model"]
-            log_event("chat_start", detail=f"[ollama fallback] {str(user_msg.content)[:160]}" if user_msg else "[ollama fallback]")
-            logger.info("Chat routed to Ollama (vLLM busy with background task)")
+            log_event("chat_start", detail=f"[27b fallback] {str(user_msg.content)[:160]}" if user_msg else "[27b fallback]")
+            logger.info(f"Chat routed to {model_name} (primary busy with background task)")
 
         set_state(status="chatting", model_in_use=model_name)
         try:
@@ -126,6 +129,7 @@ class LockingAgent(Assistant):
         finally:
             if got_lock:
                 self._lock.release()
+
         log_event("chat_complete")
         clear_state()
 
@@ -156,35 +160,81 @@ def _summarize_task_result(task_name: str, result_text: str, tool_calls: List[di
         project_ctx = f" (project: {project})" if project else ""
 
         # Build a factual record of what happened from tool calls
-        actions = []
+        searches = []
+        files_written = []
+        files_read = []
+        code_results = []
+        scheduled = []
+        other = []
+
         for tc in tool_calls:
             tool = tc.get("tool", "")
             args = tc.get("args", "")
             result = tc.get("result", "")
             if tool == "web_search":
-                actions.append(f"Searched: {args}")
+                # Extract query from args
+                try:
+                    q = json.loads(args).get("query", args)
+                except Exception:
+                    q = args
+                searches.append(q[:80])
             elif tool == "web_url_fetch":
-                actions.append(f"Fetched URL: {args}")
+                try:
+                    u = json.loads(args).get("url", args)
+                except Exception:
+                    u = args
+                searches.append(f"Fetched: {u[:80]}")
             elif tool == "project_write_file":
-                actions.append(f"Wrote file: {args}")
+                try:
+                    parsed = json.loads(args)
+                    files_written.append(f"{parsed.get('project','')}/{parsed.get('path','')}")
+                except Exception:
+                    files_written.append(args[:80])
+            elif tool == "project_read_file":
+                try:
+                    parsed = json.loads(args)
+                    files_read.append(f"{parsed.get('project','')}/{parsed.get('path','')}")
+                except Exception:
+                    files_read.append(args[:80])
             elif tool == "code_interpreter":
-                actions.append(f"Ran code → {result[:100]}")
+                if result:
+                    code_results.append(result[:120])
             elif tool == "schedule_task":
-                actions.append(f"Scheduled: {result[:100]}")
-            elif tool == "add_memory":
-                actions.append(f"Saved memory: {args[:100]}")
+                scheduled.append(result[:100])
             elif tool:
-                actions.append(f"{tool}: {args[:80]}")
+                other.append(f"{tool}: {args[:60]}")
 
-        actions_text = "\n".join(actions[-20:]) if actions else "No tool calls recorded."
+        # Build structured summary input
+        parts = [f"Task: {task_name}{project_ctx}", ""]
+        parts.append(f"Tool calls: {len(tool_calls)} total")
+        if searches:
+            parts.append(f"Searches ({len(searches)}): {'; '.join(searches[:5])}")
+        if files_read:
+            parts.append(f"Files read: {', '.join(files_read[:5])}")
+        if files_written:
+            parts.append(f"Files written: {', '.join(files_written[:5])}")
+        if code_results:
+            parts.append(f"Code outputs: {' | '.join(code_results[:3])}")
+        if scheduled:
+            parts.append(f"Scheduled: {'; '.join(scheduled[:3])}")
+        if other:
+            parts.append(f"Other: {'; '.join(other[:3])}")
+
+        actions_text = "\n".join(parts)
 
         resp = _req.post(
             f"{ollama_base}/api/chat",
             json={
                 "model": BACKGROUND_LLM_CFG["model"],
                 "messages": [
-                    {"role": "system", "content": "Summarize what this task accomplished in 2-3 sentences. Focus on: what was searched, what files were created/updated, what was scheduled, and key findings. Be factual and specific. No filler or planning language."},
-                    {"role": "user", "content": f"Task: {task_name}{project_ctx}\n\nActions taken:\n{actions_text}\n\nAgent's final message:\n{result_text[:500]}"},
+                    {"role": "system", "content": (
+                        "You are writing a digest entry. Given the facts below, write exactly 2-3 sentences. "
+                        "State what was searched, what files were created, and any key findings or numbers. "
+                        "Use the FACTS ONLY — do not invent information. Do not say 'the task initiated' or "
+                        "'the system is prepared' — say what actually happened. If files were written, name them. "
+                        "If searches were done, mention the topics. If nothing substantive happened, say that."
+                    )},
+                    {"role": "user", "content": actions_text},
                 ],
                 "think": False,
                 "stream": False,
@@ -200,39 +250,28 @@ def _summarize_task_result(task_name: str, result_text: str, tool_calls: List[di
 
 
 def run_on_best_available(system_message: str, messages: List[Message]) -> List[Message]:
-    """Run an isolated agent session, preferring the primary model if it's free.
+    """Run a background agent session on the primary model.
 
-    Tries to acquire the primary model lock non-blocking:
-    - If free: runs on primary vLLM (better quality). Does NOT hold the lock
-      during execution — releases it immediately so the main conversation
-      can still use vLLM. Both will queue on vLLM but the user only waits
-      for one background call (~30s), not the entire task.
-    - If busy (main lane is chatting): falls back to Ollama.
+    Background tasks always use the primary model (qwen3.5).
+    The backup model (qwen3.5-27b) is reserved for user chat fallback only.
+    Holds the lock for the entire run so the user gets routed to the 27B backup.
     """
     timeout = compute_request_timeout(messages)
 
-    # Check if user is currently chatting — if not, use primary
-    if _primary_model_lock.acquire(blocking=False):
-        _primary_model_lock.release()  # Release immediately — don't hold during execution
-        logger.info(f"Background task using primary model (idle, timeout={timeout}s)")
+    # Blocking acquire — background tasks wait for the primary model
+    _primary_model_lock.acquire(blocking=True)
+    try:
+        logger.info(f"Background task using primary model (timeout={timeout}s)")
         set_state(model_in_use=PRIMARY_LLM_CFG["model"])
-        log_event("model_select", detail="primary (idle)", model=PRIMARY_LLM_CFG["model"])
+        log_event("model_select", detail="primary (background)", model=PRIMARY_LLM_CFG["model"])
         agent = create_agent(system_message, llm_cfg=PRIMARY_LLM_CFG)
         agent.llm.generate_cfg["request_timeout"] = timeout
         response: List[Message] = []
         for response in agent.run(messages=messages):
             pass
         return response
-    else:
-        logger.info(f"Background task using Ollama (primary model busy, timeout={timeout}s)")
-        set_state(model_in_use=BACKGROUND_LLM_CFG["model"])
-        log_event("model_select", detail="ollama (primary busy)", model=BACKGROUND_LLM_CFG["model"])
-        agent = create_agent(system_message, llm_cfg=BACKGROUND_LLM_CFG)
-        agent.llm.generate_cfg["request_timeout"] = timeout
-        response: List[Message] = []
-        for response in agent.run(messages=messages):
-            pass
-        return response
+    finally:
+        _primary_model_lock.release()
 
 
 def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 60) -> None:
@@ -379,23 +418,10 @@ def main() -> None:
     # Start LLM bridge so code_interpreter can make LLM calls to the background model
     from sandbox_agent.tools.llm_bridge import start_bridge, get_kernel_init_code
     import sandbox_agent.tools.code_interpreter as ci
-    bridge_port = start_bridge(BACKGROUND_LLM_CFG)
+    # llm_call() uses the primary model — it's MoE so faster than the dense 27B
+    bridge_port = start_bridge(PRIMARY_LLM_CFG)
     ci._llm_init_code = get_kernel_init_code(bridge_port)
     logger.info(f"LLM bridge started on port {bridge_port} -> {BACKGROUND_LLM_CFG['model']} @ {BACKGROUND_LLM_CFG['model_server']}")
-
-    # Pre-warm Ollama model via native API (lazy-loads into GPU on first call)
-    try:
-        import requests as _req
-        ollama_base = BACKGROUND_LLM_CFG["model_server"].replace("/v1", "")
-        logger.info(f"Pre-warming Ollama model ({BACKGROUND_LLM_CFG['model']})...")
-        _req.post(
-            f"{ollama_base}/api/chat",
-            json={"model": BACKGROUND_LLM_CFG["model"], "messages": [{"role": "user", "content": "hi"}], "think": False, "stream": False},
-            timeout=120,
-        )
-        logger.info("Ollama model pre-warmed")
-    except Exception as e:
-        logger.warning(f"Failed to pre-warm Ollama model: {e}")
 
     # Main agent on primary vLLM model
     # Main agent uses system message WITH metadata (date/time/location)

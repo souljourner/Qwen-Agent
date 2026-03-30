@@ -24,17 +24,21 @@ from sandbox_agent.config import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
-WORK_DIR = os.path.join(DATA_DIR, "code_interpreter")
+WORK_DIR = os.path.join(DATA_DIR, "scratch")
 
 LAUNCH_KERNEL_PY = "from ipykernel import kernelapp as app\napp.launch_new_instance()\n"
 
-INIT_CODE = """\
+INIT_CODE = f"""\
 def input(*args, **kwargs):
     raise NotImplementedError('Python input() function is disabled.')
 
 import os, math, re, json
 import numpy as np
 import pandas as pd
+
+# Pre-configured paths
+DATA_DIR = os.getenv('DATA_DIR', '{DATA_DIR}')
+PROJECTS_DIR = os.path.join(DATA_DIR, 'projects')
 """
 
 # LLM bridge init code is appended after INIT_CODE when the kernel starts
@@ -118,8 +122,19 @@ def _drain_output(kc, timeout_seconds: int = 5) -> None:
 
 
 def _get_kernel():
-    """Get or start the kernel client."""
-    global _kernel_client
+    """Get or start the kernel client. Restarts if the kernel process died."""
+    global _kernel_client, _kernel_process
+    # Check if existing kernel is still alive
+    if _kernel_client is not None and _kernel_process is not None:
+        if _kernel_process.poll() is not None:
+            # Kernel process is dead — clean up and restart
+            logger.warning(f"Kernel process died (exit code {_kernel_process.returncode}). Restarting.")
+            try:
+                _kernel_client.stop_channels()
+            except Exception:
+                pass
+            _kernel_client = None
+            _kernel_process = None
     if _kernel_client is None:
         _kernel_client = _start_kernel()
     return _kernel_client
@@ -165,7 +180,17 @@ def _execute_code(code: str, timeout: int = 0) -> str:
     if timeout <= 0:
         timeout = _compute_timeout(code)
     kc = _get_kernel()
-    kc.wait_for_ready()
+    try:
+        kc.wait_for_ready(timeout=30)
+    except RuntimeError:
+        # Kernel not responding — restart it
+        logger.warning("Kernel not responding to wait_for_ready. Restarting.")
+        global _kernel_client, _kernel_process
+        _cleanup_kernel()
+        _kernel_client = None
+        _kernel_process = None
+        kc = _get_kernel()
+        kc.wait_for_ready(timeout=30)
 
     # Add timeout guard
     wrapped = f"""\
@@ -266,11 +291,18 @@ class LocalCodeInterpreter(BaseTool):
         "Use think=False (default) for fast extraction/classification. "
         "Use think=True for complex analysis, synthesis, or multi-step reasoning. "
         "Variables persist between calls. "
+        "NOTE: Only llm_call() and standard Python are available inside code. "
+        "Other agent tools (web_search, project_write_file, schedule_task, etc.) "
+        "are NOT available — use them as separate tool calls after code_interpreter returns. "
+        "Pre-configured path variables: DATA_DIR, PROJECTS_DIR. "
+        "Use these for file access, e.g.: open(f'{PROJECTS_DIR}/flatsixai/research/analysis.md'). "
+        "NEVER use relative paths or hardcode 'data/...' — always use the path variables. "
         "CRITICAL RULES: "
-        "1) Write intermediate data to files (use DATA_DIR=os.getenv('DATA_DIR','data')), never to stdout. "
-        "2) For multiple URLs: ONE script, for-loop, save raw content to .jsonl file, process from file with llm_call(). "
-        "3) print() ONLY a 3-5 line summary. Save full results to a file. "
-        "4) NEVER print raw HTML/page content. NEVER make separate calls per URL."
+        '1) IMPORTANT: You must escape all inner double quotes (e.g., \\") or use single quotes for strings within the code to ensure valid JSON output. '
+        "2) Write intermediate data to files (use DATA_DIR=os.getenv('DATA_DIR','data')), never to stdout. "
+        "3) For multiple URLs: ONE script, for-loop, save raw content to .jsonl file, process from file with llm_call(). "
+        "4) print() ONLY a 3-5 line summary. Save full results to a file. "
+        "5) NEVER print raw HTML/page content. NEVER make separate calls per URL."
     )
     parameters = {
         "type": "object",

@@ -16,16 +16,16 @@ PRIMARY_LLM_CFG = {
     },
 }
 
-# Background LLM: Ollama on secondary hardware (192.168.4.88)
-# Used for heartbeat, cron tasks, and any parallel background work
+# Backup LLM: qwen3.5-27b on same vLLM server
+# Reserved for user chat fallback when the big model is busy with background tasks.
+# Background tasks NEVER use this — they always use the primary model.
 BACKGROUND_LLM_CFG = {
-    "model": "qwen3.5-9b-256k:latest",
-    "model_server": os.getenv("OLLAMA_BASE", "http://192.168.4.88:11434/v1"),
+    "model": "qwen3.5-27b",
+    "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {
         "max_input_tokens": 0,
-        "request_timeout": 1800,       # 30min — same as primary for consistency
-        # Note: use_raw_api is NOT set — same reason as primary
+        "request_timeout": 1800,
     },
 }
 
@@ -41,13 +41,14 @@ DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data")
 
 TOOL_LIST = [
     "web_search", "web_url_fetch", "stock_price",
-    "schedule_task", "list_tasks", "complete_task", "cancel_task", "update_task_checkpoint",
+    "schedule_task", "list_tasks", "complete_task", "cancel_task", "pause_task", "resume_task", "update_task_checkpoint",
     "update_soul", "update_heartbeat",
     "read_memories", "add_memory",
     "code_interpreter",
     "list_chat_logs", "read_chat_log",
-    "create_project", "list_projects", "project_write_file",
+    "create_project", "list_projects", "delete_project", "project_write_file",
     "project_read_file", "project_list_files", "project_delete_file",
+    "move_file", "delete_file",
     "request_user", "view_requests", "resolve_request",
 ]
 

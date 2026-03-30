@@ -50,7 +50,8 @@ class ScheduleTask(BaseTool):
                     "Detailed step-by-step instructions for the background agent. "
                     "This is the prompt the agent will receive. Be specific about which tools to use "
                     "(e.g., 'Use code_interpreter to fetch URLs with requests.get(), then use llm_call() "
-                    "to analyze each page'). The background agent has all the same tools you do."
+                    "to analyze each page'). The background agent has all the same tools you do. "
+                    'IMPORTANT: You must escape all inner double quotes (e.g., \\") or use single quotes for strings within the code to ensure valid JSON output.'
                 ),
             },
             "schedule_type": {
@@ -123,18 +124,21 @@ class ListTasks(BaseTool):
     """List tasks in the queue."""
 
     name = "list_tasks"
-    description = "List tasks in the task queue, optionally filtered by status and/or project."
+    description = (
+        "List tasks. Default shows current tasks (pending, running, paused, failed). "
+        "Use category='completed' or 'cancelled' to see archived tasks."
+    )
     parameters = {
         "type": "object",
         "properties": {
-            "status": {
+            "category": {
                 "type": "string",
-                "enum": ["pending", "running", "completed", "failed"],
-                "description": "Filter by task status. Omit to list all tasks.",
+                "enum": ["current", "completed", "cancelled"],
+                "description": "Which tasks to list: 'current' (default — active/paused/failed), 'completed', or 'cancelled'.",
             },
             "project": {
                 "type": "string",
-                "description": "Filter by project name. Omit to list all tasks.",
+                "description": "Filter by project name.",
             },
         },
         "required": [],
@@ -143,7 +147,7 @@ class ListTasks(BaseTool):
     def call(self, params: Union[str, dict], **kwargs) -> str:
         params = self._verify_json_format_args(params)
         tq = get_task_queue()
-        tasks = tq.list_tasks(status=params.get("status"), project=params.get("project"))
+        tasks = tq.list_tasks(category=params.get("category"), project=params.get("project"))
         return json.dumps([{
             "id": t.id,
             "name": t.name,
@@ -278,3 +282,58 @@ class CancelTask(BaseTool):
         name = task.name
         tq.remove_task(params["task_id"])
         return json.dumps({"status": "cancelled", "task_id": params["task_id"], "name": name})
+
+
+@register_tool("pause_task")
+class PauseTask(BaseTool):
+    """Pause a task — it stays in the queue but won't run until resumed."""
+
+    name = "pause_task"
+    description = (
+        "Pause a task. It stays in the queue but won't be picked up by the cron loop. "
+        "Use resume_task to unpause it. Works for both one-shot and recurring tasks."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "The task ID to pause.",
+            },
+        },
+        "required": ["task_id"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        tq = get_task_queue()
+        task = tq.update_task(params["task_id"], status="paused")
+        if not task:
+            return json.dumps({"error": f"Task {params['task_id']} not found"})
+        return json.dumps({"status": "paused", "task_id": task.id, "name": task.name})
+
+
+@register_tool("resume_task")
+class ResumeTask(BaseTool):
+    """Resume a paused task."""
+
+    name = "resume_task"
+    description = "Resume a paused task so it will run again on its next schedule."
+    parameters = {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "The task ID to resume.",
+            },
+        },
+        "required": ["task_id"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        tq = get_task_queue()
+        task = tq.update_task(params["task_id"], status="pending")
+        if not task:
+            return json.dumps({"error": f"Task {params['task_id']} not found"})
+        return json.dumps({"status": "pending", "task_id": task.id, "name": task.name, "next_run": str(task.next_run)})

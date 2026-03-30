@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Union
@@ -10,6 +11,15 @@ from qwen_agent.tools.base import BaseTool, register_tool
 
 from sandbox_agent.config import DATA_DIR
 from sandbox_agent.tools.git_autocommit import autocommit
+
+
+def _validate_data_path(path: str) -> str:
+    """Validate a path is within DATA_DIR. Returns the resolved absolute path or raises."""
+    resolved = os.path.realpath(os.path.join(DATA_DIR, path))
+    data_real = os.path.realpath(DATA_DIR)
+    if not resolved.startswith(data_real + os.sep) and resolved != data_real:
+        raise ValueError(f"Path escapes sandbox: {path}")
+    return resolved
 
 PROJECTS_DIR = os.path.join(DATA_DIR, "projects")
 
@@ -128,6 +138,39 @@ class ListProjects(BaseTool):
         for p in projects:
             lines.append(f"- **{p['name']}**: {p['description']} ({p['files']} files, created {p['created'][:10]})")
         return "\n".join(lines)
+
+
+@register_tool("delete_project")
+class DeleteProject(BaseTool):
+    """Delete an entire project and all its files."""
+
+    name = "delete_project"
+    description = (
+        "Delete a project and all its files permanently. This cannot be undone. "
+        "Use list_projects and project_list_files first to verify what will be deleted."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "description": "Project name to delete.",
+            },
+        },
+        "required": ["project"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        pdir = _project_dir(params["project"])
+
+        if not os.path.exists(pdir):
+            return f"Project '{params['project']}' not found."
+
+        # Count files before deletion
+        file_count = sum(len(files) for _, _, files in os.walk(pdir))
+        shutil.rmtree(pdir)
+        return f"Deleted project '{params['project']}' ({file_count} files removed)"
 
 
 @register_tool("project_write_file")
@@ -321,3 +364,85 @@ class ProjectDeleteFile(BaseTool):
 
         os.remove(full_path)
         return f"Deleted: {params['path']} from {params['project']}"
+
+
+@register_tool("move_file")
+class MoveFile(BaseTool):
+    """Move or rename a file within the data directory."""
+
+    name = "move_file"
+    description = (
+        "Move or rename a file within the data directory. Both paths are relative to DATA_DIR. "
+        "Can move files between projects or reorganize within a project. "
+        "Creates destination directories if needed."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "src": {
+                "type": "string",
+                "description": "Source path relative to DATA_DIR (e.g., 'projects/flatsixai/old-name.md').",
+            },
+            "dst": {
+                "type": "string",
+                "description": "Destination path relative to DATA_DIR (e.g., 'projects/flatsixai/research/new-name.md').",
+            },
+        },
+        "required": ["src", "dst"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        try:
+            src = _validate_data_path(params["src"])
+            dst = _validate_data_path(params["dst"])
+        except ValueError as e:
+            return f"Error: {e}"
+
+        if not os.path.exists(src):
+            return f"Source not found: {params['src']}"
+
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.move(src, dst)
+        return f"Moved: {params['src']} → {params['dst']}"
+
+
+@register_tool("delete_file")
+class DeleteFile(BaseTool):
+    """Delete a file or empty directory within the data directory."""
+
+    name = "delete_file"
+    description = (
+        "Delete a file or empty directory within the data directory. "
+        "Path is relative to DATA_DIR. Cannot delete non-empty directories."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path relative to DATA_DIR (e.g., 'projects/flatsixai/old-file.md').",
+            },
+        },
+        "required": ["path"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        try:
+            full_path = _validate_data_path(params["path"])
+        except ValueError as e:
+            return f"Error: {e}"
+
+        if not os.path.exists(full_path):
+            return f"Not found: {params['path']}"
+
+        if os.path.isdir(full_path):
+            try:
+                os.rmdir(full_path)  # Only removes empty directories
+                return f"Deleted directory: {params['path']}"
+            except OSError:
+                return f"Cannot delete non-empty directory: {params['path']}"
+        else:
+            os.remove(full_path)
+            return f"Deleted: {params['path']}"

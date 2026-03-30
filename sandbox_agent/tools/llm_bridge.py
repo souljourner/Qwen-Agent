@@ -1,6 +1,6 @@
 """LLM bridge — exposes an HTTP endpoint so code_interpreter can make LLM calls.
 
-Calls Ollama's native API (/api/chat) with think=false to suppress reasoning tokens.
+Uses the backup model (qwen3.5-27b) on vLLM via OpenAI-compatible API.
 Secured with a shared secret token generated at startup.
 """
 
@@ -23,14 +23,9 @@ _auth_token = None
 
 MAX_REQUEST_BODY = 1_000_000  # 1MB max request size
 
-# Extract Ollama connection info from config
-# model_server is like "http://192.168.4.88:11434/v1" — we need the base URL without /v1
-_ollama_base = BACKGROUND_LLM_CFG["model_server"].replace("/v1", "")
-_ollama_model = BACKGROUND_LLM_CFG["model"]
 
-
-def _create_handler(auth_token: str):
-    """Create a request handler that calls Ollama's native API."""
+def _create_handler(llm_cfg: dict, auth_token: str):
+    """Create a request handler that calls the LLM via OpenAI-compatible API."""
 
     class LLMHandler(BaseHTTPRequestHandler):
 
@@ -55,7 +50,7 @@ def _create_handler(auth_token: str):
 
             prompt = body.get("prompt", "")
             system = body.get("system", "")
-            think = body.get("think", False)  # Default: no reasoning (fast)
+            think = body.get("think", False)
 
             # Cap prompt to ~200k tokens (800k chars) to stay within model limits
             max_prompt_chars = 200000 * 4
@@ -63,24 +58,25 @@ def _create_handler(auth_token: str):
                 prompt = prompt[:max_prompt_chars] + "\n... (truncated to fit token budget)"
 
             try:
-                # Call Ollama native API directly
+                # Build messages
                 messages = []
                 if system:
                     messages.append({"role": "system", "content": system})
                 messages.append({"role": "user", "content": prompt})
 
+                # Call vLLM OpenAI-compatible API
                 resp = http_requests.post(
-                    f"{_ollama_base}/api/chat",
+                    f"{llm_cfg['model_server']}/chat/completions",
                     json={
-                        "model": _ollama_model,
+                        "model": llm_cfg["model"],
                         "messages": messages,
-                        "think": think,
-                        "stream": False,
+                        "max_tokens": 4096,
                     },
                     timeout=600,
                 )
                 resp.raise_for_status()
-                result_text = resp.json().get("message", {}).get("content", "")
+                data = resp.json()
+                result_text = data["choices"][0]["message"].get("content", "")
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -107,17 +103,13 @@ def _create_handler(auth_token: str):
 
 def start_bridge(llm_cfg: Optional[dict] = None) -> int:
     """Start the LLM bridge server. Returns the port number."""
-    global _server, _port, _auth_token, _ollama_base, _ollama_model
+    global _server, _port, _auth_token
     if _server is not None:
         return _port
 
-    # Allow override from passed config
-    if llm_cfg:
-        _ollama_base = llm_cfg["model_server"].replace("/v1", "")
-        _ollama_model = llm_cfg["model"]
-
+    cfg = llm_cfg or BACKGROUND_LLM_CFG
     _auth_token = secrets.token_hex(32)
-    handler = _create_handler(_auth_token)
+    handler = _create_handler(cfg, _auth_token)
 
     # Find a free port, bind to localhost only
     _server = HTTPServer(("127.0.0.1", 0), handler)
@@ -125,7 +117,7 @@ def start_bridge(llm_cfg: Optional[dict] = None) -> int:
 
     thread = threading.Thread(target=_server.serve_forever, daemon=True, name="llm-bridge")
     thread.start()
-    logger.info(f"LLM bridge started on port {_port} -> {_ollama_model} @ {_ollama_base} (native API, think=false)")
+    logger.info(f"LLM bridge started on port {_port} -> {cfg['model']} @ {cfg['model_server']}")
     return _port
 
 

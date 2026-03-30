@@ -23,11 +23,14 @@ class TaskQueue:
         self._data_dir = data_dir or DATA_DIR
         os.makedirs(self._data_dir, exist_ok=True)
         self._file_path = os.path.join(self._data_dir, "tasks.json")
+        self._completed_path = os.path.join(self._data_dir, "tasks_completed.json")
+        self._cancelled_path = os.path.join(self._data_dir, "tasks_cancelled.json")
         self._lock = threading.Lock()
         self._tasks: List[Task] = []
         self._load()
 
     def _load(self) -> None:
+        # Only load active tasks into memory
         if os.path.exists(self._file_path):
             with open(self._file_path, "r") as f:
                 raw = json.load(f)
@@ -35,14 +38,74 @@ class TaskQueue:
         else:
             self._tasks = []
 
-    def _save(self) -> None:
+        # Migrate: move completed/cancelled tasks to archive files on first load
+        active = []
+        archived_completed = []
+        archived_cancelled = []
+        for t in self._tasks:
+            if t.status == "completed":
+                archived_completed.append(t)
+            elif t.status == "cancelled":
+                archived_cancelled.append(t)
+            else:
+                active.append(t)
+
+        if archived_completed or archived_cancelled:
+            self._tasks = active
+            if archived_completed:
+                self._append_to_archive(self._completed_path, archived_completed)
+            if archived_cancelled:
+                self._append_to_archive(self._cancelled_path, archived_cancelled)
+            self._save_active()
+
+    def _append_to_archive(self, path: str, tasks: List[Task]) -> None:
+        """Append tasks to an archive file."""
+        existing = []
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                existing = json.load(f)
+        existing.extend([t.model_dump(mode="json") for t in tasks])
+        with open(path, "w") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2, default=str)
+
+    def _load_archive(self, path: str) -> List[Task]:
+        """Load tasks from an archive file."""
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return [Task(**t) for t in json.load(f)]
+        return []
+
+    def _save_active(self) -> None:
+        """Save only active tasks (not completed/cancelled)."""
         with open(self._file_path, "w") as f:
             json.dump([t.model_dump(mode="json") for t in self._tasks], f, ensure_ascii=False, indent=2, default=str)
+
+    def _save(self) -> None:
+        # Separate completed/cancelled from active
+        active = []
+        newly_completed = []
+        newly_cancelled = []
+        for t in self._tasks:
+            if t.status == "completed":
+                newly_completed.append(t)
+            elif t.status == "cancelled":
+                newly_cancelled.append(t)
+            else:
+                active.append(t)
+
+        self._tasks = active
+        self._save_active()
+
+        if newly_completed:
+            self._append_to_archive(self._completed_path, newly_completed)
+        if newly_cancelled:
+            self._append_to_archive(self._cancelled_path, newly_cancelled)
+
         try:
             from sandbox_agent.tools.git_autocommit import autocommit
             autocommit("tasks.json", "Update task queue")
         except Exception:
-            pass  # Git commit is best-effort
+            pass
 
     def add_task(
         self,
@@ -92,17 +155,27 @@ class TaskQueue:
             self._save()
         return task
 
+    @staticmethod
+    def _make_naive(dt: datetime) -> datetime:
+        """Strip timezone info for consistent comparison."""
+        if dt and dt.tzinfo is not None:
+            return dt.replace(tzinfo=None)
+        return dt
+
     def get_due_tasks(self) -> List[Task]:
         """Return tasks that are due to run now, respecting dependencies."""
         now = datetime.now()
+        # Check both active and archived completed tasks for dependency resolution
         completed_ids = {t.id for t in self._tasks if t.status == "completed"}
+        completed_ids.update(t.id for t in self._load_archive(self._completed_path))
 
         due = []
         with self._lock:
             for task in self._tasks:
                 if task.status not in ("pending", "failed"):
                     continue
-                if task.next_run and task.next_run > now:
+                next_run = self._make_naive(task.next_run)
+                if next_run and next_run > now:
                     continue
                 # Check dependencies
                 if task.depends_on and not all(dep_id in completed_ids for dep_id in task.depends_on):
@@ -114,7 +187,7 @@ class TaskQueue:
                 due.append(task)
 
         # Sort by priority (higher first), then by next_run (earlier first)
-        due.sort(key=lambda t: (-t.priority, t.next_run or now))
+        due.sort(key=lambda t: (-t.priority, self._make_naive(t.next_run) or now))
         return due
 
     def update_task(
@@ -174,10 +247,23 @@ class TaskQueue:
             self._save()
             return task
 
-    def list_tasks(self, status: Optional[str] = None, project: Optional[str] = None) -> List[Task]:
-        """List tasks, optionally filtered by status and/or project."""
+    def list_tasks(self, category: Optional[str] = None, status: Optional[str] = None, project: Optional[str] = None) -> List[Task]:
+        """List tasks by category.
+
+        Categories:
+        - 'current' (default): active tasks (pending, running, paused, failed)
+        - 'completed': archived completed tasks
+        - 'cancelled': archived cancelled tasks
+        """
         with self._lock:
-            tasks = list(self._tasks)
+            if category == "completed":
+                tasks = self._load_archive(self._completed_path)
+            elif category == "cancelled":
+                tasks = self._load_archive(self._cancelled_path)
+            else:
+                # Default: current/active tasks
+                tasks = list(self._tasks)
+
             if status:
                 tasks = [t for t in tasks if t.status == status]
             if project:
@@ -190,14 +276,16 @@ class TaskQueue:
             return self._find_task(task_id)
 
     def remove_task(self, task_id: str) -> bool:
-        """Remove a task from the queue entirely."""
+        """Cancel a task — moves it to the cancelled archive."""
         with self._lock:
-            before = len(self._tasks)
+            task = self._find_task(task_id)
+            if not task:
+                return False
+            task.status = "cancelled"
             self._tasks = [t for t in self._tasks if t.id != task_id]
-            if len(self._tasks) < before:
-                self._save()
-                return True
-            return False
+            self._append_to_archive(self._cancelled_path, [task])
+            self._save_active()
+            return True
 
     def _find_task(self, task_id: str) -> Optional[Task]:
         for task in self._tasks:

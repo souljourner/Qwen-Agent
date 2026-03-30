@@ -167,10 +167,10 @@ class TestTaskQueue:
         t2 = task_queue.add_task(name="b", description="b", schedule_type="at")
         task_queue.update_task(t1.id, status="completed")
 
-        pending = task_queue.list_tasks(status="pending")
-        completed = task_queue.list_tasks(status="completed")
-        assert len(pending) == 1
-        assert len(completed) == 1
+        current = task_queue.list_tasks(category="current")
+        completed = task_queue.list_tasks(category="completed")
+        assert len(current) == 1  # Only t2 (pending)
+        assert len(completed) == 1  # t1 archived
 
 
 class TestCheckpoint:
