@@ -417,9 +417,10 @@ def main() -> None:
 
     # Start LLM bridge so code_interpreter can make LLM calls to the background model
     from sandbox_agent.tools.llm_bridge import start_bridge, get_kernel_init_code
+    from sandbox_agent.config import LLM_CALL_CFG
     import sandbox_agent.tools.code_interpreter as ci
-    # llm_call() uses the primary model — it's MoE so faster than the dense 27B
-    bridge_port = start_bridge(PRIMARY_LLM_CFG)
+    # llm_call() uses gemma4:26b on Ollama for per-item processing
+    bridge_port = start_bridge(LLM_CALL_CFG)
     ci._llm_init_code = get_kernel_init_code(bridge_port)
     logger.info(f"LLM bridge started on port {bridge_port} -> {BACKGROUND_LLM_CFG['model']} @ {BACKGROUND_LLM_CFG['model_server']}")
 

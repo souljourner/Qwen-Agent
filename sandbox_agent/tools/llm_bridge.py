@@ -58,25 +58,40 @@ def _create_handler(llm_cfg: dict, auth_token: str):
                 prompt = prompt[:max_prompt_chars] + "\n... (truncated to fit token budget)"
 
             try:
-                # Build messages
                 messages = []
                 if system:
                     messages.append({"role": "system", "content": system})
                 messages.append({"role": "user", "content": prompt})
 
-                # Call vLLM OpenAI-compatible API
-                resp = http_requests.post(
-                    f"{llm_cfg['model_server']}/chat/completions",
-                    json={
-                        "model": llm_cfg["model"],
-                        "messages": messages,
-                        "max_tokens": 4096,
-                    },
-                    timeout=600,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                result_text = data["choices"][0]["message"].get("content", "")
+                # Use Ollama native API if available, otherwise OpenAI-compat
+                ollama_base = llm_cfg["model_server"].replace("/v1", "")
+                if "11434" in ollama_base:
+                    # Ollama native API — supports think parameter
+                    resp = http_requests.post(
+                        f"{ollama_base}/api/chat",
+                        json={
+                            "model": llm_cfg["model"],
+                            "messages": messages,
+                            "think": think,
+                            "stream": False,
+                        },
+                        timeout=600,
+                    )
+                    resp.raise_for_status()
+                    result_text = resp.json().get("message", {}).get("content", "")
+                else:
+                    # vLLM OpenAI-compatible API
+                    resp = http_requests.post(
+                        f"{llm_cfg['model_server']}/chat/completions",
+                        json={
+                            "model": llm_cfg["model"],
+                            "messages": messages,
+                            "max_tokens": 4096,
+                        },
+                        timeout=600,
+                    )
+                    resp.raise_for_status()
+                    result_text = resp.json()["choices"][0]["message"].get("content", "")
 
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")

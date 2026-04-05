@@ -29,6 +29,13 @@ BACKGROUND_LLM_CFG = {
     },
 }
 
+# LLM Call model: gemma4:26b on Ollama (192.168.4.88)
+# Used by llm_call() inside code_interpreter for per-item processing
+LLM_CALL_CFG = {
+    "model": os.getenv("LLM_CALL_MODEL", "gemma4:26b"),
+    "model_server": os.getenv("LLM_CALL_BASE", "http://192.168.4.88:11434/v1"),
+}
+
 # Token budget — all models have 256k limit, we target 200k to leave room for generation
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "200000"))
 MAX_TOOL_OUTPUT_TOKENS = int(os.getenv("MAX_TOOL_OUTPUT_TOKENS", "8000"))
