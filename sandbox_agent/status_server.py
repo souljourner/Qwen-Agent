@@ -11,6 +11,8 @@ from sandbox_agent.config import DATA_DIR
 
 logger = logging.getLogger(__name__)
 
+_SERVER_START_TIME = None  # Set when status server process starts
+
 DASHBOARD_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -250,16 +252,10 @@ def _read_status_from_file() -> dict:
         "uptime_seconds": 0,
     }
 
-    # Compute uptime from first event
-    if recent_events:
-        try:
-            from datetime import datetime
-            first_ts = recent_events[0].get("ts", "")
-            if first_ts:
-                start = datetime.fromisoformat(first_ts)
-                state["uptime_seconds"] = int((datetime.now() - start).total_seconds())
-        except Exception:
-            pass
+    # Compute uptime from server start time
+    if _SERVER_START_TIME:
+        from datetime import datetime
+        state["uptime_seconds"] = int((datetime.now() - _SERVER_START_TIME).total_seconds())
 
     # Walk backwards to find current status (the most recent state-changing event wins)
     found_status = False
@@ -369,5 +365,8 @@ def start_status_server(port: int = 7861) -> None:
 
 def _run_server(port: int) -> None:
     """Entry point for the status server process."""
+    global _SERVER_START_TIME
+    from datetime import datetime
+    _SERVER_START_TIME = datetime.now()
     server = HTTPServer(("0.0.0.0", port), StatusHandler)
     server.serve_forever()

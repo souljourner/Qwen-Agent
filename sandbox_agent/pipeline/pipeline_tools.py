@@ -51,11 +51,11 @@ def _validate_idea(description: str) -> tuple:
 
 @register_tool("start_pipeline")
 class StartPipeline(BaseTool):
-    """Start a multi-stage pipeline to build a startup project."""
+    """Start a 6-stage Startup Builder Pipeline."""
 
     name = "start_pipeline"
     description = (
-        "Start a 6-stage pipeline to research, plan, and build an MVP for a startup idea. "
+        "Start a 6-stage Startup Builder Pipeline to research, plan, and build an MVP for a startup idea. "
         "Stages: Market Research → BRD → PRD → VC Pitch → MVP → Review. "
         "Each stage runs independently with acceptance evaluation between stages. "
         "If the project already exists and is completed, it will rerun to improve artifacts."
@@ -126,7 +126,7 @@ class PipelineStatusTool(BaseTool):
     """Check the status of a pipeline."""
 
     name = "pipeline_status"
-    description = "Check the status of a project pipeline. Shows each stage, attempts, and notes."
+    description = "Check the status of a Startup Builder Pipeline. Shows each stage, attempts, and notes."
     parameters = {
         "type": "object",
         "properties": {
@@ -162,7 +162,7 @@ class ListPipelines(BaseTool):
     """List all projects with active pipelines."""
 
     name = "list_pipelines"
-    description = "List all projects that have pipeline state (active, completed, or failed)."
+    description = "List all Startup Builder Pipelines (active, completed, or failed)."
     parameters = {
         "type": "object",
         "properties": {},

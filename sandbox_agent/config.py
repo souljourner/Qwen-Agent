@@ -43,7 +43,7 @@ MAX_CODE_OUTPUT_TOKENS = int(os.getenv("MAX_CODE_OUTPUT_TOKENS", "4000"))
 CHARS_PER_TOKEN = 4  # Rough estimate for English/code; conservative for CJK
 
 TOOLS_API_BASE = os.getenv("TOOLS_API_BASE", "http://localhost:8080")
-HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1800"))  # 30 minutes
+HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "3600"))  # 1 hour
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 
 TOOL_LIST = [
