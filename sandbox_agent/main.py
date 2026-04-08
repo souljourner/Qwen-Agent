@@ -27,6 +27,7 @@ from sandbox_agent.config import (
     session_metadata,
 )
 from sandbox_agent.activity_log import clear_state, get_recent_events, log_event, set_state
+from sandbox_agent.model_tracker import model_start, model_done
 from sandbox_agent.chat_logger import log_background_task, log_turn
 from sandbox_agent.daily_digest import add_digest_entry, cleanup_old_digests
 from sandbox_agent.heartbeat.heartbeat_runner import HeartbeatRunner
@@ -123,6 +124,8 @@ class LockingAgent(Assistant):
             logger.info(f"Chat routed to {model_name} (primary busy with background task)")
 
         set_state(status="chatting", model_in_use=model_name)
+        user_preview = str(user_msg.content)[:100] if user_msg else "chat"
+        model_start(model_name, f"User chat: {user_preview}")
         try:
             response = []
             for response in agent.run(*args, **kwargs):
@@ -130,6 +133,7 @@ class LockingAgent(Assistant):
         finally:
             if got_lock:
                 self._lock.release()
+            model_done(model_name)
 
         log_event("chat_complete")
         clear_state()
@@ -250,7 +254,7 @@ def _summarize_task_result(task_name: str, result_text: str, tool_calls: List[di
         return result_text[:500] if result_text else "Completed"
 
 
-def run_on_best_available(system_message: str, messages: List[Message]) -> List[Message]:
+def run_on_best_available(system_message: str, messages: List[Message], task_label: str = "background task") -> List[Message]:
     """Run a background agent session on the primary model.
 
     Background tasks always use the primary model (qwen3.5).
@@ -265,6 +269,7 @@ def run_on_best_available(system_message: str, messages: List[Message]) -> List[
         logger.info(f"Background task using primary model (timeout={timeout}s)")
         set_state(model_in_use=PRIMARY_LLM_CFG["model"])
         log_event("model_select", detail="primary (background)", model=PRIMARY_LLM_CFG["model"])
+        model_start(PRIMARY_LLM_CFG["model"], task_label)
         agent = create_agent(system_message, llm_cfg=PRIMARY_LLM_CFG)
         agent.llm.generate_cfg["request_timeout"] = timeout
         response: List[Message] = []
@@ -272,6 +277,7 @@ def run_on_best_available(system_message: str, messages: List[Message]) -> List[
             pass
         return response
     finally:
+        model_done(PRIMARY_LLM_CFG["model"])
         _primary_model_lock.release()
 
 
@@ -324,7 +330,7 @@ def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 6
                             )
                         messages = [Message(role="user", content="\n".join(prompt_parts))]
                         logger.info(f"Cron: task [{task.id}] prompt: {prompt_parts[0][:200]}...")
-                        response = run_on_best_available(system_message, messages)
+                        response = run_on_best_available(system_message, messages, task_label=f"Cron: {task.name}")
                         # Extract result text
                         result_text = ""
                         for msg in response:
@@ -369,7 +375,7 @@ def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 6
 def _start_background_lanes(system_message: str, task_queue: TaskQueue) -> None:
     """Start heartbeat and cron background threads."""
     def bg_runner(messages: List[Message]) -> List[Message]:
-        return run_on_best_available(system_message, messages)
+        return run_on_best_available(system_message, messages, task_label="Heartbeat check")
 
     heartbeat = HeartbeatRunner(
         task_queue=task_queue,

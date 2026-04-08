@@ -72,6 +72,11 @@ DASHBOARD_HTML = """\
 
     <div class="grid" id="status-cards"></div>
 
+    <div id="models-section" style="margin-bottom:12px;">
+        <h2 style="color:#8b949e;font-size:14px;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px;">Active Models</h2>
+        <div class="grid" id="model-cards"></div>
+    </div>
+
     <div class="panes">
         <div class="pane">
             <div class="pane-header"><h2>Recent Activity</h2></div>
@@ -149,6 +154,29 @@ DASHBOARD_HTML = """\
                         <div class="value">${formatUptime(s.uptime_seconds)}</div>
                     </div>
                 `;
+
+                // Fetch model status
+                try {
+                    const modelsResp = await fetch('/models');
+                    const modelsData = await modelsResp.json();
+                    const models = modelsData.models || {};
+                    const modelCards = document.getElementById('model-cards');
+                    modelCards.innerHTML = Object.entries(models).map(([name, info]) => {
+                        const isBusy = info.status === 'busy';
+                        const color = isBusy ? '#3fb950' : '#484f58';
+                        const statusText = isBusy ? 'BUSY' : 'IDLE';
+                        const task = info.task || '';
+                        const since = info.since ? formatTime(info.since) : '';
+                        return `
+                            <div class="card" style="border-left:3px solid ${color}">
+                                <div class="label">${name}</div>
+                                <div class="value" style="color:${color};font-size:16px">${statusText}</div>
+                                ${task ? '<div style="color:#8b949e;font-size:11px;margin-top:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + task + '<\/div>' : ''}
+                                ${since ? '<div style="color:#484f58;font-size:10px">since ' + since + '<\/div>' : ''}
+                            <\/div>
+                        `;
+                    }).join('');
+                } catch(err) {}
 
                 const eventsBody = document.querySelector('#events-table tbody');
                 eventsBody.innerHTML = data.recent_events.slice().reverse().map(e => `
@@ -316,6 +344,14 @@ class StatusHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/status":
             data = _read_status_from_file()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, default=str).encode())
+        elif self.path == "/models":
+            from sandbox_agent.model_tracker import read_model_status_from_file
+            data = read_model_status_from_file()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")

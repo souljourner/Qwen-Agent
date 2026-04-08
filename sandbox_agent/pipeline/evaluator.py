@@ -108,7 +108,7 @@ Respond with exactly one of:
     messages = [Message(role="user", content=eval_prompt)]
 
     try:
-        response = run_on_best_available(system_message, messages)
+        response = run_on_best_available(system_message, messages, task_label=f"Evaluating stage {stage_number}")
         result_text = ""
         for msg in response:
             if msg.role == "assistant" and isinstance(msg.content, str):

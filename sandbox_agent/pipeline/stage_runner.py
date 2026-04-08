@@ -96,7 +96,7 @@ def _execute_stage(project_name: str, stage_number: int, task_id: str, system_me
     # Run the agent
     logger.info(f"Pipeline: running {project_name} stage {stage_number} ({STAGES[stage_number]['name']}), attempt {stage.run_count + 1}/{stage.max_attempts}")
     messages = [Message(role="user", content=user_message)]
-    response = run_on_best_available(system_message, messages)
+    response = run_on_best_available(system_message, messages, task_label=f"Pipeline: {project_name} stage {stage_number}")
 
     # Extract result text
     result_text = ""

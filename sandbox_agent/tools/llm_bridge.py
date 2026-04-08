@@ -58,6 +58,9 @@ def _create_handler(llm_cfg: dict, auth_token: str):
                 prompt = prompt[:max_prompt_chars] + "\n... (truncated to fit token budget)"
 
             try:
+                from sandbox_agent.model_tracker import model_start, model_done
+                model_start(llm_cfg["model"], f"llm_call: {prompt[:80]}")
+
                 messages = []
                 if system:
                     messages.append({"role": "system", "content": system})
@@ -93,14 +96,17 @@ def _create_handler(llm_cfg: dict, auth_token: str):
                     resp.raise_for_status()
                     result_text = resp.json()["choices"][0]["message"].get("content", "")
 
+                model_done(llm_cfg["model"])
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"result": result_text}).encode())
 
             except BrokenPipeError:
+                model_done(llm_cfg["model"])
                 logger.debug("LLM bridge: client disconnected (BrokenPipeError)")
             except Exception as e:
+                model_done(llm_cfg["model"])
                 logger.warning(f"LLM bridge call failed: {e}")
                 try:
                     self.send_response(500)
