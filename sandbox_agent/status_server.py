@@ -129,13 +129,12 @@ DASHBOARD_HTML = """\
         async function refresh() {
             try {
                 const resp = await fetch('/status');
-                const data = await resp.json();
-                const s = data.state;
+                const s = await resp.json();
 
                 document.getElementById('status-cards').innerHTML = `
                     <div class="card">
                         <div class="label">Status</div>
-                        <div class="value status-${s.status}">${s.status.toUpperCase()}</div>
+                        <div class="value status-${s.agent_status}">${(s.agent_status || 'idle').toUpperCase()}</div>
                     </div>
                     <div class="card">
                         <div class="label">Current Task</div>
@@ -146,20 +145,14 @@ DASHBOARD_HTML = """\
                         <div class="value">${s.current_tool || '—'}</div>
                     </div>
                     <div class="card">
-                        <div class="label">Model</div>
-                        <div class="value">${s.model_in_use || '—'}</div>
-                    </div>
-                    <div class="card">
                         <div class="label">Uptime</div>
-                        <div class="value">${formatUptime(s.uptime_seconds)}</div>
+                        <div class="value">${formatUptime(s.uptime_seconds || 0)}</div>
                     </div>
                 `;
 
-                // Fetch model status
-                try {
-                    const modelsResp = await fetch('/models');
-                    const modelsData = await modelsResp.json();
-                    const models = modelsData.models || {};
+                // Render model status (included in /status response)
+                {
+                    const models = s.models || {};
                     const modelCards = document.getElementById('model-cards');
                     modelCards.innerHTML = Object.entries(models).map(([name, info]) => {
                         const isBusy = info.status === 'busy';
@@ -176,10 +169,19 @@ DASHBOARD_HTML = """\
                             <\/div>
                         `;
                     }).join('');
-                } catch(err) {}
+                }
+
+            } catch (err) {
+                console.error('Status refresh failed:', err);
+            }
+
+            // Fetch activity events (historical, from activity.jsonl)
+            try {
+                const eventsResp = await fetch('/events');
+                const eventsData = await eventsResp.json();
 
                 const eventsBody = document.querySelector('#events-table tbody');
-                eventsBody.innerHTML = data.recent_events.slice().reverse().map(e => `
+                eventsBody.innerHTML = (eventsData.recent_events || []).slice().reverse().map(e => `
                     <tr>
                         <td class="timestamp">${formatTime(e.ts)}</td>
                         <td class="type-${e.type}">${e.type}</td>
@@ -188,16 +190,14 @@ DASHBOARD_HTML = """\
                 `).join('');
 
                 const toolsBody = document.querySelector('#tools-table tbody');
-                toolsBody.innerHTML = data.recent_tools.slice().reverse().map(e => `
+                toolsBody.innerHTML = (eventsData.recent_tools || []).slice().reverse().map(e => `
                     <tr>
                         <td class="timestamp">${formatTime(e.ts)}</td>
                         <td>${e.tool || ''}</td>
                         <td class="detail">${e.args || ''}</td>
                     </tr>
                 `).join('');
-            } catch (err) {
-                console.error('Status refresh failed:', err);
-            }
+            } catch (err) {}
 
             // Fetch digest and requests (less frequent — every refresh is fine)
             try {
@@ -343,6 +343,14 @@ class StatusHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/status":
+            from sandbox_agent.model_tracker import read_status_from_file
+            data = read_status_from_file()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            self.wfile.write(json.dumps(data, default=str).encode())
+        elif self.path == "/events":
             data = _read_status_from_file()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

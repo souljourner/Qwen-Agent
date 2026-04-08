@@ -27,7 +27,9 @@ from sandbox_agent.config import (
     session_metadata,
 )
 from sandbox_agent.activity_log import clear_state, get_recent_events, log_event, set_state
-from sandbox_agent.model_tracker import model_start, model_done
+from sandbox_agent.model_tracker import (
+    model_start, model_done, set_agent_status, clear_agent_status, set_current_tool,
+)
 from sandbox_agent.chat_logger import log_background_task, log_turn
 from sandbox_agent.daily_digest import add_digest_entry, cleanup_old_digests
 from sandbox_agent.heartbeat.heartbeat_runner import HeartbeatRunner
@@ -71,12 +73,14 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
         args_preview = str(tool_args)[:200]
         logger.info(f"Tool call: {tool_name}({args_preview})")
         set_state(current_tool=tool_name)
+        set_current_tool(tool_name)
         log_event("tool_call", tool_name=tool_name, tool_args=args_preview)
         result = original_call_tool(tool_name, tool_args, **kwargs)
         result_preview = str(result)[:200]
         logger.info(f"Tool result: {tool_name} -> {result_preview}")
         log_event("tool_result", tool_name=tool_name, tool_result=result_preview)
         set_state(current_tool=None)
+        set_current_tool(None)
         return result
 
     agent._call_tool = _logged_call_tool
@@ -123,8 +127,9 @@ class LockingAgent(Assistant):
             log_event("chat_start", detail=f"[27b fallback] {str(user_msg.content)[:160]}" if user_msg else "[27b fallback]")
             logger.info(f"Chat routed to {model_name} (primary busy with background task)")
 
-        set_state(status="chatting", model_in_use=model_name)
         user_preview = str(user_msg.content)[:100] if user_msg else "chat"
+        set_state(status="chatting", model_in_use=model_name)
+        set_agent_status(status="chatting", current_task=f"User chat: {user_preview}")
         model_start(model_name, f"User chat: {user_preview}")
         try:
             response = []
@@ -137,6 +142,7 @@ class LockingAgent(Assistant):
 
         log_event("chat_complete")
         clear_state()
+        clear_agent_status()
 
         if user_msg and response:
             try:
@@ -268,6 +274,7 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
     try:
         logger.info(f"Background task using primary model (timeout={timeout}s)")
         set_state(model_in_use=PRIMARY_LLM_CFG["model"])
+        set_agent_status(status="background", current_task=task_label)
         log_event("model_select", detail="primary (background)", model=PRIMARY_LLM_CFG["model"])
         model_start(PRIMARY_LLM_CFG["model"], task_label)
         agent = create_agent(system_message, llm_cfg=PRIMARY_LLM_CFG)
@@ -278,6 +285,7 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
         return response
     finally:
         model_done(PRIMARY_LLM_CFG["model"])
+        clear_agent_status()
         _primary_model_lock.release()
 
 
@@ -293,6 +301,7 @@ def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 6
                 with _background_work_lock:
                     logger.info(f"Cron: executing task [{task.id}] {task.name}")
                     set_state(status="cron_task", current_task=f"[{task.id}] {task.name}")
+                    set_agent_status(status="cron_task", current_task=task.name)
                     log_event("cron_start", task_id=task.id, task_name=task.name)
                     task_queue.update_task(task.id, status="running")
                     # Snapshot event count before execution to capture tool calls
