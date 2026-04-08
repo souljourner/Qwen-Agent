@@ -57,6 +57,7 @@ TOOL_LIST = [
     "project_read_file", "project_list_files", "project_delete_file",
     "move_file", "delete_file",
     "request_user", "view_requests", "resolve_request",
+    "start_pipeline", "pipeline_status", "list_pipelines",
 ]
 
 SYSTEM_PROMPT_SUFFIX = (

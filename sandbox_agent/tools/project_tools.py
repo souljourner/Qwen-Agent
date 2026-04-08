@@ -285,16 +285,23 @@ class ProjectReadFile(BaseTool):
 
 @register_tool("project_list_files")
 class ProjectListFiles(BaseTool):
-    """List files in a project workspace."""
+    """List files and directories in a project workspace (one level)."""
 
     name = "project_list_files"
-    description = "List all files in a project workspace, including subdirectories."
+    description = (
+        "List files and subdirectories in a project directory (one level, like ls). "
+        "Use path to browse into subdirectories."
+    )
     parameters = {
         "type": "object",
         "properties": {
             "project": {
                 "type": "string",
                 "description": "Project name.",
+            },
+            "path": {
+                "type": "string",
+                "description": "Directory path within the project to list (e.g., 'research', 'research/hallucheck'). Omit for project root.",
             },
         },
         "required": ["project"],
@@ -307,26 +314,42 @@ class ProjectListFiles(BaseTool):
         if not os.path.exists(pdir):
             return f"Project '{params['project']}' not found."
 
-        files = []
-        for root, dirs, filenames in os.walk(pdir):
-            # Skip hidden files/dirs
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for fname in sorted(filenames):
-                if fname.startswith("."):
-                    continue
-                full = os.path.join(root, fname)
-                rel = os.path.relpath(full, pdir)
-                size = os.path.getsize(full)
-                files.append(f"- {rel} ({size:,} bytes)")
+        # Resolve target directory
+        subpath = params.get("path", "")
+        if subpath:
+            subpath = os.path.normpath(subpath)
+            if subpath.startswith("..") or subpath.startswith("/"):
+                return "Invalid path: must be relative within the project."
+            target = os.path.join(pdir, subpath)
+        else:
+            target = pdir
 
-        if not files:
-            return f"Project '{params['project']}' has no files yet."
+        if not os.path.isdir(target):
+            return f"Directory not found: {subpath or '(root)'}"
+
+        entries = []
+        for name in sorted(os.listdir(target)):
+            if name.startswith("."):
+                continue
+            full = os.path.join(target, name)
+            if os.path.isdir(full):
+                # Count items in subdirectory
+                count = len([f for f in os.listdir(full) if not f.startswith(".")])
+                entries.append(f"  {name}/ ({count} items)")
+            else:
+                size = os.path.getsize(full)
+                entries.append(f"  {name} ({size:,} bytes)")
+
+        if not entries:
+            return f"Empty directory: {subpath or '(root)'}"
 
         meta = _load_meta(pdir)
         header = f"Project: {params['project']}"
         if meta.get("description"):
             header += f" — {meta['description']}"
-        return header + "\n\n" + "\n".join(files)
+        if subpath:
+            header += f"\nPath: {subpath}/"
+        return header + "\n\n" + "\n".join(entries)
 
 
 @register_tool("project_delete_file")

@@ -40,6 +40,7 @@ import sandbox_agent.tools.code_interpreter  # noqa: F401
 import sandbox_agent.chat_logger  # noqa: F401 (registers list_chat_logs, read_chat_log)
 import sandbox_agent.tools.project_tools  # noqa: F401
 import sandbox_agent.tools.notification_tools  # noqa: F401
+import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
@@ -291,7 +292,24 @@ def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 6
                     # Snapshot event count before execution to capture tool calls
                     events_before = len(get_recent_events(500))
                     try:
-                        # Build task prompt with project and checkpoint context
+                        # Pipeline tasks get special handling
+                        if task.name.startswith("pipeline:"):
+                            from sandbox_agent.pipeline.stage_runner import run_pipeline_stage
+                            result_text = run_pipeline_stage(task, system_message)
+                            task_queue.update_task(task.id, status="completed", result=result_text[:1000])
+                            log_background_task(task.name, task.id, result_text[:1000])
+                            log_event("cron_complete", task_id=task.id, task_name=task.name)
+                            add_digest_entry(
+                                project=task.project,
+                                task_name=task.name,
+                                summary=result_text[:500],
+                                source="pipeline",
+                            )
+                            logger.info(f"Cron: pipeline task [{task.id}] completed")
+                            clear_state()
+                            continue
+
+                        # Regular tasks: build prompt and run
                         prompt_parts = [f"Execute this scheduled task:\n\n**{task.name}**: {task.description}"]
                         if task.project:
                             prompt_parts.append(
@@ -400,6 +418,10 @@ def main() -> None:
             tq_init.update_task(task.id, status="pending")
     except Exception:
         pass
+
+    # Clear stale pipeline lock and reset stuck pipeline stages
+    from sandbox_agent.pipeline.orchestrator import clear_lock_on_startup
+    clear_lock_on_startup()
 
     # Load system messages
     # Base system message (static, used for background sessions — no metadata for KV cache stability)

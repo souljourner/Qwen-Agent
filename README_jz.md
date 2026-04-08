@@ -19,8 +19,9 @@ cd /path/to/Qwen-Agent && source .venv/bin/activate && pytest tests/sandbox_agen
 
 | Service | Host | Model | Role |
 |---|---|---|---|
-| **vLLM** | 192.168.4.66:8000 | qwen3.5 (397B) | Main interactive conversation |
-| **Ollama** | 192.168.4.88:11434 | qwen3.5-9b-256k | Background tasks, `llm_call()` bridge, fallback when vLLM busy |
+| **vLLM** | 192.168.4.66:8000 | qwen3.5 (MoE) | Main conversation + all background tasks |
+| **vLLM** | 192.168.4.66:8000 | qwen3.5-27b | User chat fallback when primary is busy |
+| **Ollama** | 192.168.4.88:11434 | gemma4:26b | `llm_call()` bridge inside code_interpreter |
 | **Tools API** | localhost:8080 | — | Web search (Brave), URL fetch, stock prices via SSE |
 | **Gradio** | localhost:7860 | — | Chat WebUI |
 | **Dashboard** | localhost:7861 | — | Live activity monitor, digest, agent requests |
@@ -30,37 +31,89 @@ cd /path/to/Qwen-Agent && source .venv/bin/activate && pytest tests/sandbox_agen
 
 ```
 Docker Container (read_only, no-new-privileges, cap_drop: ALL)
-├── Main Lane (Gradio WebUI) → vLLM, falls back to Ollama when vLLM busy
-├── Heartbeat Lane (1 hour interval) → checks HEARTBEAT.md, uses Ollama
-├── Cron Lane (60s poll) → executes scheduled tasks, uses Ollama (or vLLM if idle)
+├── Main Lane (Gradio WebUI) → vLLM qwen3.5, falls back to qwen3.5-27b when busy
+├── Heartbeat Lane (1 hour interval) → checks HEARTBEAT.md
+├── Cron Lane (60s poll) → executes scheduled tasks + pipeline stages on vLLM
+├── Pipeline Orchestrator → code-based 6-stage project builder
 ├── Status Server (separate process, port 7861) → reads activity.jsonl from disk
-└── LLM Bridge (HTTP server on localhost) → Ollama native API with think parameter
+└── LLM Bridge (HTTP server on localhost) → Ollama gemma4:26b for llm_call()
 ```
 
-### Smart Model Routing
+### Model Routing
 
-- **User sends message**: tries vLLM first. If vLLM lock is held (background task started on it), falls back to Ollama immediately.
-- **Background task starts**: checks lock. If free (user not chatting), uses vLLM. Releases lock immediately so it doesn't block user. If user is chatting, uses Ollama.
-- **`llm_call()` inside code_interpreter**: always Ollama native API (`/api/chat`) with `think` parameter.
+- **User sends message**: tries qwen3.5 (non-blocking lock). If locked by background task, falls back to qwen3.5-27b.
+- **Background tasks**: always use qwen3.5 (blocking lock — wait for user to finish). The 27b is reserved for user fallback only.
+- **`llm_call()` inside code_interpreter**: always gemma4:26b on Ollama native API.
 
-### Key Design Decision: vLLM Never Blocks User
+### First-Come-First-Served vLLM Mutex
 
 The primary model lock is **non-blocking** for the main conversation. If a background task grabbed vLLM and is mid-tool-loop, the user's message either gets the lock (background released it) or proceeds to Ollama. The user is never stuck waiting.
 
 Background tasks release the lock immediately after checking it — they don't hold it during the entire tool loop. This means vLLM may serve both user and background requests concurrently (queued), but the user waits at most ~30s for one background call, not the full 15-minute task.
 
-## Tools (23 registered)
+## Tools (29 registered)
 
 | Category | Tools | Description |
 |---|---|---|
 | **Web** | `web_search`, `web_url_fetch`, `stock_price` | Call port 8080 API via SSE. All outputs sanitized. Brave Search rate-limited to 1 req/2s. |
-| **Code** | `code_interpreter` | Local Jupyter kernel (subprocess, no Docker-in-Docker). Has `llm_call(prompt, system="", think=False)`. Variables persist. Output capped at 4k tokens. Dynamic timeout (10min-2hr). |
-| **Scheduling** | `schedule_task`, `list_tasks`, `complete_task`, `cancel_task`, `update_task_checkpoint` | JSON-backed task queue. Cron/interval/one-shot. Project-scoped. Exponential backoff retry. `cancel_task` permanently removes (including recurring). |
+| **Code** | `code_interpreter` | Local Jupyter kernel (subprocess). Has `llm_call(prompt, system="", think=False)` via gemma4:26b. Pre-configured `DATA_DIR`, `PROJECTS_DIR` path vars. Output capped at 4k tokens. |
+| **Scheduling** | `schedule_task`, `list_tasks`, `complete_task`, `cancel_task`, `pause_task`, `resume_task`, `update_task_checkpoint` | JSON-backed task queue. Active tasks in `tasks.json`, completed/cancelled archived to separate files. |
+| **Pipeline** | `start_pipeline`, `pipeline_status`, `list_pipelines` | Code-based 6-stage project builder (see Pipeline section below). |
 | **Self-edit** | `update_soul`, `update_heartbeat` | Patch a section or append a line (not full file replacement). Auto-committed to git. |
 | **Memory** | `read_memories`, `add_memory` | MEMORIES.md with dated entries in 4 sections. Auto-loaded into system prompt. |
-| **Projects** | `create_project`, `list_projects`, `project_write_file`, `project_read_file`, `project_list_files`, `project_delete_file` | Persistent file workspaces at `DATA_DIR/projects/<name>/`. Auto-committed to git. |
+| **Projects** | `create_project`, `list_projects`, `delete_project`, `project_write_file`, `project_read_file`, `project_list_files`, `project_delete_file`, `move_file`, `delete_file` | Persistent file workspaces. `project_list_files` supports `path` param for browsing subdirectories. |
 | **Chat** | `list_chat_logs`, `read_chat_log` | Daily markdown logs at `DATA_DIR/chat_logs/YYYY-MM-DD.md`. |
 | **Notifications** | `request_user`, `view_requests`, `resolve_request` | Structured JSON requests with pending/resolved status. Deduplication on pending subjects. |
+
+## Pipeline Orchestrator
+
+A Python code-based 6-stage pipeline for building startup projects. Each stage runs independently with a clean LLM context, reading artifacts from previous stages. Flow is controlled by Python code, not prompts.
+
+### Stages
+
+| # | Stage | Input | Output | Description |
+|---|---|---|---|---|
+| 1 | Market Research | idea description | `research/market-research.md` | Market size, competitors, customers, timing, adjacent markets |
+| 2 | BRD | market research | `business/brd.md` | Branding, legal, scalability, operations, finance, personnel |
+| 3 | PRD | research + BRD | `product/prd.md` | User stories, MVP scope, technical requirements, distribution |
+| 4 | VC Pitch | all above | `business/vc-pitch.md` | Elevator pitch + longer warm-contact pitch |
+| 5 | MVP | PRD | `mvp/` directory | Frontend, backend, tests, README, DB scripts |
+| 6 | Review | all artifacts | `pipeline/review.md` | Learnings, status update, instruction improvement suggestions |
+
+### How It Works
+
+```
+start_pipeline(name="pet-ai", description="AI pet health monitoring for busy pet owners...")
+  → validates idea clarity → creates project → schedules stage 1
+
+cron_loop detects "pipeline:" prefix task
+  → acquires lock → loads stage instructions (markdown) → loads previous artifacts
+  → runs agent on primary model → evaluates output (programmatic + LLM check)
+  → PASS: schedules next stage | FAIL: adds notes, retries (up to 5x)
+```
+
+### Stage Acceptance Evaluation
+
+After each stage, the evaluator runs:
+1. **Programmatic checks**: artifact exists, non-empty, required sections present
+2. **LLM quality check**: reads output and judges completeness, depth, accuracy
+3. **Decision**: pass → next stage, fail + retries left → add feedback notes and retry, fail + 5 attempts → proceed with `completed-no-more-attempts` or `failed-no-more-attempts`
+
+### Job States
+
+`scheduled` → `running` → `completed` / `part-completion` / `failed`
+
+- **`part-completion`**: ran out of tokens/tool calls (MVP stage). Notes track progress, next attempt continues.
+- **`completed-no-more-attempts`**: produced output but never passed quality check after 5 tries. Proceeds anyway.
+- **`failed-no-more-attempts`**: couldn't produce any artifact after 5 tries. Notifies user, proceeds.
+
+### Self-Improvement
+
+Stage instructions live in editable markdown files at `sandbox_agent/pipeline/stages/`. Stage 6 (Review) evaluates instruction quality and suggests improvements. Updated instructions apply to subsequent pipeline runs.
+
+### Rerun
+
+`start_pipeline` on a completed project resets all stages. Previous artifacts are preserved — instructions tell the agent to read and improve existing files rather than start from scratch.
 
 ## Key Files
 
@@ -79,19 +132,28 @@ sandbox_agent/
 │   ├── api_tools.py          # web_search, web_url_fetch, stock_price (port 8080 SSE)
 │   ├── sanitizer.py          # Prompt injection defense: strip tokens, invisible chars, delimiters
 │   ├── code_interpreter.py   # Local Jupyter kernel with llm_call() bridge
-│   ├── llm_bridge.py         # HTTP server → Ollama native API with think=true/false
+│   ├── llm_bridge.py         # HTTP bridge → gemma4:26b on Ollama for llm_call()
 │   ├── self_edit_tools.py    # update_soul (section patch), update_heartbeat, read/add memory
-│   ├── project_tools.py      # Project workspace CRUD (6 tools)
-│   ├── notification_tools.py # request_user, view_requests, resolve_request + read_digest
+│   ├── project_tools.py      # Project workspace CRUD + move_file, delete_file, delete_project
+│   ├── notification_tools.py # request_user, view_requests, resolve_request
 │   └── git_autocommit.py     # Auto-commit file changes in DATA_DIR git repo
+├── pipeline/
+│   ├── models.py             # PipelineState, StageState pydantic models
+│   ├── orchestrator.py       # State machine: advance, lock, stage definitions
+│   ├── stage_runner.py       # Build prompts, load artifacts, run agent, detect part-completion
+│   ├── evaluator.py          # Programmatic checks + LLM acceptance evaluation
+│   ├── pipeline_tools.py     # start_pipeline, pipeline_status, list_pipelines
+│   └── stages/               # Editable markdown instruction files (6 stages + acceptance criteria)
 ├── heartbeat/
 │   ├── heartbeat_runner.py   # Isolated sessions, HEARTBEAT_OK suppression, background work lock
 │   └── HEARTBEAT.md          # Default checklist
 ├── scheduler/
 │   ├── models.py             # Task pydantic model (cron, project, checkpoint, backoff)
-│   ├── task_queue.py         # JSON-backed queue with dependencies, backoff, remove_task
-│   ├── scheduler_tools.py    # schedule/list/complete/cancel/checkpoint tools
+│   ├── task_queue.py         # JSON-backed queue with 3 files (active/completed/cancelled)
+│   ├── scheduler_tools.py    # schedule/list/complete/cancel/pause/resume/checkpoint tools
 │   └── checkpoint.py         # Task state persistence for long-running work
+├── scripts/
+│   └── cleanup_data.py       # Batch file reorganization script (standalone, dry-run default)
 └── docker/
     ├── Dockerfile            # Python 3.12, Qwen-Agent[gui], Jupyter, beautifulsoup4, lxml
     └── docker-compose.yml    # Security-hardened, bind mount, env vars
@@ -101,8 +163,9 @@ sandbox_agent/
 
 | Env Var | Value | Purpose |
 |---|---|---|
-| `VLLM_BASE` | `http://192.168.4.66:8000/v1` | Primary model |
-| `OLLAMA_BASE` | `http://192.168.4.88:11434/v1` | Background model |
+| `VLLM_BASE` | `http://192.168.4.66:8000/v1` | Primary + backup models (qwen3.5, qwen3.5-27b) |
+| `LLM_CALL_MODEL` | `gemma4:26b` | Model for llm_call() in code_interpreter |
+| `LLM_CALL_BASE` | `http://192.168.4.88:11434/v1` | Ollama server for llm_call() |
 | `TOOLS_API_BASE` | `http://host.docker.internal:8080` | Web tools |
 | `DATA_DIR` | `/app/data` | Writable volume (bind-mounted to ~/sandbox_agent_data/) |
 | `HEARTBEAT_INTERVAL_SECONDS` | `3600` | 1 hour |
