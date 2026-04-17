@@ -45,6 +45,7 @@ class PipelineState(BaseModel):
 
     project_name: str
     description: str
+    pipeline_type: str = "startup"
     current_stage: int = 0
     status: PipelineStatus = "running"
     stages: Dict[int, StageState] = Field(default_factory=dict)

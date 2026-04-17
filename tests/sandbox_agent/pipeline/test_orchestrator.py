@@ -9,16 +9,18 @@ import pytest
 
 from sandbox_agent.pipeline.models import PipelineState, StageState
 from sandbox_agent.pipeline.orchestrator import (
-    STAGES,
-    NUM_STAGES,
+    STARTUP_STAGES as STAGES,
     acquire_lock,
     clear_lock_on_startup,
+    get_num_stages,
     init_pipeline,
     load_stage_instructions,
     load_state,
     release_lock,
     save_state,
 )
+
+NUM_STAGES = get_num_stages("startup")
 
 
 @pytest.fixture
@@ -158,11 +160,16 @@ class TestLock:
 class TestLoadStageInstructions:
 
     def test_loads_existing_instruction(self):
-        instructions = load_stage_instructions(1)
+        instructions = load_stage_instructions(1, "startup")
         assert "Market Research" in instructions
         assert "Competitors" in instructions
 
     def test_loads_all_stages(self):
         for i in range(1, NUM_STAGES + 1):
-            instructions = load_stage_instructions(i)
+            instructions = load_stage_instructions(i, "startup")
             assert len(instructions) > 100, f"Stage {i} instructions too short"
+
+    def test_loads_trading_stages(self):
+        for i in range(1, 7):
+            instructions = load_stage_instructions(i, "trading")
+            assert len(instructions) > 100, f"Trading stage {i} instructions too short"

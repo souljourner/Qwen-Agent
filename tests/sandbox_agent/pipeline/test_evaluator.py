@@ -7,7 +7,7 @@ import tempfile
 import pytest
 
 from sandbox_agent.pipeline.evaluator import _programmatic_checks
-from sandbox_agent.pipeline.orchestrator import STAGES
+from sandbox_agent.pipeline.orchestrator import STARTUP_STAGES as STAGES
 
 
 @pytest.fixture

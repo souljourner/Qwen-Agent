@@ -7,7 +7,6 @@ import tempfile
 import pytest
 
 from sandbox_agent.pipeline.models import PipelineState, StageState
-from sandbox_agent.pipeline.orchestrator import STAGES
 from sandbox_agent.pipeline.stage_runner import (
     _build_prompt,
     _detect_part_completion,
@@ -40,34 +39,41 @@ def sample_state():
     )
 
 
+def _state(project="test-project", pipeline_type="startup"):
+    return PipelineState(
+        project_name=project,
+        description="test",
+        pipeline_type=pipeline_type,
+    )
+
+
 class TestLoadArtifacts:
 
     def test_no_inputs_for_stage_1(self, tmp_data_dir):
-        result = _load_artifacts("test-project", 1)
+        result = _load_artifacts(_state(), 1)
         assert "No input artifacts" in result
 
     def test_loads_existing_artifact(self, tmp_data_dir):
-        # Create a market research file
         research_dir = os.path.join(tmp_data_dir, "projects", "test-project", "research")
         os.makedirs(research_dir, exist_ok=True)
         with open(os.path.join(research_dir, "market-research.md"), "w") as f:
             f.write("# Market Research\n\nTAM is $5B")
 
-        result = _load_artifacts("test-project", 2)
+        result = _load_artifacts(_state(), 2)
         assert "Market Research" in result
         assert "TAM is $5B" in result
 
     def test_missing_artifact_noted(self, tmp_data_dir):
-        result = _load_artifacts("test-project", 2)
+        result = _load_artifacts(_state(), 2)
         assert "Not yet created" in result
 
     def test_large_artifact_truncated(self, tmp_data_dir):
         research_dir = os.path.join(tmp_data_dir, "projects", "test-project", "research")
         os.makedirs(research_dir, exist_ok=True)
         with open(os.path.join(research_dir, "market-research.md"), "w") as f:
-            f.write("x" * 50000)
+            f.write("x" * 150000)
 
-        result = _load_artifacts("test-project", 2)
+        result = _load_artifacts(_state(), 2)
         assert "truncated" in result
 
 
@@ -109,22 +115,21 @@ class TestBuildPrompt:
 class TestDetectPartCompletion:
 
     def test_explicit_part_completion_signal(self, tmp_data_dir):
-        assert _detect_part_completion("test-project", 5, "Saved progress. Status: part-completion") is True
+        assert _detect_part_completion(_state(), 5, "Saved progress. Status: part-completion") is True
 
     def test_tool_call_exhaustion_signal(self, tmp_data_dir):
-        assert _detect_part_completion("test-project", 5, "Ran out of tool calls, will continue next run") is True
+        assert _detect_part_completion(_state(), 5, "Ran out of tool calls, will continue next run") is True
 
     def test_normal_completion_not_detected(self, tmp_data_dir):
-        assert _detect_part_completion("test-project", 1, "Research complete, saved to file") is False
+        assert _detect_part_completion(_state(), 1, "Research complete, saved to file") is False
 
     def test_mvp_partial_files(self, tmp_data_dir):
-        # Create mvp dir with some but not all files
         mvp_dir = os.path.join(tmp_data_dir, "projects", "test-project", "mvp")
         os.makedirs(mvp_dir, exist_ok=True)
         with open(os.path.join(mvp_dir, "app.py"), "w") as f:
             f.write("from flask import Flask")
         # Has code but no README or tests
-        assert _detect_part_completion("test-project", 5, "Built backend") is True
+        assert _detect_part_completion(_state(), 5, "Built backend") is True
 
     def test_mvp_complete_files(self, tmp_data_dir):
         mvp_dir = os.path.join(tmp_data_dir, "projects", "test-project", "mvp")
@@ -135,9 +140,16 @@ class TestDetectPartCompletion:
             f.write("# MVP")
         with open(os.path.join(mvp_dir, "tests", "test_app.py"), "w") as f:
             f.write("def test_hello(): pass")
-        # All required files exist
-        assert _detect_part_completion("test-project", 5, "MVP complete") is False
+        assert _detect_part_completion(_state(), 5, "MVP complete") is False
 
     def test_non_mvp_stage_no_file_check(self, tmp_data_dir):
-        # Part-completion file checks only apply to MVP (stage 5)
-        assert _detect_part_completion("test-project", 2, "BRD written") is False
+        # MVP heuristic only applies to startup stage 5
+        assert _detect_part_completion(_state(), 2, "BRD written") is False
+
+    def test_trading_stage_5_no_mvp_heuristic(self, tmp_data_dir):
+        # Trading pipeline stage 5 is paper trading, not MVP — MVP file heuristic must not fire
+        mvp_dir = os.path.join(tmp_data_dir, "projects", "test-project", "mvp")
+        os.makedirs(mvp_dir, exist_ok=True)
+        with open(os.path.join(mvp_dir, "app.py"), "w") as f:
+            f.write("from flask import Flask")
+        assert _detect_part_completion(_state(pipeline_type="trading"), 5, "Scaffold complete") is False

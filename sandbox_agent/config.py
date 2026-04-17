@@ -29,18 +29,36 @@ BACKGROUND_LLM_CFG = {
     },
 }
 
-# LLM Call model: gemma4:26b on Ollama (192.168.4.88)
+# LLM Call model: gemma4 via proxy (same proxy as primary/backup)
 # Used by llm_call() inside code_interpreter for per-item processing
 LLM_CALL_CFG = {
-    "model": os.getenv("LLM_CALL_MODEL", "gemma4:26b"),
-    "model_server": os.getenv("LLM_CALL_BASE", "http://192.168.4.88:11434/v1"),
+    "model": os.getenv("LLM_CALL_MODEL", "gemma4"),
+    "model_server": os.getenv("LLM_CALL_BASE", "http://192.168.4.66:8000/v1"),
 }
 
 # Token budget — all models have 256k limit, we target 200k to leave room for generation
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "200000"))
-MAX_TOOL_OUTPUT_TOKENS = int(os.getenv("MAX_TOOL_OUTPUT_TOKENS", "8000"))
-MAX_CODE_OUTPUT_TOKENS = int(os.getenv("MAX_CODE_OUTPUT_TOKENS", "4000"))
+MAX_TOOL_OUTPUT_TOKENS = int(os.getenv("MAX_TOOL_OUTPUT_TOKENS", "16000"))
+MAX_CODE_OUTPUT_TOKENS = int(os.getenv("MAX_CODE_OUTPUT_TOKENS", "16000"))
 CHARS_PER_TOKEN = 4  # Rough estimate for English/code; conservative for CJK
+
+# --- Compaction (OpenClaw-style context management) ---
+COMPACTION_ENABLED = os.getenv("COMPACTION_ENABLED", "true").lower() == "true"
+COMPACTION_RESERVE_TOKENS = int(os.getenv("COMPACTION_RESERVE_TOKENS", "30000"))
+COMPACTION_MAX_HISTORY_SHARE = 0.5         # max fraction of context window for history
+COMPACTION_RECENT_TURNS_PRESERVE = 2       # keep last N user/assistant exchanges verbatim
+COMPACTION_SAFETY_MARGIN = 1.2             # 20% buffer on token estimates
+COMPACTION_TOOL_RESULT_MAX_SHARE = 0.30    # max 30% of context per tool result
+COMPACTION_TOOL_RESULT_HARD_CAP = 40000    # 40k chars hard cap per tool result
+COMPACTION_TOOL_RESULT_MIN_KEEP = 2000     # min 2k chars kept after truncation
+COMPACTION_BASE_CHUNK_RATIO = 0.4          # base chunk size as fraction of context
+COMPACTION_MIN_CHUNK_RATIO = 0.15          # minimum chunk ratio
+COMPACTION_MAX_FAILURES = 8                # tool failures to extract
+COMPACTION_FAILURE_CHARS = 240             # chars per failure summary
+COMPACTION_MAX_IDENTIFIERS = 12            # unique identifiers to preserve
+COMPACTION_TIMEOUT = int(os.getenv("COMPACTION_TIMEOUT", "120"))
+COMPACTION_MODEL = os.getenv("COMPACTION_MODEL", "gemma4")
+COMPACTION_URL = os.getenv("COMPACTION_URL", "http://192.168.4.66:8000")
 
 TOOLS_API_BASE = os.getenv("TOOLS_API_BASE", "http://localhost:8080")
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "3600"))  # 1 hour
@@ -51,13 +69,13 @@ TOOL_LIST = [
     "schedule_task", "list_tasks", "complete_task", "cancel_task", "pause_task", "resume_task", "update_task_checkpoint",
     "update_soul", "update_heartbeat",
     "read_memories", "add_memory",
-    "code_interpreter",
+    "code_interpreter", "exec",
     "list_chat_logs", "read_chat_log",
     "create_project", "list_projects", "delete_project", "project_write_file",
-    "project_read_file", "project_list_files", "project_delete_file",
+    "project_read_file", "project_list_files", "project_delete_file", "project_apply_patch",
     "move_file", "delete_file",
     "request_user", "view_requests", "resolve_request",
-    "start_pipeline", "pipeline_status", "list_pipelines",
+    "start_pipeline", "start_trading_pipeline", "pipeline_status", "list_pipelines",
 ]
 
 SYSTEM_PROMPT_SUFFIX = (
