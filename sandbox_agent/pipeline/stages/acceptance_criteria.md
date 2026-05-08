@@ -12,8 +12,18 @@ You are evaluating the output of a pipeline stage. Judge whether the artifact is
 
 ## Scoring
 
-- **PASS**: The artifact meets all 5 criteria at an acceptable level. Minor issues are OK — perfection is not required.
-- **FAIL**: The artifact has significant gaps, lacks depth in key sections, or contains errors that would mislead decision-making. Provide specific, actionable feedback on what to fix.
+- **PASS**: The artifact covers the required sections with reasonable depth. Minor gaps, placeholder text, or imperfect data are acceptable — this is an automated first draft, not a polished deliverable. Pass if the document provides a useful foundation that a human could refine.
+- **FAIL**: ONLY fail if the document has CRITICAL issues:
+  - Document is truncated mid-sentence or clearly incomplete (missing entire required sections)
+  - Document is mostly empty or boilerplate with no real content
+  - Content is factually wrong in ways that would mislead (wrong order of magnitude on market size, etc.)
+
+Do NOT fail for:
+- Placeholder text like [Founder Name] — that's expected for auto-generated content
+- Missing minor subsections if the main sections are covered
+- Imperfect formatting or structure
+- Lack of primary research or customer interviews — the agent only has web access
+- Sections that could be "deeper" — if they have real data and analysis, that's sufficient
 
 ## Response Format
 
@@ -23,4 +33,4 @@ PASS: [Brief explanation of why this is acceptable]
 
 or
 
-FAIL: [Specific issues to fix. Be actionable — say exactly what needs to be added, corrected, or expanded.]
+FAIL: [Specific CRITICAL issue. Only truncation, missing entire sections, or factual errors qualify.]

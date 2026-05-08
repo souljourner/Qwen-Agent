@@ -247,7 +247,7 @@ class WebUI:
 
         from qwen_agent.gui.gradio_dep import gr
 
-        yield gr.update(interactive=False, value=None), None, _chatbot, _history
+        yield gr.update(interactive=False), None, _chatbot, _history
 
     def add_mention(self, _chatbot, _agent_selector):
         if len(self.agent_list) == 1:
@@ -277,39 +277,56 @@ class WebUI:
         if self.agent_hub:
             agent_runner = self.agent_hub
         responses = []
-        for responses in agent_runner.run(_history, **self.run_kwargs):
-            if not responses:
-                continue
-            if responses[-1][CONTENT] == PENDING_USER_INPUT:
-                logger.info('Interrupted. Waiting for user input!')
-                break
+        try:
+            for responses in agent_runner.run(_history, **self.run_kwargs):
+                if not responses:
+                    continue
+                if responses[-1][CONTENT] == PENDING_USER_INPUT:
+                    logger.info('Interrupted. Waiting for user input!')
+                    break
 
-            display_responses = convert_fncall_to_text(responses)
-            if not display_responses:
-                continue
-            if display_responses[-1][CONTENT] is None:
-                continue
+                display_responses = convert_fncall_to_text(responses)
+                if not display_responses:
+                    continue
+                if display_responses[-1][CONTENT] is None:
+                    continue
 
-            while len(display_responses) > num_output_bubbles:
-                # Create a new chat bubble
-                _chatbot.append([None, None])
-                _chatbot[-1][1] = [None for _ in range(len(self.agent_list))]
-                num_output_bubbles += 1
+                while len(display_responses) > num_output_bubbles:
+                    # Create a new chat bubble
+                    _chatbot.append([None, None])
+                    _chatbot[-1][1] = [None for _ in range(len(self.agent_list))]
+                    num_output_bubbles += 1
 
-            assert num_output_bubbles == len(display_responses)
-            assert num_input_bubbles + num_output_bubbles == len(_chatbot)
+                assert num_output_bubbles == len(display_responses)
+                assert num_input_bubbles + num_output_bubbles == len(_chatbot)
 
-            for i, rsp in enumerate(display_responses):
-                agent_index = self._get_agent_index_by_name(rsp[NAME])
-                _chatbot[num_input_bubbles + i][1][agent_index] = rsp[CONTENT]
+                for i, rsp in enumerate(display_responses):
+                    agent_index = self._get_agent_index_by_name(rsp[NAME])
+                    _chatbot[num_input_bubbles + i][1][agent_index] = rsp[CONTENT]
 
-            if len(self.agent_list) > 1:
-                _agent_selector = agent_index
+                if len(self.agent_list) > 1:
+                    _agent_selector = agent_index
 
+                if _agent_selector is not None:
+                    yield _chatbot, _history, _agent_selector
+                else:
+                    yield _chatbot, _history
+        except Exception as exc:
+            logger.exception('agent_run failed')
+            error_text = f'\u26a0\ufe0f {type(exc).__name__}: {str(exc)[:500]}'
+            if _chatbot and isinstance(_chatbot[-1][1], list) and _chatbot[-1][1]:
+                _chatbot[-1][1][0] = error_text
+            elif _chatbot:
+                _chatbot[-1][1] = error_text
+            # Preserve any partial responses that streamed before the exception
+            # so the conversation isn't reset to a blank slate on the next turn.
+            if responses:
+                _history.extend([res for res in responses if res[CONTENT] != PENDING_USER_INPUT])
             if _agent_selector is not None:
                 yield _chatbot, _history, _agent_selector
             else:
                 yield _chatbot, _history
+            return
 
         if responses:
             _history.extend([res for res in responses if res[CONTENT] != PENDING_USER_INPUT])
@@ -325,7 +342,7 @@ class WebUI:
     def flushed(self):
         from qwen_agent.gui.gradio_dep import gr
 
-        return gr.update(interactive=True)
+        return gr.update(interactive=True, value=None)
 
     def _get_agent_index_by_name(self, agent_name):
         if agent_name is None:

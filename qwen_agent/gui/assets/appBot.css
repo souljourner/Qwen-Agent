@@ -110,6 +110,28 @@
   /* flex-direction: row-reverse; */
 }
 
+/* Table styling — ensure readability in both light and dark mode */
+.markdown-body table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 8px 0;
+}
+.markdown-body table th,
+.markdown-body table td {
+  border: 1px solid var(--border-color-primary, #d0d7de);
+  padding: 6px 12px;
+  text-align: left;
+  background: transparent;
+  color: inherit;
+}
+.markdown-body table th {
+  font-weight: 600;
+  background: var(--background-fill-secondary, #f6f8fa);
+}
+.markdown-body table tr:nth-child(even) td {
+  background: var(--background-fill-secondary, rgba(0,0,0,0.02));
+}
+
 .markdown-body .message {
   white-space: pre-wrap;
 }

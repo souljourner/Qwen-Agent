@@ -3,9 +3,12 @@
 ## Objective
 Scaffold a deployable paper-trading setup. This stage does NOT place live orders — the container has no broker credentials. The goal is to produce runnable code + a clear README the user can run on their own machine with their own API keys.
 
+## Runs only if Stage 4 promoted
+If `pipeline/verdict.md` has "Final Recommendation: reject", this stage is **skipped** automatically by `stage_runner._check_verdict_skip`. You will not be invoked in that case. If you are invoked, the verdict was `promote` — proceed.
+
 ## Instructions
 
-1. Read `strategy/spec.md` and `backtest/strategy.py` to understand exactly what needs to run in production.
+1. Read `backtest/full/strategy.py` and `strategy/hypothesis_v{final}.md` to understand exactly what needs to run in production. Also read `pipeline/verdict.md`'s `## If Promoted` section for the specific scaffold requirements the verdict stage specified.
 2. Pick a paper-trading broker integration. Good defaults:
    - **Alpaca** (`alpaca-trade-api` or `alpaca-py`) — free paper trading, US equities + crypto
    - **CCXT** with Binance testnet — crypto paper trading

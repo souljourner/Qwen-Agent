@@ -5,12 +5,13 @@ Review all artifacts from every stage. Update the project status. Capture learni
 
 ## Instructions
 
-1. **Read all project artifacts** (skip the code files, read the MVP README):
+1. **Read all project artifacts**:
    - research/market-research.md
    - business/brd.md
    - product/prd.md
    - business/vc-pitch.md
-   - mvp/README.md (skip the actual code)
+   - mvp/README.md
+   - The `## MVP Filesystem Audit` block injected below lists every file in `mvp/` with its size. Use it — do NOT invent file counts from the README. If the audit shows 12 files totalling 60 KB, say so. If it shows only README.md, say THAT. Never hallucinate "Code Files Created: 0" when code files are clearly present in the audit, and never claim code exists when the audit shows it doesn't.
 
 2. **Update project status**:
    - Write a comprehensive status.md with the current state of the project
@@ -44,10 +45,18 @@ Sections for review.md:
 - ## Learnings (what worked, what didn't, surprises)
 - ## Instruction Improvements (specific suggestions per stage — this enables self-improvement)
 
+## Writing Strategy — CRITICAL
+
+**NEVER write the entire document in one project_write_file call.** Build section by section:
+1. Write the first section: `project_write_file(mode='write', content='# Review\n\n## Section 1\n...')`
+2. Append each subsequent section: `project_write_file(mode='append', content='\n\n## Next Section\n...')`
+3. To fix earlier content, provide the exact text to find and its replacement:
+   `project_write_file(mode='edit', old_text='exact text in file', new_text='replacement text')`
+
 ## Tools to Use
 - project_read_file to read all artifacts
 - project_list_files to see what exists
-- project_write_file to save the review and status
+- project_write_file (mode='write' for first section, mode='append' for rest, mode='edit' for corrections)
 
 ## Quality Bar
 - Summary should be concise and actionable

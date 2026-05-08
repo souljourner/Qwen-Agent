@@ -1,39 +1,62 @@
 import os
 from pathlib import Path
 
-# Primary LLM: vLLM on 192.168.4.66 (single-queue, no concurrency)
-# Used for main interactive conversation only
+# Primary LLM: qwen3.6-27b-linux on vLLM (192.168.4.66) — supports concurrency 15
+# Used for main interactive conversation AND background tasks; up to 15 in flight
+# at once. Saturating all slots routes user chat to the backup (see main.py
+# `_primary_model_lock`, sized as BoundedSemaphore(PRIMARY_MODEL_CONCURRENCY)).
 PRIMARY_LLM_CFG = {
-    "model": "qwen3.5",
+    "model": "qwen3.6-27b-linux",
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {
         "max_input_tokens": 0,        # Disable client-side truncation for KV cache stability
         "request_timeout": 1800,       # 30min — covers full 200k context window worst case
-        # Note: use_raw_api is NOT set (defaults to False) because vLLM does not support
-        # native OpenAI tool_calls. Qwen-Agent uses prompt-based function calling instead,
-        # injecting tool definitions into the system message and parsing calls from text.
+        "temperature": 0.6,
+        # use_raw_api=True: pass `tools=` to vLLM natively. Required because
+        # vLLM has auto-tool-call-parsing enabled for this model, and in
+        # streaming mode it consumes the model's `<tool_call>...</tool_call>`
+        # tokens. Without `tools=`, those tokens are dropped on the floor —
+        # the response streams ~17 None chunks then `'\n\n'` and stops, with
+        # the actual tool call lost. Passing `tools=` makes vLLM emit those
+        # tokens as `delta.tool_calls` instead, which qwen-agent's streaming
+        # handler already supports. Confirmed: prior server (qwen3.5 only)
+        # didn't support this; the linux deployment does.
+        "use_raw_api": True,
     },
 }
 
-# Backup LLM: qwen3.5-27b on same vLLM server
-# Reserved for user chat fallback when the big model is busy with background tasks.
-# Background tasks NEVER use this — they always use the primary model.
+# How many primary-model requests may be in flight at once. The 27b-linux model
+# is configured for concurrency 15 on the vLLM side; raising this above the
+# server's actual limit will cause queueing on the server instead of clean
+# fallback to the backup. Tune both sides together.
+PRIMARY_MODEL_CONCURRENCY = int(os.getenv("PRIMARY_MODEL_CONCURRENCY", "15"))
+
+# Backup LLM: qwen3.5 (the 397B MoE) on same vLLM server.
+# Reserved for user chat fallback when all primary slots are occupied by
+# background work. Background tasks NEVER use this directly — they always
+# acquire a primary-model slot.
 BACKGROUND_LLM_CFG = {
-    "model": "qwen3.5-27b",
+    "model": "qwen3.5",
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {
         "max_input_tokens": 0,
         "request_timeout": 1800,
+        "temperature": 0.6,
+        # Same reason as PRIMARY_LLM_CFG: vLLM auto-tool-parsing means we
+        # must pass `tools=` natively or tool calls vanish from streaming.
+        "use_raw_api": True,
     },
 }
 
-# LLM Call model: gemma4 via proxy (same proxy as primary/backup)
-# Used by llm_call() inside code_interpreter for per-item processing
+# llm_call() endpoint: no longer pinned to a specific model — the bridge and
+# the standalone llm_client both fall through primary (qwen3.6-27b-linux) →
+# backup (qwen3.5) on every call. LLM_CALL_MODEL/LLM_CALL_BASE are honored as
+# a legacy override (single-entry chain) if explicitly set.
 LLM_CALL_CFG = {
-    "model": os.getenv("LLM_CALL_MODEL", "gemma4"),
-    "model_server": os.getenv("LLM_CALL_BASE", "http://192.168.4.66:8000/v1"),
+    "model": os.getenv("LLM_CALL_MODEL", PRIMARY_LLM_CFG["model"]),
+    "model_server": os.getenv("LLM_CALL_BASE", PRIMARY_LLM_CFG["model_server"]),
 }
 
 # Token budget — all models have 256k limit, we target 200k to leave room for generation
@@ -57,7 +80,7 @@ COMPACTION_MAX_FAILURES = 8                # tool failures to extract
 COMPACTION_FAILURE_CHARS = 240             # chars per failure summary
 COMPACTION_MAX_IDENTIFIERS = 12            # unique identifiers to preserve
 COMPACTION_TIMEOUT = int(os.getenv("COMPACTION_TIMEOUT", "120"))
-COMPACTION_MODEL = os.getenv("COMPACTION_MODEL", "gemma4")
+COMPACTION_MODEL = os.getenv("COMPACTION_MODEL", "qwen3.6-27b-linux")
 COMPACTION_URL = os.getenv("COMPACTION_URL", "http://192.168.4.66:8000")
 
 TOOLS_API_BASE = os.getenv("TOOLS_API_BASE", "http://localhost:8080")

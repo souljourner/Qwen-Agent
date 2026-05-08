@@ -72,6 +72,8 @@ DASHBOARD_HTML = """\
 
     <div class="grid" id="status-cards"></div>
 
+    <div id="preview-row" style="margin-bottom:16px;"></div>
+
     <div id="models-section" style="margin-bottom:12px;">
         <h2 style="color:#8b949e;font-size:14px;text-transform:uppercase;letter-spacing:1px;margin:0 0 8px;">Active Models</h2>
         <div class="grid" id="model-cards"></div>
@@ -149,6 +151,24 @@ DASHBOARD_HTML = """\
                         <div class="value">${formatUptime(s.uptime_seconds || 0)}</div>
                     </div>
                 `;
+
+                // Render streaming preview if present
+                {
+                    const previewEl = document.getElementById('preview-row');
+                    const preview = s.current_preview;
+                    if (preview) {
+                        const escDiv = document.createElement('div');
+                        escDiv.textContent = preview;
+                        previewEl.innerHTML = `
+                            <div class="card" style="border-left:3px solid #3fb950">
+                                <div class="label">Streaming Preview</div>
+                                <div style="font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#c9d1d9;white-space:pre-wrap;margin-top:4px;max-height:120px;overflow-y:auto">${escDiv.innerHTML}</div>
+                            </div>
+                        `;
+                    } else {
+                        previewEl.innerHTML = '';
+                    }
+                }
 
                 // Render model status (included in /status response)
                 {
@@ -358,8 +378,8 @@ class StatusHandler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(json.dumps(data, default=str).encode())
         elif self.path == "/models":
-            from sandbox_agent.model_tracker import read_model_status_from_file
-            data = read_model_status_from_file()
+            from sandbox_agent.model_tracker import read_status_from_file
+            data = read_status_from_file()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -367,7 +387,11 @@ class StatusHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(data, default=str).encode())
         elif self.path == "/digest":
             digest_path = os.path.join(DATA_DIR, "digest", "latest.md")
-            content = open(digest_path).read() if os.path.exists(digest_path) else "No digest yet."
+            try:
+                with open(digest_path) as f:
+                    content = f.read()
+            except (FileNotFoundError, OSError):
+                content = "No digest yet."
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -376,7 +400,11 @@ class StatusHandler(BaseHTTPRequestHandler):
         elif self.path == "/requests":
             # Prefer the markdown view, fall back to old format
             requests_md = os.path.join(DATA_DIR, "agent_requests.md")
-            content = open(requests_md).read() if os.path.exists(requests_md) else "No requests."
+            try:
+                with open(requests_md) as f:
+                    content = f.read()
+            except (FileNotFoundError, OSError):
+                content = "No requests."
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")

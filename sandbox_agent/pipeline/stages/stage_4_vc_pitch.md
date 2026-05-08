@@ -33,9 +33,17 @@ Write to `business/vc-pitch.md`:
 - ## Key Metrics to Highlight (3-5 numbers that matter most)
 - ## Anticipated Questions (top 5 questions a VC would ask, with answers)
 
+## Writing Strategy — CRITICAL
+
+**NEVER write the entire document in one project_write_file call.** Build section by section:
+1. Write the first section: `project_write_file(mode='write', content='# VC Pitch\n\n## Elevator Pitch\n...')`
+2. Append each subsequent section: `project_write_file(mode='append', content='\n\n## Next Section\n...')`
+3. To fix earlier content, provide the exact text to find and its replacement:
+   `project_write_file(mode='edit', old_text='exact text in file', new_text='replacement text')`
+
 ## Tools to Use
 - project_read_file to read all previous artifacts
-- project_write_file to save the output
+- project_write_file (mode='write' for first section, mode='append' for rest, mode='edit' for corrections)
 
 ## Quality Bar
 - Elevator pitch should be under 100 words and memorable

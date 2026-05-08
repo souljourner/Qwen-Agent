@@ -36,10 +36,18 @@ Write to `product/prd.md` using standard PRD format:
 - ## Distribution & Deployment (how to reach users)
 - ## Timeline Estimate (rough phases)
 
+## Writing Strategy — CRITICAL
+
+**NEVER write the entire document in one project_write_file call.** Build section by section:
+1. Write the first section: `project_write_file(mode='write', content='# PRD\n\n## Section 1\n...')`
+2. Append each subsequent section: `project_write_file(mode='append', content='\n\n## Next Section\n...')`
+3. To fix earlier content, provide the exact text to find and its replacement:
+   `project_write_file(mode='edit', old_text='exact text in file', new_text='replacement text')`
+
 ## Tools to Use
 - project_read_file to read market research and BRD
 - web_search for technical feasibility questions
-- project_write_file to save the output
+- project_write_file (mode='write' for first section, mode='append' for rest, mode='edit' for corrections)
 
 ## Quality Bar
 - User stories should be specific and testable

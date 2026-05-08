@@ -10,12 +10,15 @@ import pytest
 from sandbox_agent.pipeline.models import PipelineState, StageState
 from sandbox_agent.pipeline.orchestrator import (
     STARTUP_STAGES as STAGES,
+    TRADING_STAGES,
+    _verdict_is_reject,
     acquire_lock,
     clear_lock_on_startup,
     get_num_stages,
     init_pipeline,
     load_stage_instructions,
     load_state,
+    mark_stage_part_completion,
     release_lock,
     save_state,
 )
@@ -173,3 +176,223 @@ class TestLoadStageInstructions:
         for i in range(1, 7):
             instructions = load_stage_instructions(i, "trading")
             assert len(instructions) > 100, f"Trading stage {i} instructions too short"
+
+
+class TestStage6OutputsNoStatusMd:
+
+    def test_startup_stage6_no_status_md(self):
+        assert "status.md" not in STAGES[6]["outputs"]
+        assert "pipeline/review.md" in STAGES[6]["outputs"]
+
+    def test_trading_stage6_no_status_md(self):
+        assert "status.md" not in TRADING_STAGES[6]["outputs"]
+        assert "pipeline/review.md" in TRADING_STAGES[6]["outputs"]
+
+
+class TestBudgetsAndCeilings:
+
+    def test_trading_research_loop_budget_and_ceiling(self, tmp_data_dir):
+        # Stage 2 (research_loop) is the only budgeted trading stage in the
+        # redesigned pipeline — 48h wall-clock, 150 part-completions.
+        state = init_pipeline("tx", "a strategy", pipeline_type="trading")
+        stage2 = state.stages[2]
+        assert stage2.max_part_completions == 150
+        assert stage2.budget_seconds == 172800
+
+    def test_startup_stages_use_defaults(self, tmp_data_dir):
+        state = init_pipeline("startup-x", "idea", pipeline_type="startup")
+        # No startup stage should carry a budget
+        for num, stage in state.stages.items():
+            assert stage.budget_seconds is None, f"stage {num} has unexpected budget"
+            assert stage.max_part_completions == 20
+
+    def test_trading_non_budget_stages_use_defaults(self, tmp_data_dir):
+        state = init_pipeline("tx", "a strategy", pipeline_type="trading")
+        # Everything except stage 2 uses defaults.
+        for num in (1, 3, 4, 5, 6):
+            assert state.stages[num].budget_seconds is None
+            assert state.stages[num].max_part_completions == 20
+
+
+@pytest.fixture
+def stubbed_scheduler(monkeypatch):
+    """Replace the scheduler's TaskQueue with an in-memory stub so orchestrator
+    calls that normally persist to tasks.json don't touch DATA_DIR."""
+    import sys
+    import types
+    import uuid
+
+    class _FakeTask:
+        def __init__(self, name, project):
+            self.id = str(uuid.uuid4())
+            self.name = name
+            self.project = project
+
+    class _FakeTaskQueue:
+        def __init__(self):
+            self.added = []
+
+        def add_task(self, *, name, description, schedule_type, run_at, project):
+            task = _FakeTask(name, project)
+            self.added.append(task)
+            return task
+
+    fake_queue = _FakeTaskQueue()
+
+    # Stub scheduler_tools.get_task_queue — _schedule_stage imports it lazily.
+    mod = types.ModuleType("sandbox_agent.scheduler.scheduler_tools")
+    mod.get_task_queue = lambda: fake_queue
+    monkeypatch.setitem(sys.modules, "sandbox_agent.scheduler.scheduler_tools", mod)
+
+    # Stub notification_tools.RequestUser — used by _finalize_exhausted_stage
+    # on the no-artifacts path.
+    notif = types.ModuleType("sandbox_agent.tools.notification_tools")
+
+    class _StubRequestUser:
+        def __init__(self):
+            self.calls = []
+
+        def call(self, payload):
+            self.calls.append(payload)
+            return ""
+
+    notif.RequestUser = _StubRequestUser
+    monkeypatch.setitem(sys.modules, "sandbox_agent.tools.notification_tools", notif)
+
+    return fake_queue
+
+
+class TestPartCompletionCeiling:
+
+    def test_part_completion_increments_counter(self, tmp_data_dir, stubbed_scheduler):
+        state = init_pipeline("tx", "d", pipeline_type="trading")
+        assert state.stages[3].part_completion_count == 0
+        mark_stage_part_completion("tx", 3, "chunk done")
+        reloaded = load_state("tx")
+        assert reloaded.stages[3].part_completion_count == 1
+        assert reloaded.stages[3].status == "part-completion"
+        # Same-stage re-schedule, not advance
+        assert reloaded.current_stage == 1
+
+    def test_ceiling_advances_to_next_stage_when_artifacts_exist(
+        self, tmp_data_dir, stubbed_scheduler,
+    ):
+        state = init_pipeline("tx", "d", pipeline_type="trading")
+        state.stages[3].max_part_completions = 2
+        # Create an artifact that matches trading stage 3 (full_validation) outputs.
+        full_dir = os.path.join(tmp_data_dir, "projects", "tx", "backtest", "full")
+        os.makedirs(full_dir, exist_ok=True)
+        with open(os.path.join(full_dir, "results.md"), "w") as f:
+            f.write("# Results\nplaceholder\n")
+        save_state(state)
+
+        mark_stage_part_completion("tx", 3, "chunk 1")
+        mark_stage_part_completion("tx", 3, "chunk 2")  # hits ceiling
+
+        reloaded = load_state("tx")
+        assert reloaded.stages[3].part_completion_count == 2
+        assert reloaded.stages[3].status == "completed-no-more-attempts"
+        assert reloaded.current_stage == 4
+
+    def test_ceiling_fails_stage_when_no_artifacts(
+        self, tmp_data_dir, stubbed_scheduler,
+    ):
+        state = init_pipeline("tx-nofile", "d", pipeline_type="trading")
+        state.stages[3].max_part_completions = 1
+        save_state(state)
+
+        mark_stage_part_completion("tx-nofile", 3, "stuck")
+
+        reloaded = load_state("tx-nofile")
+        assert reloaded.stages[3].status == "failed-no-more-attempts"
+        # Still advances to next stage after failure
+        assert reloaded.current_stage == 4
+
+    def test_part_completion_ignored_when_stage_already_completed(
+        self, tmp_data_dir, stubbed_scheduler,
+    ):
+        # Reproduces the prem14a corruption: an orphaned stage-N task runs
+        # after stage N was already marked completed and stage N+1 was
+        # scheduled. mark_stage_part_completion must NOT flip stage N back.
+        state = init_pipeline("tx-done", "d", pipeline_type="trading")
+        state.stages[4].status = "completed"
+        state.stages[4].part_completion_count = 0
+        state.current_stage = 5
+        save_state(state)
+
+        mark_stage_part_completion("tx-done", 4, "late ghost run")
+
+        reloaded = load_state("tx-done")
+        assert reloaded.stages[4].status == "completed"
+        assert reloaded.stages[4].part_completion_count == 0
+        assert reloaded.current_stage == 5
+
+
+class TestVerdictGateAndRejectedStatus:
+
+    def _write_verdict(self, tmp_data_dir, project, body):
+        vdir = os.path.join(tmp_data_dir, "projects", project, "pipeline")
+        os.makedirs(vdir, exist_ok=True)
+        with open(os.path.join(vdir, "verdict.md"), "w") as f:
+            f.write(body)
+
+    def test_verdict_missing_returns_false(self, tmp_data_dir):
+        init_pipeline("tx-v", "d", pipeline_type="trading")
+        assert _verdict_is_reject("tx-v") is False
+
+    def test_verdict_promote_returns_false(self, tmp_data_dir):
+        init_pipeline("tx-p", "d", pipeline_type="trading")
+        self._write_verdict(
+            tmp_data_dir, "tx-p",
+            "## Final Recommendation\npromote\n\n## Rationale\nAll gates passed.",
+        )
+        assert _verdict_is_reject("tx-p") is False
+
+    def test_verdict_reject_returns_true(self, tmp_data_dir):
+        init_pipeline("tx-r", "d", pipeline_type="trading")
+        self._write_verdict(
+            tmp_data_dir, "tx-r",
+            "## Final Recommendation\nreject\n\n## Rationale\nOOS collapsed.",
+        )
+        assert _verdict_is_reject("tx-r") is True
+
+    def test_schedule_next_stage_marks_rejected_and_skips(
+        self, tmp_data_dir, stubbed_scheduler,
+    ):
+        from sandbox_agent.pipeline.orchestrator import _schedule_next_stage
+
+        state = init_pipeline("tx-skip", "d", pipeline_type="trading")
+        state.stages[4].status = "completed"
+        state.current_stage = 4
+        save_state(state)
+        self._write_verdict(
+            tmp_data_dir, "tx-skip",
+            "## Final Recommendation\nreject\n\n## Rationale\nno edge.",
+        )
+
+        _schedule_next_stage(state, 5)
+
+        assert state.status == "completed_rejected"
+        # No stage 5 task enqueued.
+        added_names = [t.name for t in stubbed_scheduler.added]
+        assert not any("paper_trading" in n for n in added_names)
+        assert not any("_stage5" in n for n in added_names)
+
+    def test_schedule_next_stage_promotes_normally(
+        self, tmp_data_dir, stubbed_scheduler,
+    ):
+        from sandbox_agent.pipeline.orchestrator import _schedule_next_stage
+
+        state = init_pipeline("tx-go", "d", pipeline_type="trading")
+        state.stages[4].status = "completed"
+        state.current_stage = 4
+        save_state(state)
+        self._write_verdict(
+            tmp_data_dir, "tx-go",
+            "## Final Recommendation\npromote\n\n## Rationale\nAll gates passed.",
+        )
+
+        _schedule_next_stage(state, 5)
+
+        assert state.status != "completed_rejected"
+        assert state.current_stage == 5

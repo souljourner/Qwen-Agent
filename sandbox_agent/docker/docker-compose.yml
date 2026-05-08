@@ -3,13 +3,12 @@ services:
     build:
       context: ../..
       dockerfile: sandbox_agent/docker/Dockerfile
-    read_only: true
     security_opt:
       - no-new-privileges:true
     cap_drop:
       - ALL
     tmpfs:
-      - /tmp:size=100M
+      - /tmp:size=10G
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
@@ -20,8 +19,6 @@ services:
     environment:
       - TOOLS_API_BASE=http://host.docker.internal:8080
       - VLLM_BASE=http://192.168.4.66:8000/v1
-      - LLM_CALL_MODEL=gemma4:26b
-      - LLM_CALL_BASE=http://192.168.4.88:11434/v1
       - DATA_DIR=/app/data
       - HEARTBEAT_INTERVAL_SECONDS=3600
       - QWEN_AGENT_DEFAULT_WORKSPACE=/app/data/workspace

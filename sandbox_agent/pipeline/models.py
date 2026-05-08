@@ -18,6 +18,7 @@ StageStatus = Literal[
 PipelineStatus = Literal[
     "running",
     "completed",
+    "completed_rejected",
     "failed",
     "paused",
 ]
@@ -38,6 +39,10 @@ class StageState(BaseModel):
     completed_at: Optional[datetime] = None
     last_error: Optional[str] = None
     acceptance_result: Optional[str] = None
+    part_completion_count: int = 0
+    max_part_completions: int = 20
+    first_started_at: Optional[datetime] = None
+    budget_seconds: Optional[int] = None
 
 
 class PipelineState(BaseModel):
@@ -52,3 +57,4 @@ class PipelineState(BaseModel):
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: Optional[datetime] = None
     lock_holder: Optional[str] = None
+    pilot_llm_cost_usd: float = 0.0

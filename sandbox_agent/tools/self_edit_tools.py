@@ -1,6 +1,7 @@
 """Tools that allow the agent to read and update its own configuration files (SOUL.md, HEARTBEAT.md, MEMORIES.md)."""
 
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Union
@@ -219,7 +220,10 @@ class AddMemory(BaseTool):
     description = (
         "Append a concise learning to MEMORIES.md. Use this when you learn something important "
         "from a conversation — user preferences, useful facts, technical discoveries, or task outcomes. "
-        "Keep each entry to 1-2 lines. Add under the appropriate section header."
+        "Keep each entry to 1-2 lines. Add under the appropriate section header. "
+        "IMPORTANT: Do NOT include a date in the memory text — the tool prepends today's date "
+        "automatically. Just write the learning itself (e.g. 'User prefers terse responses'), "
+        "not '[2026-04-20] User prefers terse responses'."
     )
     parameters = {
         "type": "object",
@@ -241,6 +245,8 @@ class AddMemory(BaseTool):
         params = self._verify_json_format_args(params)
         section = params["section"]
         memory = params["memory"]
+
+        memory = re.sub(r"^\s*\[\d{4}-\d{2}-\d{2}\]\s*", "", memory.lstrip("- ").lstrip())
 
         content = _read_file("MEMORIES.md")
         if not content:

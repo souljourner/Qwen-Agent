@@ -3,17 +3,22 @@
 ## Objective
 Synthesize all prior stages into a deployment-readiness assessment. Be honest about robustness and shortcomings.
 
+## Runs only if Stage 4 promoted
+If `pipeline/verdict.md` has "Final Recommendation: reject", this stage is **skipped** automatically by `stage_runner._check_verdict_skip`. If invoked, the verdict was `promote`.
+
 ## Instructions
 
 1. Read every prior artifact:
-   - `research/strategy-research.md`
-   - `strategy/spec.md`
-   - `data/README.md`
-   - `backtest/results.md`
+   - `research/data-landscape.md`
+   - `strategy/loop_state.json` (full history — pilot_history, run_notes, hypothesis_notes)
+   - `strategy/hypothesis_v{final}.md`
+   - `backtest/full/results.md` and `backtest/full/metrics.json`
+   - `pipeline/verdict.md`
    - `paper/README.md`
 2. Write `pipeline/review.md` with these sections:
-   - ## Performance Summary (Sharpe, Max Drawdown, CAGR, Win Rate from backtest — restate the numbers)
-   - ## Robustness (regime sensitivity, parameter sensitivity, walk-forward degradation, known failure modes from stage 1 — did the backtest expose any?)
+   - ## Performance Summary (Sharpe, Max Drawdown, CAGR, Win Rate from `backtest/full/metrics.json` — restate the numbers; include pilot vs. OOS and walk-forward win rate)
+   - ## Research Trajectory (how many hypotheses were tried, how many iterations per hypothesis, what hypothesis_notes say about abandoned ones — the story of what this research *learned*)
+   - ## Robustness (regime sensitivity, walk-forward degradation, known failure modes from `run_notes`' "what_seemed_off" entries — did the backtest expose any?)
    - ## Deployment Readiness (is this strategy ready for paper trading? For live trading with real money? What risks should the user be aware of?)
    - ## Learnings (what worked, what didn't, what would you change)
    - ## Recommended Next Steps (parameter tuning, regime filters, additional universe diversification, risk overlays)

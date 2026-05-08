@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import threading
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -22,11 +23,14 @@ _state = {
     "agent_status": "idle",
     "current_task": None,
     "current_tool": None,
+    "current_preview": None,
     "models": {},
     "started_at": None,
 }
 
 _start_time = datetime.now()
+_PREVIEW_MIN_INTERVAL = 1.0
+_last_preview_write = 0.0
 
 
 def model_start(model: str, task: str) -> None:
@@ -66,11 +70,34 @@ def set_agent_status(status: str = None, current_task: str = None, current_tool:
 
 def clear_agent_status() -> None:
     """Reset agent to idle."""
+    global _last_preview_write
     with _lock:
         _state["agent_status"] = "idle"
         _state["current_task"] = None
         _state["current_tool"] = None
+        _state["current_preview"] = None
         _state["started_at"] = None
+        _last_preview_write = 0.0
+        _write()
+
+
+def set_current_preview(text: Optional[str]) -> None:
+    """Update the rolling streaming-preview field shown on the dashboard.
+
+    Throttled to ~1 write/sec to avoid flooding disk during token streaming.
+    Pass None to clear immediately (bypasses the throttle)."""
+    global _last_preview_write
+    with _lock:
+        if text is None:
+            _state["current_preview"] = None
+            _last_preview_write = 0.0
+            _write()
+            return
+        now = time.monotonic()
+        if now - _last_preview_write < _PREVIEW_MIN_INTERVAL:
+            return
+        _state["current_preview"] = text[-300:]
+        _last_preview_write = now
         _write()
 
 

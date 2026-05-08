@@ -1,0 +1,73 @@
+# Stage 3: Full Validation (OOS + Walk-Forward)
+
+## Objective
+Judgment day. The strategy is **locked** from Stage 2's converged hypothesis. This stage runs the **first and only** look at held-out OOS data plus a walk-forward analysis. There are **no retries** — one honest OOS peek is all you get.
+
+## What "locked" means
+- The strategy code under `backtest/pilot/strategy_v{N}.py` from Stage 2's final iteration is the canonical strategy. Copy it to `backtest/full/strategy.py` unchanged.
+- The llm_cache under `data/processed/llm_cache/pilot/` is re-used as-is for pilot-period signals. You do **not** re-run extraction; you extend the cache to cover OOS rows using the exact same prompt as Stage 2's final iteration.
+- The hypothesis, universe, and feature pipeline are frozen. If anything feels wrong, the answer is "reject" — not "tweak."
+
+## Instructions
+
+1. **Copy strategy code** from the converged iteration to `backtest/full/strategy.py`.
+2. **Extend llm_cache** to cover OOS rows. Load the Stage-2 extraction prompt unchanged, call `llm_batch()` on OOS items, write to `data/processed/llm_cache/oos/{hash}.json`. Every `exec` ≤ 600s; chunk if needed.
+3. **Run the full backtest** over pilot + OOS, emitting signals on OOS using the cached OOS classifications.
+4. **Run walk-forward analysis**: slide a rolling window (e.g., 6-month train / 3-month test) across the full date range; for each window, compute per-window Sharpe vs. the benchmark (SPY by default; pick a defensible index for the universe).
+5. **Write `backtest/full/metrics.json`** with the machine-readable numbers the evaluator gates on.
+6. **Write `backtest/full/results.md`** with the required sections (see Quality Bar below).
+
+## Required metrics.json schema
+```json
+{
+  "pilot_sharpe": 0.88,
+  "oos_sharpe": 0.61,
+  "oos_pilot_ratio": 0.69,
+  "walk_forward_wins": 7,
+  "walk_forward_total": 10,
+  "walk_forward_win_rate": 0.70,
+  "total_trades": 142,
+  "t_stat_daily_returns": 2.4,
+  "deflated_sharpe": 0.31,
+  "turnover_annual": 4.2,
+  "holding_period_days_claimed": 60,
+  "holding_period_days_observed": 58,
+  "benchmark": "SPY"
+}
+```
+
+## Programmatic gates (ALL must pass)
+- `oos_sharpe / pilot_sharpe >= 0.5` — the single best honesty check.
+- `walk_forward_win_rate >= 0.6` — strategy beats benchmark (risk-adjusted) in ≥ 60% of rolling windows.
+- `total_trades >= 100` over the full period.
+- `abs(t_stat_daily_returns) >= 2.0`.
+- `deflated_sharpe > 0` — López de Prado's correction for the number of pilot trials (cap at 24 to match the total-iterations ceiling).
+- Turnover within ±50% of the holding-period claim in the converged hypothesis.
+
+## One peek, no retries
+If acceptance fails here, the stage is marked `completed-no-more-attempts` with the failing gate recorded. The verdict stage reads `metrics.json` and writes the "reject" narrative. There is no rerun mechanism — re-running the full-validation stage against the same OOS data after seeing the result contaminates the OOS boundary and is explicitly disallowed.
+
+## Never re-look at pilot-period signals "just to check"
+No modifications to Stage 2 outputs from this stage. Do not re-extract, do not re-prompt, do not re-tune. If you notice something you wish you'd done in Stage 2, document it in `results.md` under "Post-hoc observations" and move on — reject is an honest outcome.
+
+## Output Files
+- `backtest/full/strategy.py` — copy of the converged pilot strategy.
+- `backtest/full/results.md` — narrative with required sections below.
+- `backtest/full/metrics.json` — machine-readable numbers the evaluator reads.
+- `data/processed/llm_cache/oos/{hash}.json` — OOS feature cache (same prompt as pilot).
+
+## Quality Bar
+`results.md` MUST include sections titled:
+- `## OOS Sharpe` — the number and its ratio to pilot Sharpe.
+- `## Walk-Forward` — win count, win rate, per-window table.
+- `## Benchmark Comparison` — strategy vs. benchmark cumulative return + risk-adjusted comparison.
+- `## Trade Count` — total trades over full period.
+- `## t-Statistic` — daily-returns t-stat + interpretation.
+- `## Turnover` — observed vs. claimed holding period.
+
+## CRITICAL RULES
+- Do **not** change `oos_cutoff_date` in `loop_state.json`.
+- Do **not** re-run Stage 2 extraction against pilot rows.
+- `backtest/full/strategy.py` MUST reference `data/processed/llm_cache/` (either pilot or oos subdirs are fine) — positive lineage check still applies.
+- Every row used for OOS evaluation must have `date >= oos_cutoff_date`. The evaluator checks this.
+- No "mock" / "simulated" / "synthetic" / "fake" anywhere in the strategy or results.

@@ -50,22 +50,33 @@ class TestStageRegistry:
     def test_get_stages_trading(self):
         stages = get_stages("trading")
         assert stages is TRADING_STAGES
-        assert stages[1]["name"] == "strategy_research"
-        assert stages[2]["name"] == "strategy_spec"
-        assert stages[3]["name"] == "data_pipeline"
-        assert stages[4]["name"] == "backtest"
+        assert stages[1]["name"] == "data_landscape"
+        assert stages[2]["name"] == "research_loop"
+        assert stages[3]["name"] == "full_validation"
+        assert stages[4]["name"] == "verdict"
         assert stages[5]["name"] == "paper_trading"
         assert stages[6]["name"] == "review"
 
-    def test_trading_stage_3_requires_requirements_txt(self):
-        assert "data/requirements.txt" in TRADING_STAGES[3]["outputs"]
+    def test_trading_stage_3_requires_metrics_outputs(self):
+        assert "backtest/full/metrics.json" in TRADING_STAGES[3]["outputs"]
+        assert "backtest/full/results.md" in TRADING_STAGES[3]["outputs"]
 
-    def test_trading_stage_4_requires_metric_sections(self):
-        required = TRADING_STAGES[4]["required_sections"]
-        assert "Sharpe" in required
-        assert "Max Drawdown" in required
-        assert "CAGR" in required
-        assert "Win Rate" in required
+    def test_trading_stage_3_requires_metric_sections(self):
+        required = TRADING_STAGES[3]["required_sections"]
+        assert "OOS Sharpe" in required
+        assert "Walk-Forward" in required
+        assert "Trade Count" in required
+        assert "t-Statistic" in required
+
+    def test_trading_stage_2_has_budget_and_ceiling(self):
+        # Only stage 2 (research_loop) is budgeted in the redesigned pipeline.
+        assert TRADING_STAGES[2]["budget_seconds"] == 172800
+        assert TRADING_STAGES[2]["max_part_completions"] == 150
+
+    def test_trading_other_stages_have_no_budget(self):
+        for n in (1, 3, 4, 5, 6):
+            assert "budget_seconds" not in TRADING_STAGES[n]
+            assert "max_part_completions" not in TRADING_STAGES[n]
 
     def test_get_num_stages_is_six(self):
         assert get_num_stages("startup") == 6
@@ -121,13 +132,13 @@ class TestBackcompat:
 
         state = init_pipeline("tx-proj", "a strategy", pipeline_type="trading")
         assert state.pipeline_type == "trading"
-        assert state.stages[1].stage_name == "strategy_research"
+        assert state.stages[1].stage_name == "data_landscape"
 
         # Round-trip through disk
         loaded = load_state("tx-proj")
         assert loaded is not None
         assert loaded.pipeline_type == "trading"
-        assert loaded.stages[4].stage_name == "backtest"
+        assert loaded.stages[4].stage_name == "verdict"
 
     def test_init_pipeline_rejects_unknown_type(self, tmp_data_dir, monkeypatch):
         from sandbox_agent.pipeline import orchestrator

@@ -75,7 +75,8 @@ class ReadDigest(BaseTool):
     def call(self, params: Union[str, dict], **kwargs) -> str:
         latest = os.path.join(DIGEST_DIR, "latest.md")
         if os.path.exists(latest):
-            content = open(latest).read()
+            with open(latest) as f:
+                content = f.read()
             if len(content) > 16000:
                 content = content[:16000] + "\n\n... (truncated)"
             return content

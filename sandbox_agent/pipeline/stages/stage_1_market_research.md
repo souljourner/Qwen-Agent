@@ -34,11 +34,27 @@ Write a comprehensive markdown file to `research/market-research.md` with these 
 - ## Adjacent Markets (other markets this could serve, comparison)
 - ## Key Insights (2-3 non-obvious findings from the research)
 
+## Writing Strategy — CRITICAL
+
+**NEVER write the entire document in one project_write_file call.** Your output WILL be truncated and the stage will fail.
+
+Build the document section by section:
+1. Research ONE section (e.g., Market Size), then write it immediately:
+   `project_write_file(mode='write', content='# Market Research Report\n\n## Market Size\n...')`
+2. Research the NEXT section, then append it:
+   `project_write_file(mode='append', content='\n\n## Competitors\n...')`
+3. Continue for each section. Each tool call adds to the file without replacing previous content.
+4. To fix or update an earlier section, use edit mode with old_text (exact text to find) and new_text (replacement):
+   `project_write_file(mode='edit', old_text='The TAM is $10B.', new_text='The TAM is $15B based on 2026 data.')`
+   old_text must exactly match existing content in the file. Only the first occurrence is replaced.
+
+**Do NOT accumulate all research in memory and write at the end. Write each section as you complete it.**
+
 ## Tools to Use
 - web_search for market data and competitor research
 - web_url_fetch for specific company pages or reports
 - code_interpreter with llm_call() for processing multiple sources
-- project_write_file to save the output
+- project_write_file (mode='write' for first section, mode='append' for subsequent sections, mode='edit' for corrections)
 
 ## Quality Bar
 - Each section should have at least 200 words with specific data

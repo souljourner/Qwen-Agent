@@ -64,3 +64,10 @@ qwen-agent-docs/website/.source-docs/
 qwen-agent-docs/website/last-sync.json
 qwen-agent-docs/website/_pagefind/
 qwen-agent-docs/website/*.tsbuildinfo
+
+# Sandbox-agent runtime data — separate git repo at ~/sandbox_agent_data
+sandbox_agent/data/
+
+# Editor swap files
+*.swp
+*.swo

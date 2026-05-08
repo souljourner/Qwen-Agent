@@ -175,12 +175,16 @@ class DeleteProject(BaseTool):
 
 @register_tool("project_write_file")
 class ProjectWriteFile(BaseTool):
-    """Write or overwrite a file in a project workspace."""
+    """Write, append, or overwrite a file in a project workspace."""
 
     name = "project_write_file"
     description = (
-        "Write a file to a project workspace. Use for saving research, drafts, plans, "
-        "data, reports, or any project artifact. Supports subdirectories (e.g., 'research/competitors.md'). "
+        "Write a file to a project workspace. Supports 3 modes:\n"
+        "- 'write' (default): create or overwrite the file\n"
+        "- 'append': add content to the end of an existing file (creates if missing)\n"
+        "- 'edit': find and replace a specific string in the file\n"
+        "For large documents, use 'append' to build section by section. "
+        "For targeted changes, use 'edit' with old_text/new_text. "
         "Auto-committed to git."
     )
     parameters = {
@@ -196,10 +200,23 @@ class ProjectWriteFile(BaseTool):
             },
             "content": {
                 "type": "string",
-                "description": "File content to write.",
+                "description": "File content to write (for 'write' and 'append' modes).",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["write", "append", "edit"],
+                "description": "Write mode: 'write' (overwrite), 'append' (add to end), 'edit' (find and replace). Default: 'write'.",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "Text to find (required for 'edit' mode). Must be an exact match of existing content.",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "Replacement text (required for 'edit' mode).",
             },
         },
-        "required": ["project", "path", "content"],
+        "required": ["project", "path"],
     }
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
@@ -217,8 +234,54 @@ class ProjectWriteFile(BaseTool):
         full_path = os.path.join(pdir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-        with open(full_path, "w") as f:
-            f.write(params["content"])
+        mode = params.get("mode", "write")
+
+        if mode == "append":
+            content = params.get("content", "")
+            with open(full_path, "a") as f:
+                f.write(content)
+            result_msg = f"Appended to {params['path']} ({len(content)} chars)"
+
+        elif mode == "edit":
+            old_text = params.get("old_text")
+            new_text = params.get("new_text")
+            if not old_text:
+                return "Error: 'old_text' is required for edit mode."
+            if new_text is None:
+                return "Error: 'new_text' is required for edit mode."
+            if not os.path.exists(full_path):
+                return f"Error: file '{params['path']}' does not exist. Use 'write' mode to create it."
+            with open(full_path, "r") as f:
+                existing = f.read()
+            if old_text not in existing:
+                # Try trimmed matching as fallback
+                old_stripped = old_text.strip()
+                found = False
+                for line_start in range(len(existing)):
+                    candidate = existing[line_start:line_start + len(old_text)]
+                    if candidate.strip() == old_stripped:
+                        existing = existing[:line_start] + new_text + existing[line_start + len(candidate):]
+                        found = True
+                        break
+                if not found:
+                    preview = old_text[:100] + ("..." if len(old_text) > 100 else "")
+                    return f"Error: old_text not found in {params['path']}. Preview: '{preview}'"
+                result_msg = f"Edited {params['path']} (fuzzy match)"
+            else:
+                count = existing.count(old_text)
+                existing = existing.replace(old_text, new_text, 1)
+                if count > 1:
+                    result_msg = f"Edited {params['path']} (replaced first of {count} occurrences)"
+                else:
+                    result_msg = f"Edited {params['path']} (replaced {len(old_text)} chars with {len(new_text)} chars)"
+            with open(full_path, "w") as f:
+                f.write(existing)
+
+        else:  # write mode (default)
+            content = params.get("content", "")
+            with open(full_path, "w") as f:
+                f.write(content)
+            result_msg = f"Written: {params['path']} ({len(content)} chars)"
 
         # Update project metadata
         meta = _load_meta(pdir)
@@ -232,7 +295,7 @@ class ProjectWriteFile(BaseTool):
         except Exception:
             pass
 
-        return f"Written: {params['path']} ({len(params['content'])} chars)"
+        return result_msg
 
 
 @register_tool("project_read_file")
@@ -271,7 +334,8 @@ class ProjectReadFile(BaseTool):
         if not os.path.exists(full_path):
             return f"File not found: {params['path']} in project '{params['project']}'"
 
-        content = open(full_path).read()
+        with open(full_path) as f:
+            content = f.read()
 
         # Cap to avoid blowing up context — suggest code_interpreter for large files
         max_chars = 16000
@@ -387,6 +451,325 @@ class ProjectDeleteFile(BaseTool):
 
         os.remove(full_path)
         return f"Deleted: {params['path']} from {params['project']}"
+
+
+@register_tool("project_apply_patch")
+class ProjectApplyPatch(BaseTool):
+    """Apply a structured patch to one or more files in a project."""
+
+    name = "project_apply_patch"
+    description = (
+        "Apply a patch to one or more project files in a single call. "
+        "Supports adding, deleting, and updating files. "
+        "Update uses context-based matching (like unified diff) — provide a few lines of "
+        "surrounding context with - (remove) and + (add) markers.\n\n"
+        "Format:\n"
+        "*** Begin Patch\n"
+        "*** Add File: path/to/new.md\n"
+        "+line 1 of new file\n"
+        "+line 2 of new file\n"
+        "*** Update File: path/to/existing.md\n"
+        "@@ context line to locate the edit\n"
+        "-old line to remove\n"
+        "+new line to add\n"
+        " unchanged context line\n"
+        "*** Delete File: path/to/remove.md\n"
+        "*** End Patch\n\n"
+        "Best for making targeted edits to multiple files without rewriting them entirely."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "description": "Project name.",
+            },
+            "patch": {
+                "type": "string",
+                "description": "Patch content using *** Begin Patch / *** End Patch format.",
+            },
+        },
+        "required": ["project", "patch"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        pdir = _project_dir(params["project"])
+
+        if not os.path.exists(pdir):
+            return f"Project '{params['project']}' not found."
+
+        patch_text = params["patch"]
+        try:
+            result = _apply_patch(pdir, patch_text)
+        except Exception as e:
+            return f"Patch failed: {e}"
+
+        # Update project metadata
+        meta = _load_meta(pdir)
+        meta["updated_at"] = datetime.now().isoformat()
+        _save_meta(pdir, meta)
+
+        # Git commit
+        try:
+            autocommit("projects/", f"Apply patch in {params['project']}")
+        except Exception:
+            pass
+
+        return result
+
+
+def _apply_patch(project_dir: str, patch_text: str) -> str:
+    """Parse and apply a patch in OpenClaw-style format.
+
+    Format:
+        *** Begin Patch
+        *** Add File: path
+        +content lines (each prefixed with +)
+        *** Update File: path
+        @@ optional context line
+        -old line
+        +new line
+         unchanged context line
+        *** Delete File: path
+        *** End Patch
+    """
+    lines = patch_text.strip().split("\n")
+    if not lines:
+        return "Error: empty patch"
+
+    # Strip heredoc wrappers if present
+    if lines[0] in ("<<EOF", "<<'EOF'", '<<"EOF"') and lines[-1].rstrip() == "EOF":
+        lines = lines[1:-1]
+
+    if lines[0].strip() != "*** Begin Patch":
+        return "Error: patch must start with '*** Begin Patch'"
+    if lines[-1].strip() != "*** End Patch":
+        return "Error: patch must end with '*** End Patch'"
+
+    body = lines[1:-1]
+    added, modified, deleted = [], [], []
+    i = 0
+
+    while i < len(body):
+        line = body[i].strip()
+
+        if not line:
+            i += 1
+            continue
+
+        if line.startswith("*** Add File: "):
+            file_path = line[len("*** Add File: "):]
+            content_lines = []
+            i += 1
+            while i < len(body) and body[i].startswith("+"):
+                content_lines.append(body[i][1:])
+                i += 1
+            full_path = _safe_project_path(project_dir, file_path)
+            if full_path is None:
+                return f"Error: invalid path '{file_path}'"
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w") as f:
+                f.write("\n".join(content_lines) + "\n" if content_lines else "")
+            added.append(file_path)
+
+        elif line.startswith("*** Delete File: "):
+            file_path = line[len("*** Delete File: "):]
+            full_path = _safe_project_path(project_dir, file_path)
+            if full_path is None:
+                return f"Error: invalid path '{file_path}'"
+            if os.path.exists(full_path):
+                os.remove(full_path)
+                deleted.append(file_path)
+            else:
+                return f"Error: file not found for deletion: {file_path}"
+            i += 1
+
+        elif line.startswith("*** Update File: "):
+            file_path = line[len("*** Update File: "):]
+            full_path = _safe_project_path(project_dir, file_path)
+            if full_path is None:
+                return f"Error: invalid path '{file_path}'"
+            if not os.path.exists(full_path):
+                return f"Error: file not found for update: {file_path}"
+
+            # Parse chunks
+            i += 1
+            chunks = []
+            while i < len(body) and not body[i].startswith("***"):
+                if not body[i].strip():
+                    i += 1
+                    continue
+                chunk, consumed = _parse_update_chunk(body, i)
+                chunks.append(chunk)
+                i += consumed
+
+            if not chunks:
+                return f"Error: update for '{file_path}' has no edit chunks"
+
+            # Apply chunks
+            try:
+                result_text = _apply_update_chunks(full_path, chunks)
+                with open(full_path, "w") as f:
+                    f.write(result_text)
+                modified.append(file_path)
+            except Exception as e:
+                return f"Error updating {file_path}: {e}"
+        else:
+            return f"Error: unrecognized patch line: '{line}'"
+
+    # Format summary
+    parts = []
+    if added:
+        parts.extend(f"A {f}" for f in added)
+    if modified:
+        parts.extend(f"M {f}" for f in modified)
+    if deleted:
+        parts.extend(f"D {f}" for f in deleted)
+
+    if not parts:
+        return "No files were modified."
+    return "Patch applied:\n" + "\n".join(parts)
+
+
+def _safe_project_path(project_dir: str, file_path: str):
+    """Validate and resolve a path within the project. Returns None if invalid."""
+    normalized = os.path.normpath(file_path)
+    if normalized.startswith("..") or normalized.startswith("/"):
+        return None
+    return os.path.join(project_dir, normalized)
+
+
+def _parse_update_chunk(lines, start):
+    """Parse one update chunk starting at `start`. Returns (chunk_dict, lines_consumed)."""
+    i = start
+    context = None
+
+    # Optional @@ context marker
+    if lines[i].startswith("@@ ") or lines[i].strip() == "@@":
+        if lines[i].strip() != "@@":
+            context = lines[i][3:]  # text after "@@ "
+        i += 1
+
+    old_lines = []
+    new_lines = []
+    consumed_content = 0
+
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("***") or (line.startswith("@@ ") and consumed_content > 0):
+            break
+
+        marker = line[0] if line else " "
+        if marker == "-":
+            old_lines.append(line[1:])
+        elif marker == "+":
+            new_lines.append(line[1:])
+        elif marker == " ":
+            old_lines.append(line[1:])
+            new_lines.append(line[1:])
+        else:
+            # Treat as context (no prefix = unchanged line)
+            old_lines.append(line)
+            new_lines.append(line)
+
+        i += 1
+        consumed_content += 1
+
+    return {"context": context, "old_lines": old_lines, "new_lines": new_lines}, i - start
+
+
+def _apply_update_chunks(file_path: str, chunks: list) -> str:
+    """Apply update chunks to a file. Returns the new file content."""
+    with open(file_path, "r") as f:
+        original = f.read()
+
+    original_lines = original.split("\n")
+    # Remove trailing empty line from split
+    if original_lines and original_lines[-1] == "":
+        original_lines.pop()
+
+    replacements = []
+    search_start = 0
+
+    for chunk in chunks:
+        context = chunk.get("context")
+        old_lines = chunk["old_lines"]
+        new_lines = chunk["new_lines"]
+
+        # If there's a context marker, seek to it first
+        if context:
+            ctx_idx = _seek_line(original_lines, context, search_start)
+            if ctx_idx is None:
+                raise ValueError(f"Context not found: '{context}'")
+            search_start = ctx_idx  # Start from context line (it may be the edited line itself)
+
+        if not old_lines:
+            # Pure insertion at end of file
+            insert_at = len(original_lines)
+            replacements.append((insert_at, 0, new_lines))
+            continue
+
+        # Find the old_lines sequence in the original
+        found = _seek_sequence(original_lines, old_lines, search_start)
+        if found is None:
+            preview = old_lines[0] if old_lines else "(empty)"
+            raise ValueError(f"Could not find lines to replace starting with: '{preview}'")
+
+        replacements.append((found, len(old_lines), new_lines))
+        search_start = found + len(old_lines)
+
+    # Apply replacements in reverse order to preserve indices
+    replacements.sort(key=lambda r: r[0])
+    result = list(original_lines)
+    for start_idx, old_len, new_lines in reversed(replacements):
+        result[start_idx:start_idx + old_len] = new_lines
+
+    # Ensure trailing newline
+    if not result or result[-1] != "":
+        result.append("")
+    return "\n".join(result)
+
+
+def _seek_line(lines: list, target: str, start: int) -> int:
+    """Find a single line in the file, with fuzzy matching fallback."""
+    # Exact match
+    for i in range(start, len(lines)):
+        if lines[i] == target:
+            return i
+    # Trimmed match
+    target_stripped = target.strip()
+    for i in range(start, len(lines)):
+        if lines[i].strip() == target_stripped:
+            return i
+    return None
+
+
+def _seek_sequence(lines: list, pattern: list, start: int) -> int:
+    """Find a sequence of lines, with progressive fuzzy matching."""
+    if not pattern:
+        return start
+    if len(pattern) > len(lines):
+        return None
+
+    max_start = len(lines) - len(pattern)
+
+    # Pass 1: exact match
+    for i in range(start, max_start + 1):
+        if all(lines[i + j] == pattern[j] for j in range(len(pattern))):
+            return i
+
+    # Pass 2: strip trailing whitespace
+    for i in range(start, max_start + 1):
+        if all(lines[i + j].rstrip() == pattern[j].rstrip() for j in range(len(pattern))):
+            return i
+
+    # Pass 3: strip all whitespace
+    for i in range(start, max_start + 1):
+        if all(lines[i + j].strip() == pattern[j].strip() for j in range(len(pattern))):
+            return i
+
+    return None
 
 
 @register_tool("move_file")

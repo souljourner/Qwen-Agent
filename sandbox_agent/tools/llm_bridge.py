@@ -1,6 +1,7 @@
 """LLM bridge — exposes an HTTP endpoint so code_interpreter can make LLM calls.
 
-Uses the backup model (qwen3.5-27b) on vLLM via OpenAI-compatible API.
+Falls back through the primary vLLM model (qwen3.6-27b-linux) then the backup
+(qwen3.5 397B). Treats empty completions as failures with one retry per model.
 Secured with a shared secret token generated at startup.
 """
 
@@ -13,7 +14,7 @@ import requests as http_requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
-from sandbox_agent.config import BACKGROUND_LLM_CFG
+from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +25,28 @@ _auth_token = None
 MAX_REQUEST_BODY = 1_000_000  # 1MB max request size
 
 
-def _create_handler(llm_cfg: dict, auth_token: str):
+def _build_fallback_chain(llm_cfg: Optional[dict]) -> list:
+    """Ordered (model, server) pairs tried in sequence on each /llm request.
+
+    Always starts with primary → backup. A caller-supplied llm_cfg is only
+    honored if it matches one of the two canonical models — this keeps the
+    bridge from silently routing to a misconfigured model."""
+    canonical = {
+        PRIMARY_LLM_CFG["model"]: PRIMARY_LLM_CFG["model_server"],
+        BACKGROUND_LLM_CFG["model"]: BACKGROUND_LLM_CFG["model_server"],
+    }
+    chain = []
+    if llm_cfg and llm_cfg.get("model") in canonical:
+        chain.append((llm_cfg["model"], llm_cfg["model_server"]))
+    for m, s in canonical.items():
+        if all(m != existing for existing, _ in chain):
+            chain.append((m, s))
+    return chain
+
+
+def _create_handler(llm_cfg: Optional[dict], auth_token: str):
     """Create a request handler that calls the LLM via OpenAI-compatible API."""
+    fallback_chain = _build_fallback_chain(llm_cfg)
 
     class LLMHandler(BaseHTTPRequestHandler):
 
@@ -59,54 +80,57 @@ def _create_handler(llm_cfg: dict, auth_token: str):
 
             try:
                 from sandbox_agent.model_tracker import model_start, model_done
-                model_start(llm_cfg["model"], f"llm_call: {prompt[:80]}")
 
                 messages = []
                 if system:
                     messages.append({"role": "system", "content": system})
                 messages.append({"role": "user", "content": prompt})
 
-                # Use Ollama native API if available, otherwise OpenAI-compat
-                ollama_base = llm_cfg["model_server"].replace("/v1", "")
-                if "11434" in ollama_base:
-                    # Ollama native API — supports think parameter
-                    resp = http_requests.post(
-                        f"{ollama_base}/api/chat",
-                        json={
-                            "model": llm_cfg["model"],
-                            "messages": messages,
-                            "think": think,
-                            "stream": False,
-                        },
-                        timeout=600,
-                    )
-                    resp.raise_for_status()
-                    result_text = resp.json().get("message", {}).get("content", "")
-                else:
-                    # vLLM OpenAI-compatible API
-                    resp = http_requests.post(
-                        f"{llm_cfg['model_server']}/chat/completions",
-                        json={
-                            "model": llm_cfg["model"],
-                            "messages": messages,
-                            "max_tokens": 4096,
-                        },
-                        timeout=600,
-                    )
-                    resp.raise_for_status()
-                    result_text = resp.json()["choices"][0]["message"].get("content", "")
+                result_text = None
+                last_error = None
+                # Primary → backup chain. Retry each model once on empty content
+                # before falling through (vLLM sometimes returns 200 with an empty
+                # completion under context-window pressure).
+                for model, server in fallback_chain:
+                    succeeded = False
+                    for attempt in (1, 2):
+                        try:
+                            model_start(model, f"llm_call: {prompt[:80]}")
+                            resp = http_requests.post(
+                                f"{server}/chat/completions",
+                                json={
+                                    "model": model,
+                                    "messages": messages,
+                                    "temperature": 0.6,
+                                },
+                                timeout=600,
+                            )
+                            resp.raise_for_status()
+                            content = resp.json()["choices"][0]["message"].get("content") or ""
+                            model_done(model)
+                            if content.strip():
+                                result_text = content
+                                succeeded = True
+                                break
+                            last_error = Exception(f"{model}: empty completion (attempt {attempt})")
+                        except Exception as e:
+                            model_done(model)
+                            last_error = e
+                            logger.warning(f"llm_call failed on {model}: {e}")
+                            break  # HTTP error — skip retry, try next model
+                    if succeeded:
+                        break
 
-                model_done(llm_cfg["model"])
+                if result_text is None:
+                    raise last_error or Exception("All models failed")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"result": result_text}).encode())
 
             except BrokenPipeError:
-                model_done(llm_cfg["model"])
                 logger.debug("LLM bridge: client disconnected (BrokenPipeError)")
             except Exception as e:
-                model_done(llm_cfg["model"])
                 logger.warning(f"LLM bridge call failed: {e}")
                 try:
                     self.send_response(500)
@@ -123,14 +147,18 @@ def _create_handler(llm_cfg: dict, auth_token: str):
 
 
 def start_bridge(llm_cfg: Optional[dict] = None) -> int:
-    """Start the LLM bridge server. Returns the port number."""
+    """Start the LLM bridge server. Returns the port number.
+
+    `llm_cfg` is optional — when omitted (or when its model isn't in the
+    canonical primary/backup set), the bridge falls through primary → backup
+    on every request."""
     global _server, _port, _auth_token
     if _server is not None:
         return _port
 
-    cfg = llm_cfg or BACKGROUND_LLM_CFG
     _auth_token = secrets.token_hex(32)
-    handler = _create_handler(cfg, _auth_token)
+    handler = _create_handler(llm_cfg, _auth_token)
+    chain = _build_fallback_chain(llm_cfg)
 
     # Find a free port, bind to localhost only
     _server = HTTPServer(("127.0.0.1", 0), handler)
@@ -138,7 +166,8 @@ def start_bridge(llm_cfg: Optional[dict] = None) -> int:
 
     thread = threading.Thread(target=_server.serve_forever, daemon=True, name="llm-bridge")
     thread.start()
-    logger.info(f"LLM bridge started on port {_port} -> {cfg['model']} @ {cfg['model_server']}")
+    chain_desc = " → ".join(f"{m}" for m, _ in chain)
+    logger.info(f"LLM bridge started on port {_port} — chain: {chain_desc}")
     return _port
 
 

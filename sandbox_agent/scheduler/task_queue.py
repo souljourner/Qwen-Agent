@@ -1,6 +1,7 @@
 """JSON-file-backed task queue with cron, interval, dependencies, and exponential backoff."""
 
 import json
+import logging
 import os
 import threading
 import uuid
@@ -11,6 +12,8 @@ from croniter import croniter
 
 from sandbox_agent.config import DATA_DIR
 from sandbox_agent.scheduler.models import Task
+
+logger = logging.getLogger(__name__)
 
 # Exponential backoff delays for failed tasks (OpenClaw pattern)
 BACKOFF_DELAYS = [30, 60, 300, 900, 3600]  # 30s, 1m, 5m, 15m, 60m
@@ -32,9 +35,13 @@ class TaskQueue:
     def _load(self) -> None:
         # Only load active tasks into memory
         if os.path.exists(self._file_path):
-            with open(self._file_path, "r") as f:
-                raw = json.load(f)
-            self._tasks = [Task(**t) for t in raw]
+            try:
+                with open(self._file_path, "r") as f:
+                    raw = json.load(f)
+                self._tasks = [Task(**t) for t in raw]
+            except Exception as e:
+                logger.warning(f"Corrupt tasks file {self._file_path}, starting fresh: {e}")
+                self._tasks = []
         else:
             self._tasks = []
 
@@ -274,6 +281,33 @@ class TaskQueue:
         """Get a single task by ID."""
         with self._lock:
             return self._find_task(task_id)
+
+    def reset_orphaned_running_tasks(self, reason: str = "process restart") -> List[str]:
+        """Flip tasks stuck in 'running' back to 'pending' so the cron loop
+        picks them up again. A task is 'running' only while a worker thread is
+        actively executing it; after a crash/restart that worker is gone but
+        the on-disk status never got reverted. Without this sweep,
+        get_due_tasks skips them forever (it only considers pending/failed).
+
+        Called at process startup AND by the cron-task wall-clock timeout path
+        when a task wedges and we abandon it."""
+        reset_ids: List[str] = []
+        with self._lock:
+            now = datetime.now()
+            for task in self._tasks:
+                if task.status != "running":
+                    continue
+                task.status = "pending"
+                task.updated_at = now
+                # Schedule immediately — these tasks were already due.
+                task.next_run = now
+                task.last_error = f"Orphaned from previous run ({reason}); reset to pending"
+                reset_ids.append(task.id)
+            if reset_ids:
+                self._save()
+        if reset_ids:
+            logger.info(f"Reset {len(reset_ids)} orphaned running task(s) to pending: {reset_ids}")
+        return reset_ids
 
     def remove_task(self, task_id: str) -> bool:
         """Cancel a task — moves it to the cancelled archive."""

@@ -77,7 +77,8 @@ def _update_latest():
         date_str = date.strftime("%Y-%m-%d")
         path = _digest_path(date_str)
         if os.path.exists(path):
-            days.append(open(path).read().strip())
+            with open(path) as f:
+                days.append(f.read().strip())
 
     with open(latest_path, "w") as f:
         f.write("# Agent Activity Digest (Last 3 Days)\n\n")

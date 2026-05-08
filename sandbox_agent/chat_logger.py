@@ -146,7 +146,8 @@ class ReadChatLog(BaseTool):
         if not os.path.exists(filepath):
             return f"No chat log found for {date_str}."
 
-        content = open(filepath, "r").read()
+        with open(filepath, "r") as f:
+            content = f.read()
         # Cap at ~4000 tokens to avoid blowing up context
         max_chars = 16000
         if len(content) > max_chars:
