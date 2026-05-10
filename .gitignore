@@ -71,3 +71,10 @@ sandbox_agent/data/
 # Editor swap files
 *.swp
 *.swo
+
+# Chainlit runtime artifacts (auto-generated; the real config lives in the
+# bind-mounted DATA_DIR inside the container)
+.chainlit/
+chainlit.md
+chainlit.lock
+sandbox_agent_dev_data/

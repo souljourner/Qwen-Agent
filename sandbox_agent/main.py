@@ -743,6 +743,83 @@ def _start_background_lanes(system_message: str, task_queue: TaskQueue) -> None:
     logger.info("Cron loop started")
 
 
+_BOOTSTRAPPED = False
+_BOOTSTRAP_TASK_QUEUE: Optional[TaskQueue] = None
+
+
+def bootstrap_background(status_server_port: int = 7861) -> TaskQueue:
+    """One-time bootstrap of all background machinery for non-Gradio entrypoints
+    (Chainlit, REPL with-bg, tests). Idempotent — repeated calls are no-ops.
+
+    Sets up, in order:
+      1. DATA_DIR + git repo (idempotent)
+      2. Pipeline lock + stuck-stage cleanup
+      3. System message (loaded into config cache, available via load_system_message)
+      4. Shared TaskQueue + orphan task recovery + scheduler-tools wiring
+      5. Pipeline orphan-stage rescheduling
+      6. LLM bridge (HTTP server on localhost; sets ci._llm_init_code)
+      7. Status server (port `status_server_port`, separate process via multiprocessing)
+      8. Background lanes (heartbeat thread + cron thread)
+
+    Returns the shared TaskQueue (some callers want a handle to it).
+    Pass `status_server_port=0` to skip starting the status server (useful in
+    dev where you might already have one running on the standard port).
+    """
+    global _BOOTSTRAPPED, _BOOTSTRAP_TASK_QUEUE
+    if _BOOTSTRAPPED:
+        assert _BOOTSTRAP_TASK_QUEUE is not None
+        return _BOOTSTRAP_TASK_QUEUE
+
+    os.makedirs(DATA_DIR, exist_ok=True)
+    # Don't bother with git repo init here — main.main() does that for the CLI
+    # path, and Chainlit deployments inherit the bind-mounted host repo.
+
+    from sandbox_agent.pipeline.orchestrator import (
+        clear_lock_on_startup,
+        reschedule_orphaned_stages_on_startup,
+    )
+    clear_lock_on_startup()
+
+    system_message = load_system_message()
+    logger.info("System message loaded")
+
+    task_queue = TaskQueue()
+    orphaned = task_queue.reset_orphaned_running_tasks(reason="process startup")
+    if orphaned:
+        logger.warning(f"Recovered {len(orphaned)} orphaned task(s): {orphaned}")
+
+    from sandbox_agent.scheduler.scheduler_tools import set_task_queue
+    set_task_queue(task_queue)
+
+    rescheduled = reschedule_orphaned_stages_on_startup()
+    if rescheduled:
+        logger.warning(f"Rescheduled {len(rescheduled)} orphaned pipeline stage(s): {rescheduled}")
+
+    from sandbox_agent.tools.llm_bridge import start_bridge, get_kernel_init_code
+    import sandbox_agent.tools.code_interpreter as ci
+    bridge_port = start_bridge()
+    ci._llm_init_code = get_kernel_init_code(bridge_port)
+    logger.info(
+        f"LLM bridge started on port {bridge_port} — chain: "
+        f"{PRIMARY_LLM_CFG['model']} → {BACKGROUND_LLM_CFG['model']} "
+        f"@ {PRIMARY_LLM_CFG['model_server']}"
+    )
+
+    if status_server_port > 0:
+        try:
+            from sandbox_agent.status_server import start_status_server
+            start_status_server(status_server_port)
+            logger.info(f"Status server started on port {status_server_port}")
+        except Exception:
+            logger.exception("Status server failed to start; continuing without it")
+
+    _start_background_lanes(system_message, task_queue)
+
+    _BOOTSTRAPPED = True
+    _BOOTSTRAP_TASK_QUEUE = task_queue
+    return task_queue
+
+
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Sandbox Agent")

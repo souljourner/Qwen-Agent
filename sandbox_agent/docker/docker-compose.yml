@@ -25,5 +25,17 @@ services:
       - GRADIO_SERVER_TIMEOUT=3600
       - TZ=America/Los_Angeles
       - QWEN_AGENT_MAX_LLM_CALL_PER_RUN=50
+      # --- Chainlit chat surface ---
+      # Auth secret. Generate once with `python -c "import secrets; print(secrets.token_hex(32))"`
+      # and put in a sibling .env file (which docker-compose reads automatically).
+      # Falling back to a fixed dev secret here so the container can boot
+      # without one configured — overwrite for any non-dev deployment.
+      - CHAINLIT_AUTH_SECRET=${CHAINLIT_AUTH_SECRET:-dev-secret-change-me-9c4f7e2a8b1d}
+      # SQLite connection for the data layer (threads + messages + steps live here).
+      - DATABASE_URL=sqlite+aiosqlite:////app/data/chat.db
+      # Status server lane: set to 7861 to start it in-process from chat_app.py.
+      # Set to 0 to skip (e.g. if running an external monitor).
+      - STATUS_SERVER_PORT=7861
 
-# Data is bind-mounted to ~/sandbox_agent_data (visible in Finder)
+# Data is bind-mounted to ~/sandbox_agent_data (visible in Finder).
+# Chainlit's chat history persists at /app/data/chat.db (host: ~/sandbox_agent_data/chat.db).

@@ -33,6 +33,22 @@ from qwen_agent.llm.schema import ASSISTANT, FunctionCall, Message
 from qwen_agent.log import logger
 
 
+def _extract_reasoning(obj) -> str:
+    """Pull reasoning/thinking text off a streaming delta or a message.
+
+    OpenAI-compatible servers haven't standardized the field name: vLLM emits
+    `reasoning`, DeepSeek and some others emit `reasoning_content`. Check both
+    so the model's thinking isn't silently dropped.
+    """
+    if obj is None:
+        return ''
+    for attr in ('reasoning_content', 'reasoning'):
+        val = getattr(obj, attr, None)
+        if val:
+            return val
+    return ''
+
+
 @register_llm('oai')
 class TextChatAtOAI(BaseFnCallModel):
 
@@ -108,12 +124,12 @@ class TextChatAtOAI(BaseFnCallModel):
             if delta_stream:
                 for chunk in response:
                     if chunk.choices:
-                        if hasattr(chunk.choices[0].delta,
-                                   'reasoning_content') and chunk.choices[0].delta.reasoning_content:
+                        delta_reasoning = _extract_reasoning(chunk.choices[0].delta)
+                        if delta_reasoning:
                             yield [
                                 Message(role=ASSISTANT,
                                         content='',
-                                        reasoning_content=chunk.choices[0].delta.reasoning_content)
+                                        reasoning_content=delta_reasoning)
                             ]
                         if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
                             yield [Message(role=ASSISTANT, content=chunk.choices[0].delta.content)]
@@ -123,9 +139,9 @@ class TextChatAtOAI(BaseFnCallModel):
                 full_tool_calls = []
                 for chunk in response:
                     if chunk.choices:
-                        if hasattr(chunk.choices[0].delta,
-                                   'reasoning_content') and chunk.choices[0].delta.reasoning_content:
-                            full_reasoning_content += chunk.choices[0].delta.reasoning_content
+                        delta_reasoning = _extract_reasoning(chunk.choices[0].delta)
+                        if delta_reasoning:
+                            full_reasoning_content += delta_reasoning
                         if hasattr(chunk.choices[0].delta, 'content') and chunk.choices[0].delta.content:
                             full_response += chunk.choices[0].delta.content
                         if hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
@@ -166,11 +182,12 @@ class TextChatAtOAI(BaseFnCallModel):
         messages = self.convert_messages_to_dicts(messages)
         try:
             response = self._chat_complete_create(model=self.model, messages=messages, stream=False, **generate_cfg)
-            if hasattr(response.choices[0].message, 'reasoning_content'):
+            msg_reasoning = _extract_reasoning(response.choices[0].message)
+            if msg_reasoning:
                 return [
                     Message(role=ASSISTANT,
                             content=response.choices[0].message.content,
-                            reasoning_content=response.choices[0].message.reasoning_content)
+                            reasoning_content=msg_reasoning)
                 ]
             else:
                 return [Message(role=ASSISTANT, content=response.choices[0].message.content)]

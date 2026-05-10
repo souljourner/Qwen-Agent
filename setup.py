@@ -107,7 +107,8 @@ setup(
             'uvicorn>=0.23.2',
         ],
 
-        # Extra dependencies for Gradio-based GUI:
+        # Extra dependencies for Gradio-based GUI (legacy — sandbox_agent has
+        # cut over to Chainlit, but the Gradio path is kept as a fallback).
         'gui': [
             # Gradio has bad version compatibility. Therefore, we use `==` instead of `>=`.
             'pydantic==2.9.2',
@@ -115,6 +116,14 @@ setup(
             'gradio==5.23.1',
             'gradio-client==1.8.0',
             'modelscope_studio==1.6.1',
+        ],
+
+        # Chainlit-based chat front end for sandbox_agent. Persistence is
+        # backed by SQLAlchemy (SQLite by default; see chat_data_layer.py).
+        'chat': [
+            'chainlit',
+            'aiosqlite',
+            'sqlalchemy>=2.0',
         ],
     },
     url='https://github.com/QwenLM/Qwen-Agent',

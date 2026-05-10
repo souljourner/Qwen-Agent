@@ -70,10 +70,14 @@ resp = client.chat.completions.create(
     model="qwen3.6-27b-linux",
     messages=[{"role":"system","content":"..."},{"role":"user","content":"..."}],
     temperature=0.6,
+    # Disable reasoning when you want fast, direct answers (classification,
+    # extraction, formatting). Keep it on (omit this line) for complex
+    # synthesis where the model benefits from thinking out loud.
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
 )
 text = resp.choices[0].message.content
 ```
-The `openai` package is already installed in the runtime image. `VLLM_BASE` resolves to the same vLLM the agent itself uses. Models available: `qwen3.6-27b-linux` (primary, supports concurrency), `qwen3.5` (397B, slower, prefer for complex reasoning).
+The `openai` package is already installed in the runtime image. `VLLM_BASE` resolves to the same vLLM the agent itself uses. Models available: `qwen3.6-27b-linux` (primary, supports concurrency), `qwen3.5` (397B, slower, prefer for complex reasoning). Both honor `enable_thinking`. For streaming calls, pass `stream=True` and the same `extra_body` together — `enable_thinking=False` is per-call, not per-client, so flip it on for hard problems and off for fast loops.
 
 ### Batch URL processing — MANDATORY pattern
 When you need to process multiple URLs (2 or more):
