@@ -330,7 +330,26 @@ class _StreamBridge:
         # Empty / whitespace-only assistant messages with no function_call are
         # streaming placeholders — ignore until they grow real content.
 
+    async def _close_thought(self, i: int) -> None:
+        """Mark the reasoning step that precedes message index `i` as done, so
+        its spinner clears the moment the model stops thinking and starts
+        acting — not at the very end of the run. (qwen-agent always follows a
+        message's reasoning_content with that message's content / function
+        call, so the appearance of either means the thinking for `i` is over.)"""
+        state = self._by_index.get(-(i + 1))
+        if state is None:
+            return
+        obj = state["obj"]
+        if getattr(obj, "end", None):
+            return
+        obj.end = utc_now()
+        try:
+            await obj.update()
+        except Exception:  # noqa: BLE001
+            logger.debug("StreamBridge: failed to close thought step", exc_info=True)
+
     async def _stream_text(self, i: int, text: str) -> None:
+        await self._close_thought(i)
         state = self._by_index.get(i)
         first = False
         if state is None or state["kind"] != "text":
@@ -395,6 +414,7 @@ class _StreamBridge:
             state["streamed"] = len(reasoning)
 
     async def _stream_tool_call(self, i: int, msg, function_call) -> None:
+        await self._close_thought(i)
         name = getattr(function_call, "name", None) or "tool"
         args = getattr(function_call, "arguments", "") or ""
         function_id = self._function_id(msg)
