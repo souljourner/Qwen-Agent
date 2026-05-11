@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY setup.py README.md /app/Qwen-Agent/
 COPY qwen_agent/ /app/Qwen-Agent/qwen_agent/
 RUN pip install --no-cache-dir "/app/Qwen-Agent[gui]" croniter numpy soundfile \
-    ipykernel jupyter_client pandas requests Pillow beautifulsoup4 lxml \
+    pandas requests Pillow beautifulsoup4 lxml \
     chainlit aiosqlite "sqlalchemy>=2.0"
 
 # Copy sandbox_agent

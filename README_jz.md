@@ -55,7 +55,7 @@ Setting `PRIMARY_MODEL_CONCURRENCY` higher than what vLLM actually serves on the
 | Category | Tools | Description |
 |---|---|---|
 | **Web** | `web_search`, `web_url_fetch`, `stock_price` | Call port 8080 API via SSE. All outputs sanitized. Brave Search rate-limited to 1 req/2s. |
-| **Code** | `code_interpreter` | Local Jupyter kernel (subprocess). Has `llm_call(prompt, system="", think=False)` via the qwen3.6-27b-linux → qwen3.5 chain. Pre-configured `DATA_DIR`, `PROJECTS_DIR` path vars. Output capped at 4k tokens. |
+| **Code** | `code_interpreter` | Fresh Python subprocess per call (no cross-call state — persist via files). `start_new_session=True` + killpg on timeout/error. numpy/pandas/requests pre-imported. Has `llm_call(prompt, system="", think=False)` via the qwen3.6-27b-linux → qwen3.5 chain. Pre-configured `DATA_DIR`, `PROJECTS_DIR` path vars. Output capped at `MAX_CODE_OUTPUT_TOKENS`. |
 | **Scheduling** | `schedule_task`, `list_tasks`, `complete_task`, `cancel_task`, `pause_task`, `resume_task`, `update_task_checkpoint` | JSON-backed task queue. Active tasks in `tasks.json`, completed/cancelled archived to separate files. |
 | **Pipeline** | `start_pipeline`, `pipeline_status`, `list_pipelines` | Code-based 6-stage project builder (see Pipeline section below). |
 | **Self-edit** | `update_soul`, `update_heartbeat` | Patch a section or append a line (not full file replacement). Auto-committed to git. |
@@ -130,7 +130,7 @@ sandbox_agent/
 ├── tools/
 │   ├── api_tools.py          # web_search, web_url_fetch, stock_price (port 8080 SSE)
 │   ├── sanitizer.py          # Prompt injection defense: strip tokens, invisible chars, delimiters
-│   ├── code_interpreter.py   # Local Jupyter kernel with llm_call() bridge
+│   ├── code_interpreter.py   # Stateless Python subprocess per call, with llm_call() bridge
 │   ├── llm_bridge.py         # HTTP bridge → qwen3.6-27b-linux → qwen3.5 on vLLM for llm_call()
 │   ├── self_edit_tools.py    # update_soul (section patch), update_heartbeat, read/add memory
 │   ├── project_tools.py      # Project workspace CRUD + move_file, delete_file, delete_project
@@ -154,7 +154,7 @@ sandbox_agent/
 ├── scripts/
 │   └── cleanup_data.py       # Batch file reorganization script (standalone, dry-run default)
 └── docker/
-    ├── Dockerfile            # Python 3.12, Qwen-Agent[gui], Jupyter, beautifulsoup4, lxml
+    ├── Dockerfile            # Python 3.12, Qwen-Agent[gui], Chainlit, pandas/requests, beautifulsoup4, lxml
     └── docker-compose.yml    # Security-hardened, bind mount, env vars
 ```
 
@@ -169,7 +169,7 @@ sandbox_agent/
 | `TOOLS_API_BASE` | `http://host.docker.internal:8080` | Web tools |
 | `DATA_DIR` | `/app/data` | Writable volume (bind-mounted to ~/sandbox_agent_data/) |
 | `HEARTBEAT_INTERVAL_SECONDS` | `3600` | 1 hour |
-| `QWEN_AGENT_MAX_LLM_CALL_PER_RUN` | `50` | Max tool iterations per agent run |
+| `QWEN_AGENT_MAX_LLM_CALL_PER_RUN` | `100` | Max tool iterations per agent run |
 | `GRADIO_SERVER_TIMEOUT` | `3600` | 1 hour (prevents connection timeout on long tasks) |
 | `TZ` | `America/Los_Angeles` | Pacific time |
 | `QWEN_AGENT_DEFAULT_WORKSPACE` | `/app/data/workspace` | Qwen-Agent RAG workspace |
@@ -184,7 +184,7 @@ sandbox_agent/
 | Request timeout | 10-30 min (dynamic) | Linear scale based on payload size |
 | Code interpreter timeout | 10 min - 2 hr (dynamic) | Scales with code size |
 | `llm_call()` prompt | 200k tokens / 1MB | Bridge truncates |
-| Tool call loop | 50 iterations | `QWEN_AGENT_MAX_LLM_CALL_PER_RUN` |
+| Tool call loop | 100 iterations | `QWEN_AGENT_MAX_LLM_CALL_PER_RUN` |
 
 ## System Prompt Assembly
 
@@ -206,8 +206,7 @@ Background sessions use the base system message without metadata (static for KV 
 
 | Capability | Description |
 |-----------|-------------|
-| **Persistent Jupyter kernel** | State (variables, imports, DataFrames) survives across code_interpreter calls. OpenClaw starts fresh every command. |
-| **`llm_call()` inside code execution** | Agent calls a background LLM from within Python loops for per-item reasoning. 2-model fallback chain (qwen3.6-27b-linux → qwen3.5) with empty-completion retry. OpenClaw has no LLM access inside execution. |
+| **`llm_call()` / `llm_batch()` inside code execution** | Agent calls a background LLM from within Python loops for per-item reasoning (`llm_batch` runs many concurrently). 2-model fallback chain (qwen3.6-27b-linux → qwen3.5) with empty-completion retry. OpenClaw has no LLM access inside execution. |
 | **Pipeline orchestrator** | Automated 6-stage startup builder (Market Research → BRD → PRD → VC Pitch → MVP → Review) with acceptance evaluation, retry logic, incremental file writing, and stage-to-stage artifact passing. OpenClaw has no equivalent. |
 | **Self-scheduling** | Agent creates its own cron jobs, schedules pipeline stages, runs periodic heartbeat checks autonomously. |
 | **Self-modification** | `update_soul`, `update_heartbeat`, `add_memory` — agent edits its own identity, checklist, and persistent memory at runtime. OpenClaw's AGENTS.md is static. |
@@ -223,8 +222,7 @@ Background sessions use the base system message without metadata (static for KV 
 
 | Capability | Description | Impact |
 |-----------|-------------|--------|
-| **General shell/exec tool** | Runs any shell command (`npm install`, `cargo build`, start servers). We only have Python via Jupyter. | Can't build non-Python apps or run build tools. |
-| **Background process management** | Auto-backgrounds after 10s, tracks processes in registry, cancellable. | Can't start dev servers while doing other work. |
+| **Background process management** | Auto-backgrounds after 10s, tracks processes in a registry, cancellable. We have `exec` + `code_interpreter` (both process-group-isolated) but no backgrounded-session registry — a `server &` survives a call but isn't tracked. | Can't manage long-running dev servers as first-class objects. |
 | **Inner sandbox isolation** | Docker sandbox with path denylists, env sanitization, seccomp/AppArmor, command approval system. | Code interpreter has full container filesystem access. Prompt injection → code exec → data exfiltration is possible. |
 | **Tool approval system** | Multi-tier (`deny`/`allowlist`/`full`) with interactive prompts before dangerous operations. | Every tool call executes without review. |
 | **Push notifications** | Not in OpenClaw either, but our `request_user` is file-only — no email, Slack, webhook, desktop alert. | Agent can't actually reach the user when it says "I'll let you know." |
@@ -238,11 +236,11 @@ Background sessions use the base system message without metadata (static for KV 
 
 | Aspect | **OpenClaw** | **Sandbox Agent** |
 |--------|-------------|-------------------|
-| Code execution | Docker + ephemeral shell commands | Persistent Jupyter kernel (subprocess) |
-| Languages | Any (shell) | Python only |
-| State persistence | None per command | Yes across calls |
-| Output limit | 200k chars | 64k chars (raised from 16k) |
-| Timeout | Overall + no-output; auto-background at 10s | Dynamic 10min–2hr; OS signal alarm |
+| Code execution | Docker + ephemeral shell commands | `code_interpreter` (fresh Python subprocess per call) + `exec` (shell); both `start_new_session=True` + killpg on timeout |
+| Languages | Any (shell) | Python (`code_interpreter`) + anything via `exec` |
+| State persistence | None per command | None per call — filesystem only (DATA_DIR/PROJECTS_DIR) |
+| Output limit | 200k chars | `MAX_CODE_OUTPUT_TOKENS` (code) / 16k tokens (exec) |
+| Timeout | Overall + no-output; auto-background at 10s | Dynamic 10–20min (code) / ≤10min (exec); killpg on timeout |
 | Security model | Docker sandbox + path denylists + env sanitization + seccomp + command approval | Outer Docker container only |
 | LLM inside code | None | `llm_call()` with 2-model fallback + empty-completion retry |
 | File tools | write, edit, apply_patch (workspace-scoped) | write/append/edit, apply_patch (project-scoped) |
@@ -345,7 +343,7 @@ Background sessions use the base system message without metadata (static for KV 
 │       ├── TODO.md
 │       ├── research/             # Research files
 │       └── demos/                # Demo artifacts
-├── code_interpreter/              # Jupyter kernel files
+├── scratch/                       # code_interpreter temp scripts (auto-deleted per call)
 ├── checkpoints/                   # Task checkpoint state
 └── workspace/                     # Qwen-Agent RAG workspace
 ```

@@ -225,6 +225,4 @@ def llm_call(prompt, system="", think=False):
     )
     resp.raise_for_status()
     return resp.json()["result"]
-
-print("llm_call() is available — call the background LLM with any prompt. Use think=True for complex reasoning.")
 """

@@ -7,6 +7,7 @@ file operations, and non-Python CLIs. Commands run via subprocess with shell=Tru
 import logging
 import os
 import re
+import signal
 import subprocess
 import time
 from typing import Union
@@ -17,6 +18,23 @@ from sandbox_agent.config import DATA_DIR
 from sandbox_agent.token_budget import truncate_output
 
 logger = logging.getLogger(__name__)
+
+
+def kill_process_group(proc: "subprocess.Popen") -> None:
+    """SIGKILL the entire process group of `proc` (which was started with
+    start_new_session=True, so it's a group leader). Reaches background
+    children a plain proc.kill() would miss. Best-effort — swallows the
+    races where the group is already gone."""
+    if proc is None or proc.poll() is not None:
+        # already exited — still try the group in case `&` children linger
+        pass
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except (ProcessLookupError, OSError):
+            pass
 
 MAX_TIMEOUT = 600  # 10 minutes
 DEFAULT_TIMEOUT = 120  # 2 minutes
@@ -31,6 +49,14 @@ BLOCKED_PATTERNS = [
     re.compile(r"\bmkfs\b"),  # format filesystem
     re.compile(r"\bfdisk\b"),  # partition table
     re.compile(r"\bmount\b.*\bdev\b"),  # mount devices
+    # Broad process kills — PID 1 in the container is `python` (chainlit), so
+    # any of these would take the whole agent down. Process-group isolation
+    # (start_new_session) already protects against `kill 0` / `kill -- -PGID`
+    # spilling into PID 1's group, but name-targeted kills bypass that.
+    re.compile(r"\bpkill\b[^|;&]*\bpython"),
+    re.compile(r"\bkillall\b[^|;&]*\bpython"),
+    re.compile(r"\bkill\b\s+-?(9|SIGKILL|TERM|SIGTERM)?\s*-1\b"),  # kill -1 / kill -9 -1
+    re.compile(r"\bkill\b\s+(-\w+\s+)?\b1\b"),  # kill 1 / kill -9 1
 ]
 
 
@@ -60,7 +86,7 @@ class ExecTool(BaseTool):
         "Run a shell command. Supports pipes, redirects, && chains. "
         "Use for: npm/pip install, build tools, git, file operations, starting servers, "
         "running tests, and any CLI tool. "
-        "For Python data work with persistent state and llm_call(), prefer code_interpreter. "
+        "For Python data work and llm_call(), prefer code_interpreter. "
         "For building apps: use exec for installs and builds, project_write_file for source code. "
         "Commands run in DATA_DIR by default, or in a project directory if 'project' is set."
     )
@@ -126,46 +152,50 @@ class ExecTool(BaseTool):
         existing_pp = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = "/app" + (os.pathsep + existing_pp if existing_pp else "")
 
-        # Execute
+        # Execute. `start_new_session=True` puts the shell (and everything it
+        # spawns) in its own process group / session, isolated from PID 1.
+        # Without this, an agent-issued command like `kill 0`, `pkill -f
+        # python`, or a botched PID-extraction one-liner can SIGTERM the
+        # container's main process and take the whole agent down.
         start = time.monotonic()
+        proc = None
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=workdir,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout,
                 env=env,
+                start_new_session=True,
             )
-            duration = time.monotonic() - start
-            output = ""
-            if result.stdout:
-                output += result.stdout
-            if result.stderr:
-                if output:
-                    output += "\n"
-                output += result.stderr
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the WHOLE process group — a `cmd &` may have left
+                # background children that proc.kill() alone wouldn't reach.
+                kill_process_group(proc)
+                try:
+                    stdout, stderr = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = "", ""
+                duration = time.monotonic() - start
+                partial = ((stdout or "") + ("\n" + stderr if stderr else "")).strip()
+                partial = truncate_output(partial, MAX_OUTPUT_TOKENS) if partial else "(no output before timeout)"
+                return f"Timed out after {timeout}s | {len(partial):,} chars\n\n{partial}"
 
+            duration = time.monotonic() - start
+            output = (stdout or "")
+            if stderr:
+                output += ("\n" if output else "") + stderr
             output = output.strip() or "(no output)"
             output = truncate_output(output, MAX_OUTPUT_TOKENS)
-
-            header = f"Exit {result.returncode} | {duration:.1f}s | {len(output):,} chars"
-            return f"{header}\n\n{output}"
-
-        except subprocess.TimeoutExpired as e:
-            duration = time.monotonic() - start
-            partial = ""
-            if e.stdout:
-                partial += e.stdout if isinstance(e.stdout, str) else e.stdout.decode(errors="replace")
-            if e.stderr:
-                partial += e.stderr if isinstance(e.stderr, str) else e.stderr.decode(errors="replace")
-            partial = truncate_output(partial.strip(), MAX_OUTPUT_TOKENS) if partial.strip() else "(no output before timeout)"
-
-            header = f"Timed out after {timeout}s | {len(partial):,} chars"
-            return f"{header}\n\n{partial}"
+            return f"Exit {proc.returncode} | {duration:.1f}s | {len(output):,} chars\n\n{output}"
 
         except Exception as e:
+            if proc is not None:
+                kill_process_group(proc)
             return f"Error: {e}"
         finally:
             set_current_tool(None)

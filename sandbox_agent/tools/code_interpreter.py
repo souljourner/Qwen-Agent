@@ -1,16 +1,18 @@
-"""Local code interpreter — runs Python via a subprocess Jupyter kernel (no Docker-in-Docker).
+"""Local code interpreter — runs Python as a fresh subprocess per call.
 
-Based on the benchmark code_interpreter pattern from qwen_agent, adapted as a
-registered tool that works inside an already-sandboxed Docker container.
+Each `code_interpreter` call writes the user's code (after a fixed prelude that
+imports numpy/pandas, sets DATA_DIR/PROJECTS_DIR, and — if the LLM bridge is up —
+defines llm_call()) to a temp .py file and runs it with `subprocess.Popen(...,
+start_new_session=True)` + `communicate(timeout=...)`, killing the whole process
+group on timeout/error. No persistent interpreter: state does NOT carry over
+between calls — persist anything you need to a file. This mirrors `exec_tool` and
+matches how OpenClaw/Hermes run code; it eliminates the wedged-Jupyter-kernel hang
+class. Persistence is the filesystem (DATA_DIR/PROJECTS_DIR) + the container's
+installed packages.
 """
 
-import atexit
-import base64
-import io
-import json
 import logging
 import os
-import queue
 import re
 import subprocess
 import sys
@@ -20,269 +22,135 @@ from typing import Union
 
 from qwen_agent.tools.base import BaseTool, register_tool
 
-from sandbox_agent.config import DATA_DIR
+from sandbox_agent.config import DATA_DIR, MAX_CODE_OUTPUT_TOKENS
+from sandbox_agent.token_budget import truncate_output
+from sandbox_agent.tools.exec_tool import kill_process_group
 
 logger = logging.getLogger(__name__)
 
 WORK_DIR = os.path.join(DATA_DIR, "scratch")
-
-LAUNCH_KERNEL_PY = "from ipykernel import kernelapp as app\napp.launch_new_instance()\n"
 
 INIT_CODE = f"""\
 def input(*args, **kwargs):
     raise NotImplementedError('Python input() function is disabled.')
 
 import os, math, re, json
-import numpy as np
-import pandas as pd
+try:
+    import numpy as np
+except ImportError:
+    pass
+try:
+    import pandas as pd
+except ImportError:
+    pass
 
 # Pre-configured paths
 DATA_DIR = os.getenv('DATA_DIR', '{DATA_DIR}')
 PROJECTS_DIR = os.path.join(DATA_DIR, 'projects')
 """
 
-# LLM bridge init code is appended after INIT_CODE when the kernel starts
+# LLM bridge init code (defines llm_call()) — set at bootstrap by main.py /
+# chat_app.py via `code_interpreter._llm_init_code = get_kernel_init_code(port)`.
+# Prepended to every script. If unset, scripts that call llm_call() get a
+# NameError (same as the old kernel started without the bridge).
 _llm_init_code = None
-
-_kernel_client = None
-_kernel_process = None
 
 
 def _escape_ansi(text: str) -> str:
     return re.compile(r"(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]").sub("", text)
 
 
-def _start_kernel():
-    """Start a local Jupyter kernel as a subprocess and return a BlockingKernelClient."""
-    global _kernel_process
-    from jupyter_client import BlockingKernelClient
-
-    os.makedirs(WORK_DIR, exist_ok=True)
-
-    pid = os.getpid()
-    connection_file = os.path.join(WORK_DIR, f"kernel_connection_{pid}.json")
-    launch_script = os.path.join(WORK_DIR, f"launch_kernel_{pid}.py")
-
-    # Clean up stale files
-    for f in [connection_file, launch_script]:
-        if os.path.exists(f):
-            os.remove(f)
-
-    with open(launch_script, "w") as fout:
-        fout.write(LAUNCH_KERNEL_PY)
-
-    _kernel_process = subprocess.Popen(
-        [sys.executable, launch_script, "--IPKernelApp.connection_file", connection_file, "--quiet"],
-        cwd=WORK_DIR,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    logger.info(f"Kernel started (PID={_kernel_process.pid})")
-
-    # Wait for connection file to be written
-    for _ in range(100):  # 10 seconds max
-        if os.path.isfile(connection_file):
-            try:
-                with open(connection_file, "r") as fp:
-                    json.load(fp)
-                break
-            except json.JSONDecodeError:
-                pass
-        time.sleep(0.1)
-    else:
-        raise RuntimeError("Kernel connection file not created within 10 seconds")
-
-    kc = BlockingKernelClient(connection_file=connection_file)
-    kc.load_connection_file()
-    kc.start_channels()
-    kc.wait_for_ready()
-
-    # Run init code
-    kc.execute(INIT_CODE)
-    _drain_output(kc)
-
-    # Inject llm_call() if bridge is running
-    if _llm_init_code:
-        kc.execute(_llm_init_code)
-        _drain_output(kc)
-
-    return kc
-
-
-def _drain_output(kc, timeout_seconds: int = 5) -> None:
-    """Drain all pending messages from the kernel."""
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        try:
-            msg = kc.get_iopub_msg(timeout=0.5)
-            if msg["msg_type"] == "status" and msg["content"].get("execution_state") == "idle":
-                break
-        except queue.Empty:
-            break
-
-
-def _get_kernel():
-    """Get or start the kernel client. Restarts if the kernel process died."""
-    global _kernel_client, _kernel_process
-    # Check if existing kernel is still alive
-    if _kernel_client is not None and _kernel_process is not None:
-        if _kernel_process.poll() is not None:
-            # Kernel process is dead — clean up and restart
-            logger.warning(f"Kernel process died (exit code {_kernel_process.returncode}). Restarting.")
-            try:
-                _kernel_client.stop_channels()
-            except Exception:
-                pass
-            _kernel_client = None
-            _kernel_process = None
-    if _kernel_client is None:
-        _kernel_client = _start_kernel()
-    return _kernel_client
-
-
-def _cleanup_kernel():
-    """Clean up kernel on exit."""
-    global _kernel_process, _kernel_client
-    if _kernel_client:
-        try:
-            _kernel_client.stop_channels()
-        except Exception:
-            pass
-    if _kernel_process:
-        try:
-            _kernel_process.terminate()
-            _kernel_process.wait(timeout=5)
-        except Exception:
-            pass
-
-
-atexit.register(_cleanup_kernel)
-
-
-MIN_TIMEOUT = 600       # 10 minutes minimum
+MIN_TIMEOUT = 600        # 10 minutes minimum
 SECONDS_PER_TOKEN = 0.1  # ~10 tokens/sec generation speed as budget estimate
-MAX_TIMEOUT = 7200      # 2 hour hard cap
+MAX_TIMEOUT = 1200       # 20 minute hard cap (a longer job should be a scheduled task)
 
 
 def _compute_timeout(code: str) -> int:
     """Compute timeout based on code size. Longer code = more work = more time.
 
     Heuristic: 1 token ≈ 4 chars, budget ~0.1s per token of code.
-    Minimum 10 minutes, max 2 hours.
+    Minimum 10 minutes, max 20 minutes.
     """
     estimated_tokens = len(code) // 4
     computed = int(estimated_tokens * SECONDS_PER_TOKEN)
     return max(MIN_TIMEOUT, min(computed, MAX_TIMEOUT))
 
 
+def _build_script(code: str) -> str:
+    """Assemble the full script: fixed prelude + llm_call() def + user code."""
+    return INIT_CODE + "\n" + (_llm_init_code or "") + "\n\n# --- user code ---\n" + code + "\n"
+
+
 def _execute_code(code: str, timeout: int = 0) -> str:
-    """Execute Python code in the kernel and return the output."""
+    """Run `code` as a fresh Python subprocess; return exec-style output."""
     if timeout <= 0:
         timeout = _compute_timeout(code)
-    kc = _get_kernel()
+
+    os.makedirs(WORK_DIR, exist_ok=True)
+    script_path = os.path.join(WORK_DIR, f"_ci_{uuid.uuid4().hex[:8]}.py")
+    with open(script_path, "w") as f:
+        f.write(_build_script(code))
+
+    # /app on PYTHONPATH so the script can `from sandbox_agent.tools.llm_client
+    # import llm_batch` (the editable install usually covers this already, but
+    # be explicit — same as exec_tool).
+    env = dict(os.environ)
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = "/app" + (os.pathsep + existing_pp if existing_pp else "")
+
+    start = time.monotonic()
+    proc = None
     try:
-        kc.wait_for_ready(timeout=30)
-    except RuntimeError:
-        # Kernel not responding — restart it
-        logger.warning("Kernel not responding to wait_for_ready. Restarting.")
-        global _kernel_client, _kernel_process
-        _cleanup_kernel()
-        _kernel_client = None
-        _kernel_process = None
-        kc = _get_kernel()
-        kc.wait_for_ready(timeout=30)
-
-    # Add timeout guard
-    wrapped = f"""\
-import signal
-def _timeout_handler(signum, frame):
-    raise TimeoutError("Code execution timed out after {timeout} seconds")
-signal.signal(signal.SIGALRM, _timeout_handler)
-signal.alarm({timeout})
-{code}
-signal.alarm(0)
-"""
-    kc.execute(wrapped)
-
-    result_parts = []
-    image_idx = 0
-
-    while True:
-        finished = False
+        # `start_new_session=True`: the script (and anything it spawns) gets its
+        # own process group / session, isolated from PID 1. A `kill 0` / `pkill`
+        # inside the script can't reach the container's main process.
+        proc = subprocess.Popen(
+            [sys.executable, script_path],
+            cwd=DATA_DIR,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            start_new_session=True,
+        )
         try:
-            msg = kc.get_iopub_msg(timeout=timeout + 5)
-            msg_type = msg["msg_type"]
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # SIGKILL the whole group — a `server &` may have left children.
+            kill_process_group(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                stdout, stderr = "", ""
+            partial = _escape_ansi(((stdout or "") + ("\n" + stderr if stderr else "")).strip())
+            partial = truncate_output(partial, MAX_CODE_OUTPUT_TOKENS) if partial else "(no output before timeout)"
+            return f"Timed out after {timeout}s | {len(partial):,} chars\n\n{partial}"
 
-            if msg_type == "status":
-                if msg["content"].get("execution_state") == "idle":
-                    finished = True
-            elif msg_type == "execute_result":
-                text = msg["content"]["data"].get("text/plain", "")
-                if text:
-                    result_parts.append(text)
-                if "image/png" in msg["content"]["data"]:
-                    image_idx += 1
-                    path = _save_image(msg["content"]["data"]["image/png"])
-                    result_parts.append(f"[Image saved: {path}]")
-            elif msg_type == "display_data":
-                if "image/png" in msg["content"]["data"]:
-                    image_idx += 1
-                    path = _save_image(msg["content"]["data"]["image/png"])
-                    result_parts.append(f"[Image saved: {path}]")
-                else:
-                    text = msg["content"]["data"].get("text/plain", "")
-                    if text:
-                        result_parts.append(text)
-            elif msg_type == "stream":
-                text = msg["content"]["text"]
-                if text.strip():
-                    result_parts.append(text)
-            elif msg_type == "error":
-                tb = _escape_ansi("\n".join(msg["content"]["traceback"]))
-                if "Code execution timed out" in tb:
-                    result_parts.append(f"Timeout: no response after {timeout} seconds.")
-                else:
-                    result_parts.append(f"Error:\n{tb}")
-                finished = True
+        duration = time.monotonic() - start
+        output = (stdout or "")
+        if stderr:
+            output += ("\n" if output else "") + stderr
+        # NOTE: on a clean exit we deliberately do NOT kill the process group —
+        # a server the script started with `&` is reparented to init and keeps
+        # listening, so the agent can curl it from the next call (matches exec).
+        output = _escape_ansi(output.strip()) or "(no output)"
+        output = truncate_output(output, MAX_CODE_OUTPUT_TOKENS)
+        return f"Exit {proc.returncode} | {duration:.1f}s | {len(output):,} chars\n\n{output}"
 
-        except queue.Empty:
-            result_parts.append(f"Timeout: no response after {timeout} seconds.")
-            finished = True
-        except Exception as e:
-            result_parts.append(f"Kernel error: {e}")
-            finished = True
-
-        if finished:
-            break
-
-    # Reset alarm
-    try:
-        kc.execute("signal.alarm(0)")
-        _drain_output(kc, timeout_seconds=2)
-    except Exception:
-        pass
-
-    result = "\n".join(result_parts).strip() or "(no output)"
-
-    # Cap output to token budget
-    from sandbox_agent.token_budget import truncate_output
-    from sandbox_agent.config import MAX_CODE_OUTPUT_TOKENS
-    return truncate_output(result, MAX_CODE_OUTPUT_TOKENS)
-
-
-def _save_image(image_b64: str) -> str:
-    """Save a base64-encoded PNG image to the work directory."""
-    import PIL.Image
-    filename = f"{uuid.uuid4().hex[:8]}.png"
-    filepath = os.path.join(WORK_DIR, filename)
-    png_bytes = base64.b64decode(image_b64)
-    PIL.Image.open(io.BytesIO(png_bytes)).save(filepath, "png")
-    return filepath
+    except Exception as e:  # noqa: BLE001
+        if proc is not None:
+            kill_process_group(proc)
+        return f"Error: {e}"
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
 
 
 @register_tool("code_interpreter", allow_overwrite=True)
 class LocalCodeInterpreter(BaseTool):
-    """Execute Python code in a local Jupyter kernel."""
+    """Execute Python code as a fresh subprocess (no persistent state)."""
 
     name = "code_interpreter"
     description = (
@@ -290,7 +158,10 @@ class LocalCodeInterpreter(BaseTool):
         "llm_call(prompt, system='', think=False) for background LLM calls. "
         "Use think=False (default) for fast extraction/classification. "
         "Use think=True for complex analysis, synthesis, or multi-step reasoning. "
-        "Variables persist between calls. "
+        "Each call runs in a FRESH Python process — no variables/imports carry over between "
+        "calls; persist anything you need to a file (use DATA_DIR/PROJECTS_DIR). Use plt.savefig(path), "
+        "not plt.show() — there is no inline display. A server started with `&` survives to the next "
+        "call (curl it then). "
         "NOTE: Only llm_call() and standard Python are available inside code. "
         "Other agent tools (web_search, project_write_file, schedule_task, etc.) "
         "are NOT available — use them as separate tool calls after code_interpreter returns. "

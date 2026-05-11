@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import chainlit as cl
+from chainlit.utils import utc_now  # ISO timestamp helper Chainlit uses for step start/end
 
 # Import tool modules to trigger @register_tool registrations. Same set as
 # sandbox_agent/main.py — the agent expects these in TOOL_REGISTRY when it
@@ -354,14 +355,19 @@ class _StreamBridge:
             await state["obj"].stream_token(delta)
 
     async def finalize(self) -> None:
-        """End-of-run cleanup. Calls update() on each streamed cl.Message so
-        the final content is persisted to the data layer (Chainlit's
-        stream_token does not persist on its own — explicit update is
-        required after the last token)."""
+        """End-of-run cleanup. Calls update() on each streamed element so the
+        final content is persisted (Chainlit's stream_token does not persist
+        on its own — explicit update is required after the last token), and
+        sets `end` on any cl.Step that's still "running" so its spinner clears
+        — covers thought steps (no natural close event) and tool steps whose
+        result never came back."""
         for state in self._by_index.values():
             obj = state.get("obj")
             if obj is None:
                 continue
+            # cl.Step → mark done if not already; cl.Message has no spinner concept.
+            if state.get("kind") in ("tool", "thought") and not getattr(obj, "end", None):
+                obj.end = utc_now()
             try:
                 await obj.update()
             except Exception:  # noqa: BLE001
@@ -379,6 +385,7 @@ class _StreamBridge:
                 name="thinking", type="thought", default_open=False,
                 parent_id=self._parent_id(),
             )
+            step.start = utc_now()  # mark "running" — finalize() sets `end` so the spinner clears
             await step.send()
             state = {"kind": "thought", "obj": step, "streamed": 0}
             self._by_index[key] = state
@@ -398,6 +405,7 @@ class _StreamBridge:
                 name=name, type="tool", show_input="json",
                 parent_id=self._parent_id(),
             )
+            step.start = utc_now()  # opens the step in "running" state (spinner)
             await step.send()
             state = {
                 "kind": "tool", "obj": step, "streamed": 0,
@@ -431,6 +439,9 @@ class _StreamBridge:
         if not isinstance(result, str):
             result = str(result)
         target_step.output = result
+        # Mark the step done so its spinner clears immediately (not at end of run).
+        if not getattr(target_step, "end", None):
+            target_step.end = utc_now()
         try:
             await target_step.update()
         except Exception:  # noqa: BLE001

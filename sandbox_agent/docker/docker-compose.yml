@@ -24,7 +24,7 @@ services:
       - QWEN_AGENT_DEFAULT_WORKSPACE=/app/data/workspace
       - GRADIO_SERVER_TIMEOUT=3600
       - TZ=America/Los_Angeles
-      - QWEN_AGENT_MAX_LLM_CALL_PER_RUN=50
+      - QWEN_AGENT_MAX_LLM_CALL_PER_RUN=100
       # --- Chainlit chat surface ---
       # Auth secret. Generate once with `python -c "import secrets; print(secrets.token_hex(32))"`
       # and put in a sibling .env file (which docker-compose reads automatically).

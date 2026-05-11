@@ -13,15 +13,35 @@
 # limitations under the License.
 
 import copy
+import logging
 from typing import Dict, Iterator, List, Literal, Optional, Union
 
 from qwen_agent import Agent
 from qwen_agent.llm import BaseChatModel
-from qwen_agent.llm.schema import DEFAULT_SYSTEM_MESSAGE, FUNCTION, Message
+from qwen_agent.llm.schema import ASSISTANT, DEFAULT_SYSTEM_MESSAGE, FUNCTION, USER, Message
 from qwen_agent.memory import Memory
 from qwen_agent.settings import MAX_LLM_CALL_PER_RUN
 from qwen_agent.tools import BaseTool
 from qwen_agent.utils.utils import extract_files_from_messages
+
+logger = logging.getLogger(__name__)
+
+# --- LOCAL MOD (sandbox_agent) -----------------------------------------------
+# Graceful tool-call budget exhaustion, modeled on Hermes Agent's `budget_pressure`
+# + `_handle_max_iterations`. Stock qwen-agent just exits `_run`'s loop when
+# MAX_LLM_CALL_PER_RUN is spent and yields a possibly-dangling tool call with no
+# concluding message. Two additions, both inside `_run` (so a subclass override
+# isn't clean — hence the in-file mod):
+#   1. When fewer than `_BUDGET_PRESSURE_AT` LLM calls remain, prepend a one-line
+#      budget note to each tool result so the model self-consolidates.
+#   2. When the budget runs out mid-chain (loop exited via the `while` condition,
+#      not via `break`), make one final tool-less LLM call asking for a wrap-up,
+#      and prepend a deterministic marker line that (a) shows clearly in the UI and
+#      (b) matches sandbox_agent's `stage_runner._detect_part_completion` greps so
+#      pipeline stages that hit the cap continue next run instead of restarting.
+_BUDGET_PRESSURE_AT = 10
+_BUDGET_EXHAUSTED_MARKER = "⚠️ I ran out of tool calls for this run (part-completion). Here's where I am:"
+# -----------------------------------------------------------------------------
 
 
 class FnCallAgent(Agent):
@@ -74,6 +94,7 @@ class FnCallAgent(Agent):
         messages = copy.deepcopy(messages)
         num_llm_calls_available = MAX_LLM_CALL_PER_RUN
         response = []
+        completed_with_answer = False  # True only if we exit via `break` (model gave a final answer)
         while True and num_llm_calls_available > 0:
             num_llm_calls_available -= 1
 
@@ -95,6 +116,14 @@ class FnCallAgent(Agent):
                     use_tool, tool_name, tool_args, _ = self._detect_tool(out)
                     if use_tool:
                         tool_result = self._call_tool(tool_name, tool_args, messages=messages, **kwargs)
+                        # LOCAL MOD: budget pressure — when few LLM calls remain, tell the
+                        # model to consolidate. Prepend (not append): long tool results get
+                        # truncated from the end, so a leading note survives.
+                        if num_llm_calls_available <= _BUDGET_PRESSURE_AT:
+                            _note = (f'[budget: {num_llm_calls_available} tool calls left this run — '
+                                     f'start consolidating; deliver your answer before you run out]')
+                            _body = tool_result if isinstance(tool_result, str) else str(tool_result)
+                            tool_result = _note + '\n\n' + _body
                         fn_msg = Message(role=FUNCTION,
                                          name=tool_name,
                                          content=tool_result,
@@ -104,8 +133,48 @@ class FnCallAgent(Agent):
                         yield response
                         used_any_tool = True
                 if not used_any_tool:
+                    completed_with_answer = True
                     break
+        # LOCAL MOD: budget ran out mid-chain (loop exited via the `while` condition, not
+        # `break`) — make a graceful wrap-up call so the turn ends with a real message
+        # carrying a part-completion marker, instead of a dangling tool result.
+        if not completed_with_answer and response:
+            try:
+                wrapup = self._wrap_up_after_budget(messages, lang)
+                if wrapup:
+                    response = response + wrapup
+            except Exception:  # noqa: BLE001 — never let the wrap-up break the run
+                logger.exception('budget wrap-up call failed; emitting fallback marker')
+                response = response + [Message(
+                    role=ASSISTANT,
+                    content=("⚠️ I ran out of tool calls for this run (part-completion). "
+                             "Reply 'continue' to resume."),
+                )]
         yield response
+
+    def _wrap_up_after_budget(self, messages: List[Message], lang: str) -> List[Message]:
+        """One final tool-less LLM call asking the model to summarize what it
+        accomplished and what's left. Returns a single assistant message whose
+        content is prefixed with `_BUDGET_EXHAUSTED_MARKER` (a deterministic
+        line that shows clearly in the UI AND is recognized by
+        `stage_runner._detect_part_completion`)."""
+        instruction = (
+            "You have used your entire tool-call budget for this run. Do NOT attempt any "
+            "further tool calls. In 3-6 sentences, summarize what you accomplished, what is "
+            "still outstanding, and end with: reply 'continue' and I'll resume."
+        )
+        msgs2 = list(messages) + [Message(role=USER, content=instruction)]
+        extra_generate_cfg = {'lang': lang}
+        summary_chunks: List[Message] = []
+        for summary_chunks in self._call_llm(messages=msgs2, functions=None,
+                                             extra_generate_cfg=extra_generate_cfg):
+            pass  # take the final accumulated chunk
+        summary_text = ''
+        for m in (summary_chunks or []):
+            if getattr(m, 'role', None) == ASSISTANT and isinstance(getattr(m, 'content', None), str):
+                summary_text += m.content
+        summary_text = summary_text.strip() or "(no summary produced)"
+        return [Message(role=ASSISTANT, content=f'{_BUDGET_EXHAUSTED_MARKER}\n\n{summary_text}')]
 
     def _call_tool(self, tool_name: str, tool_args: Union[str, dict] = '{}', **kwargs) -> str:
         if tool_name not in self.function_map:
