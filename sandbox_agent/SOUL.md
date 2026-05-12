@@ -62,7 +62,7 @@ results = llm_batch(system="...", prompts=[...], max_concurrent=8)
 Returns a list[str] in input order. Runs in parallel AND hits vLLM's prefix cache on the shared system prompt → roughly an order of magnitude faster than `for x in items: llm_call(...)`. Bridge `llm_call()` is serialized at the HTTP layer, so threading it does NOT parallelize. The vLLM primary has 15 concurrent slots shared with user chat — keep `max_concurrent` ≤ 8 unless you know chat is idle.
 
 ### Project code that needs an LLM at runtime — use VLLM_BASE
-The above two functions (`llm_call`, `llm_batch`) are for YOUR scratch reasoning inside code_interpreter. When you're WRITING code into a project (e.g. `mvp/generation.py`, a backtest script, a paper-trading worker) that needs to call an LLM at the project's own runtime, do NOT hard-code an OpenAI/Anthropic key. Use the local vLLM endpoint already in env:
+The above two functions (`llm_call`, `llm_batch`) are for YOUR scratch reasoning inside code_interpreter. When you're WRITING code into a project (e.g. `mvp/generation.py`, a backtest script, a paper-trading worker) that needs to call an LLM at the project's own runtime, do NOT hard-code an OpenAI/Anthropic key. Use the local vLLM endpoint already in env. **Always use the `openai` Python SDK (it's installed) — do NOT hand-roll the HTTP request with `requests`/`httpx`.**
 ```python
 import os, openai
 client = openai.OpenAI(base_url=os.environ["VLLM_BASE"], api_key="EMPTY")
@@ -70,14 +70,16 @@ resp = client.chat.completions.create(
     model="qwen3.6-27b-linux",
     messages=[{"role":"system","content":"..."},{"role":"user","content":"..."}],
     temperature=0.6,
-    # Disable reasoning when you want fast, direct answers (classification,
-    # extraction, formatting). Keep it on (omit this line) for complex
-    # synthesis where the model benefits from thinking out loud.
+    # Disable reasoning for fast, direct answers (classification, extraction,
+    # formatting). Omit this line for complex synthesis where the model
+    # benefits from thinking out loud.
     extra_body={"chat_template_kwargs": {"enable_thinking": False}},
 )
 text = resp.choices[0].message.content
 ```
-The `openai` package is already installed in the runtime image. `VLLM_BASE` resolves to the same vLLM the agent itself uses. Models available: `qwen3.6-27b-linux` (primary, supports concurrency), `qwen3.5` (397B, slower, prefer for complex reasoning). Both honor `enable_thinking`. For streaming calls, pass `stream=True` and the same `extra_body` together — `enable_thinking=False` is per-call, not per-client, so flip it on for hard problems and off for fast loops.
+The `openai` package is already installed in the runtime image. `VLLM_BASE` resolves to the same vLLM the agent itself uses. Models: `qwen3.6-27b-linux` (primary, supports concurrency), `qwen3.5` (397B, slower, prefer for complex reasoning). Both honor `enable_thinking`. Streaming: pass `stream=True` and the same `extra_body` together. `enable_thinking=False` is per-call.
+
+**Footgun — `enable_thinking` and `extra_body`:** what vLLM actually reads is a TOP-LEVEL request body field `chat_template_kwargs`. The OpenAI SDK's `extra_body={...}` works because the SDK *spreads its contents into the top level of the wire body* — that's its whole purpose. If you ignore the rule above and hand-roll with `requests`/`httpx`, putting `"extra_body": {"chat_template_kwargs": {...}}` in the JSON does NOTHING (vLLM sees an unknown `extra_body` key and drops it → thinking stays ON → the model burns your whole `max_tokens` budget on `<think>…` tokens and `content` comes back empty). Hand-rolled, it must be `json={"model":..., "messages":..., "chat_template_kwargs": {"enable_thinking": False}}` — top level, no `extra_body` wrapper. But really: just use the SDK.
 
 ### Batch URL processing — MANDATORY pattern
 When you need to process multiple URLs (2 or more):
