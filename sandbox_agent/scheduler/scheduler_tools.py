@@ -260,7 +260,9 @@ class CancelTask(BaseTool):
     name = "cancel_task"
     description = (
         "Cancel and remove a task from the queue. Works for both one-shot and recurring tasks. "
-        "Use this to stop recurring cron/interval tasks that are no longer needed."
+        "Use this to stop recurring cron/interval tasks that are no longer needed. "
+        "If the task is currently running, it is interrupted: the agent loop stops at its next step "
+        "and any exec/code_interpreter subprocess it's wedged in is killed (response includes killed_running)."
     )
     parameters = {
         "type": "object",
@@ -281,7 +283,21 @@ class CancelTask(BaseTool):
             return json.dumps({"error": f"Task {params['task_id']} not found"})
         name = task.name
         tq.remove_task(params["task_id"])
-        return json.dumps({"status": "cancelled", "task_id": params["task_id"], "name": name})
+        # If this task is currently executing, interrupt it: set its cancel
+        # flag (the agent loop raises RunCancelled at the next step) and SIGKILL
+        # any exec/code_interpreter subprocess it's wedged in.
+        killed_running = False
+        try:
+            from sandbox_agent.cancellation import cancel as _cancel_run
+            killed_running = _cancel_run(params["task_id"])
+        except Exception:  # noqa: BLE001
+            pass
+        return json.dumps({
+            "status": "cancelled",
+            "task_id": params["task_id"],
+            "name": name,
+            "killed_running": killed_running,
+        })
 
 
 @register_tool("pause_task")

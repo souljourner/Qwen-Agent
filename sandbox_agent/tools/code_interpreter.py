@@ -98,6 +98,7 @@ def _execute_code(code: str, timeout: int = 0) -> str:
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = "/app" + (os.pathsep + existing_pp if existing_pp else "")
 
+    from sandbox_agent.cancellation import register_child_pgid, unregister_child_pgid
     start = time.monotonic()
     proc = None
     try:
@@ -113,6 +114,9 @@ def _execute_code(code: str, timeout: int = 0) -> str:
             env=env,
             start_new_session=True,
         )
+        # Register the child's process group so cancel_task can SIGKILL it
+        # (start_new_session=True → pgid == pid).
+        register_child_pgid(proc.pid)
         try:
             stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -142,6 +146,8 @@ def _execute_code(code: str, timeout: int = 0) -> str:
             kill_process_group(proc)
         return f"Error: {e}"
     finally:
+        if proc is not None:
+            unregister_child_pgid(proc.pid)
         try:
             os.unlink(script_path)
         except OSError:

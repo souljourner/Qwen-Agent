@@ -157,6 +157,7 @@ class ExecTool(BaseTool):
         # Without this, an agent-issued command like `kill 0`, `pkill -f
         # python`, or a botched PID-extraction one-liner can SIGTERM the
         # container's main process and take the whole agent down.
+        from sandbox_agent.cancellation import register_child_pgid, unregister_child_pgid
         start = time.monotonic()
         proc = None
         try:
@@ -170,6 +171,9 @@ class ExecTool(BaseTool):
                 env=env,
                 start_new_session=True,
             )
+            # Register the child's process group so cancel_task can SIGKILL it
+            # (start_new_session=True → pgid == pid).
+            register_child_pgid(proc.pid)
             try:
                 stdout, stderr = proc.communicate(timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -199,3 +203,5 @@ class ExecTool(BaseTool):
             return f"Error: {e}"
         finally:
             set_current_tool(None)
+            if proc is not None:
+                unregister_child_pgid(proc.pid)

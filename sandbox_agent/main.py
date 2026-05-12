@@ -108,9 +108,15 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
     original_run = agent._run
 
     def _compacting_run(messages, **kwargs):
+        from sandbox_agent import cancellation
         from sandbox_agent.compaction import maybe_compact
         messages = maybe_compact(messages)
-        yield from original_run(messages, **kwargs)
+        # cancellation.guard raises RunCancelled at each yield point if this
+        # run (see cancellation.begin_run) has been cancelled — between tool
+        # calls and between streamed chunks. A tool call wedged inside a
+        # subprocess is unstuck separately (cancel() SIGKILLs the child),
+        # which then produces the next yield this guard checks.
+        yield from cancellation.guard(original_run(messages, **kwargs))
 
     agent._run = _compacting_run
     return agent
@@ -519,59 +525,17 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
 
 def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_before: int) -> None:
     """Execute one cron task. Runs inside a worker thread so the cron loop can
-    enforce a wall-clock timeout on it."""
+    enforce a wall-clock timeout on it; wrapped in a cancellation run so
+    `cancel_task` (or the stuck-detector) can interrupt it mid-flight."""
+    from sandbox_agent import cancellation
     try:
-        # Pipeline tasks get special handling
-        if task.name.startswith("pipeline:"):
-            from sandbox_agent.pipeline.stage_runner import run_pipeline_stage
-            result_text = run_pipeline_stage(task, system_message)
-            task_queue.update_task(task.id, status="completed", result=result_text[:1000])
-            log_background_task(task.name, task.id, result_text[:1000])
-            log_event("cron_complete", task_id=task.id, task_name=task.name)
-            add_digest_entry(
-                project=task.project,
-                task_name=task.name,
-                summary=result_text[:500],
-                source="pipeline",
-            )
-            logger.info(f"Cron: pipeline task [{task.id}] completed")
-            clear_state()
-            return
-
-        # Regular tasks: build prompt and run
-        prompt_parts = [f"Execute this scheduled task:\n\n**{task.name}**: {task.description}"]
-        if task.project:
-            prompt_parts.append(
-                f"\nThis task belongs to project '{task.project}'. "
-                f"Save any results to the project using project_write_file. "
-                f"You can read existing project files with project_read_file."
-            )
-        if task.checkpoint:
-            prompt_parts.append(
-                f"\nThis task was previously interrupted at step {task.current_step}. "
-                f"Resume from checkpoint: {task.checkpoint}"
-            )
-        messages = [Message(role="user", content="\n".join(prompt_parts))]
-        logger.info(f"Cron: task [{task.id}] prompt: {prompt_parts[0][:200]}...")
-        response = run_on_best_available(system_message, messages, task_label=f"Cron: {task.name}")
-        result_text = ""
-        for msg in response:
-            if msg.role == "assistant" and isinstance(msg.content, str):
-                result_text += msg.content
-        logger.info(f"Cron: task [{task.id}] result ({len(result_text)} chars): {result_text[:200]}...")
-        task_queue.update_task(task.id, status="completed", result=result_text[:1000])
-        log_background_task(task.name, task.id, result_text[:1000])
-        log_event("cron_complete", task_id=task.id, task_name=task.name)
-        all_events = get_recent_events(500)
-        task_tool_calls = [e for e in all_events[events_before:] if e.get("type") == "tool_call"]
-        digest_summary = _summarize_task_result(task.name, result_text, task_tool_calls, task.project or "")
-        add_digest_entry(
-            project=task.project,
-            task_name=task.name,
-            summary=digest_summary,
-            source="cron",
-        )
-        logger.info(f"Cron: task [{task.id}] completed")
+        with cancellation.begin_run(task.id):
+            _execute_cron_task(task, system_message, task_queue, events_before)
+    except cancellation.RunCancelled:
+        # `cancel_task` already removed the task from the queue (or the
+        # stuck-detector marked it failed); the worker just unwinds.
+        logger.info(f"Cron: task [{task.id}] run cancelled mid-flight")
+        log_event("cron_cancelled", task_id=task.id, task_name=task.name)
         clear_state()
     except Exception as e:
         logger.exception(f"Cron: task [{task.id}] failed")
@@ -584,6 +548,61 @@ def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_befo
         )
         task_queue.update_task(task.id, status="failed", last_error=str(e)[:500])
         clear_state()
+
+
+def _execute_cron_task(task, system_message: str, task_queue: TaskQueue, events_before: int) -> None:
+    # Pipeline tasks get special handling
+    if task.name.startswith("pipeline:"):
+        from sandbox_agent.pipeline.stage_runner import run_pipeline_stage
+        result_text = run_pipeline_stage(task, system_message)
+        task_queue.update_task(task.id, status="completed", result=result_text[:1000])
+        log_background_task(task.name, task.id, result_text[:1000])
+        log_event("cron_complete", task_id=task.id, task_name=task.name)
+        add_digest_entry(
+            project=task.project,
+            task_name=task.name,
+            summary=result_text[:500],
+            source="pipeline",
+        )
+        logger.info(f"Cron: pipeline task [{task.id}] completed")
+        clear_state()
+        return
+
+    # Regular tasks: build prompt and run
+    prompt_parts = [f"Execute this scheduled task:\n\n**{task.name}**: {task.description}"]
+    if task.project:
+        prompt_parts.append(
+            f"\nThis task belongs to project '{task.project}'. "
+            f"Save any results to the project using project_write_file. "
+            f"You can read existing project files with project_read_file."
+        )
+    if task.checkpoint:
+        prompt_parts.append(
+            f"\nThis task was previously interrupted at step {task.current_step}. "
+            f"Resume from checkpoint: {task.checkpoint}"
+        )
+    messages = [Message(role="user", content="\n".join(prompt_parts))]
+    logger.info(f"Cron: task [{task.id}] prompt: {prompt_parts[0][:200]}...")
+    response = run_on_best_available(system_message, messages, task_label=f"Cron: {task.name}")
+    result_text = ""
+    for msg in response:
+        if msg.role == "assistant" and isinstance(msg.content, str):
+            result_text += msg.content
+    logger.info(f"Cron: task [{task.id}] result ({len(result_text)} chars): {result_text[:200]}...")
+    task_queue.update_task(task.id, status="completed", result=result_text[:1000])
+    log_background_task(task.name, task.id, result_text[:1000])
+    log_event("cron_complete", task_id=task.id, task_name=task.name)
+    all_events = get_recent_events(500)
+    task_tool_calls = [e for e in all_events[events_before:] if e.get("type") == "tool_call"]
+    digest_summary = _summarize_task_result(task.name, result_text, task_tool_calls, task.project or "")
+    add_digest_entry(
+        project=task.project,
+        task_name=task.name,
+        summary=digest_summary,
+        source="cron",
+    )
+    logger.info(f"Cron: task [{task.id}] completed")
+    clear_state()
 
 
 def _is_progressing(events_baseline: int, last_progress_at: "datetime") -> "tuple[bool, datetime]":
@@ -701,6 +720,17 @@ def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 6
                             f"Abandoning worker and marking failed."
                         )
                         log_event("cron_stuck", task_id=task.id, task_name=task.name)
+                        # Signal the worker to unwind and SIGKILL any subprocess
+                        # it's wedged in, so the abandoned thread actually exits
+                        # instead of zombie-ing (possibly still holding a model
+                        # slot). The status stays "failed" — the worker's
+                        # RunCancelled handler doesn't touch it — so the task is
+                        # re-queued via the existing backoff path.
+                        try:
+                            from sandbox_agent import cancellation
+                            cancellation.cancel(task.id)
+                        except Exception:  # noqa: BLE001
+                            logger.debug("stuck-detector: cancellation.cancel raised", exc_info=True)
                         task_queue.update_task(
                             task.id, status="failed",
                             last_error=(
