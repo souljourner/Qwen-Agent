@@ -24,6 +24,7 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -366,6 +367,14 @@ class _StreamBridge:
     message we've already pushed to the UI so we send only deltas.
     """
 
+    # cl.Step.update() sends the FULL step dict (incl. cumulative reasoning/args)
+    # over the socket + persists it. Calling it per chunk from a chatty LLM made
+    # the UI lag many seconds behind the model. Throttle the per-chunk updates
+    # to ~5/s; the in-memory step object is always current, and the close-time
+    # update (via _close_open_thoughts / _close_tool_with_result) + finalize()
+    # flush the final state with no throttle.
+    _UPDATE_THROTTLE_S = 0.2
+
     def __init__(self):
         # Per-message-index UI state.
         # entry shape: {"kind": "text"|"tool"|"thought", "obj": cl.Message|cl.Step,
@@ -373,6 +382,8 @@ class _StreamBridge:
         self._by_index: Dict[int, dict] = {}
         # Allow result messages to find their tool step by function_id when present.
         self._tool_by_function_id: Dict[str, "cl.Step"] = {}
+        # key (matches _by_index key) → monotonic time of last awaited update()
+        self._last_update: Dict = {}
 
     @staticmethod
     def _function_id(msg) -> Optional[str]:
@@ -507,8 +518,14 @@ class _StreamBridge:
             self._by_index[key] = state
         if len(reasoning) > state["streamed"]:
             state["obj"].output = reasoning  # cumulative; chainlit renders the whole thing
-            await state["obj"].update()
             state["streamed"] = len(reasoning)
+            # Throttle the actual network round-trip — update_step sends the
+            # entire cumulative `output` every call, so per-chunk updates flood
+            # the socket. The close-time update flushes the final state.
+            now = time.monotonic()
+            if now - self._last_update.get(key, 0.0) >= self._UPDATE_THROTTLE_S:
+                self._last_update[key] = now
+                await state["obj"].update()
 
     async def _stream_tool_call(self, i: int, msg, function_call) -> None:
         await self._close_open_thoughts()
@@ -532,11 +549,15 @@ class _StreamBridge:
             if function_id:
                 self._tool_by_function_id[function_id] = step
 
-        # Stream growing arguments as the tool-call's input.
+        # Stream growing arguments as the tool-call's input. Throttle the
+        # update for the same reason as _stream_thought; close-time flushes.
         if len(args) > state["streamed"]:
             state["obj"].input = args
-            await state["obj"].update()
             state["streamed"] = len(args)
+            now = time.monotonic()
+            if now - self._last_update.get(i, 0.0) >= self._UPDATE_THROTTLE_S:
+                self._last_update[i] = now
+                await state["obj"].update()
 
     async def update_running_tool(self, text: str) -> None:
         """Live stdout from a still-running tool (code_interpreter) — show it on
@@ -610,10 +631,19 @@ async def on_message(message: cl.Message):
         name="chainlit-agent-run",
     ).start()
 
+    # held_back lets us coalesce queued items (each `chunk` and each
+    # `tool_progress` is fully cumulative, so older ones are subsumed by the
+    # latest); when we encounter a non-coalescable item while peeking we hold
+    # it for the next iteration to keep FIFO ordering.
     final_response: List[Message] = []
+    held_back: Optional[tuple] = None
     try:
         while True:
-            kind, payload = await queue.get()
+            if held_back is not None:
+                kind, payload = held_back
+                held_back = None
+            else:
+                kind, payload = await queue.get()
             if kind == "done":
                 break
             if kind == "error":
@@ -623,10 +653,35 @@ async def on_message(message: cl.Message):
                 ).send()
                 return
             if kind == "tool_progress":
-                # Live stdout from a running code_interpreter call.
+                # Live stdout from a running code_interpreter call. Drain any
+                # later progress snapshots — only the most recent matters.
+                while True:
+                    try:
+                        nk, np = queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    if nk == "tool_progress":
+                        payload = np
+                        continue
+                    held_back = (nk, np)
+                    break
                 await bridge.update_running_tool(payload)
                 continue
-            # kind == "chunk"
+            # kind == "chunk" — coalesce ahead. Each chunk is the full cumulative
+            # thread state, so newer ones supersede older ones; the bridge's
+            # delta computation (state["streamed"] char counters) handles a
+            # "jumped forward" payload correctly. This stops the drain from
+            # falling minutes behind a chatty model during streaming.
+            while True:
+                try:
+                    nk, np = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                if nk == "chunk":
+                    payload = np
+                    continue
+                held_back = (nk, np)
+                break
             final_response = payload
             await bridge.consume(payload)
 
