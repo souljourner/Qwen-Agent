@@ -547,6 +547,11 @@ def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_befo
             source="cron",
         )
         task_queue.update_task(task.id, status="failed", last_error=str(e)[:500])
+        try:
+            from sandbox_agent import task_notify
+            task_notify.notify_task_done(task.id, task.name, f"FAILED: {str(e)[:400]}", source="cron", ok=False)
+        except Exception:  # noqa: BLE001
+            pass
         clear_state()
 
 
@@ -564,6 +569,11 @@ def _execute_cron_task(task, system_message: str, task_queue: TaskQueue, events_
             summary=result_text[:500],
             source="pipeline",
         )
+        try:
+            from sandbox_agent import task_notify
+            task_notify.notify_task_done(task.id, task.name, result_text, source="pipeline")
+        except Exception:  # noqa: BLE001
+            pass
         logger.info(f"Cron: pipeline task [{task.id}] completed")
         clear_state()
         return
@@ -601,6 +611,11 @@ def _execute_cron_task(task, system_message: str, task_queue: TaskQueue, events_
         summary=digest_summary,
         source="cron",
     )
+    try:
+        from sandbox_agent import task_notify
+        task_notify.notify_task_done(task.id, task.name, digest_summary or result_text, source="cron")
+    except Exception:  # noqa: BLE001
+        pass
     logger.info(f"Cron: task [{task.id}] completed")
     clear_state()
 

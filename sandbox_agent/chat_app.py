@@ -184,6 +184,72 @@ def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.Ab
 
 
 # ---------------------------------------------------------------------------
+# Background-task completion notices (Hermes-style alert)
+# ---------------------------------------------------------------------------
+# When a cron task / pipeline stage finishes, it pushes a record onto
+# task_notify's queue (the producer side, in main.py). A single background loop
+# here drains that queue and pushes a notice into every connected Chainlit
+# session — so the agent/user learns the job is done without having to ask. If
+# no session is connected the events stay queued and get delivered as soon as
+# one connects (the loop is the sole drainer).
+
+_NOTIFIER_POLL_SECONDS = 4.0
+_notifier_started = False
+
+
+def _format_task_notice(evt: dict) -> str:
+    name = evt.get("name") or evt.get("task_id") or "task"
+    ok = evt.get("ok", True)
+    result = (evt.get("result") or "").strip()
+    head = (f"✅ Background task **{name}** finished."
+            if ok else f"⚠️ Background task **{name}** failed.")
+    if result:
+        snippet = result if len(result) <= 600 else result[:600].rstrip() + " …"
+        return f"{head}\n\n{snippet}\n\n_(ask me about it for the full result — I'll look it up with `list_tasks`)_"
+    return head
+
+
+async def _completion_notifier_loop() -> None:
+    from chainlit.session import ws_sessions_id
+    from chainlit.context import init_ws_context
+    from sandbox_agent import task_notify
+
+    while True:
+        try:
+            await asyncio.sleep(_NOTIFIER_POLL_SECONDS)
+            # Only sessions that have a thread (been through on_chat_start/resume)
+            # can receive a persisted message.
+            sessions = [s for s in list(ws_sessions_id.values()) if getattr(s, "thread_id", None)]
+            if not sessions:
+                continue  # nobody to deliver to — leave events queued
+            events = task_notify.drain()
+            for evt in events:
+                content = _format_task_notice(evt)
+                for session in sessions:
+                    try:
+                        init_ws_context(session)
+                        await cl.Message(content=content, author="background task").send()
+                    except Exception:  # noqa: BLE001
+                        logger.debug("notifier: deliver to session %s failed",
+                                     getattr(session, "id", "?"), exc_info=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            logger.exception("completion notifier loop error")
+            await asyncio.sleep(5)
+
+
+def _ensure_notifier() -> None:
+    """Start the completion-notifier loop once (idempotent). Called from
+    on_chat_start / on_chat_resume so there's always a running event loop."""
+    global _notifier_started
+    if _notifier_started:
+        return
+    _notifier_started = True
+    asyncio.create_task(_completion_notifier_loop())
+
+
+# ---------------------------------------------------------------------------
 # Chainlit handlers
 # ---------------------------------------------------------------------------
 
@@ -194,6 +260,7 @@ HISTORY_KEY = "history"
 async def on_chat_start():
     """Fresh chat — empty history."""
     cl.user_session.set(HISTORY_KEY, [])
+    _ensure_notifier()
 
 
 _FEEDBACK_LOG = os.path.join(os.environ.get("DATA_DIR", "/app/data"), "feedback.jsonl")
@@ -285,6 +352,7 @@ async def on_chat_resume(thread):
         # next user turn.
     cl.user_session.set(HISTORY_KEY, history)
     logger.info("Resumed thread with %d messages of history", len(history))
+    _ensure_notifier()
 
 
 class _StreamBridge:
