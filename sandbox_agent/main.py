@@ -627,12 +627,15 @@ def _is_progressing(events_baseline: int, last_progress_at: "datetime") -> "tupl
       - activity.jsonl grew (tool_call / tool_result / model_select / ...)
       - model_tracker shows any model 'busy since T' with T newer than our
         last-progress timestamp (i.e., a model_start fired)
+      - code_interpreter / exec streamed a new line to the dashboard preview
+        (so a long ML training that just print()s epoch counters keeps the
+        stuck-detector at bay without firing activity events)
 
     Returns (progressed, new_last_progress_at). When nothing moved, the second
     element is the same timestamp that was passed in."""
     from datetime import datetime as _dt
 
-    from sandbox_agent.model_tracker import read_status_from_file
+    from sandbox_agent.model_tracker import get_last_preview_at, read_status_from_file
 
     progressed = False
     new_mark = last_progress_at
@@ -654,6 +657,11 @@ def _is_progressing(events_baseline: int, last_progress_at: "datetime") -> "tupl
         if t > new_mark:
             progressed = True
             new_mark = t
+
+    preview_at = get_last_preview_at()
+    if preview_at is not None and preview_at > new_mark:
+        progressed = True
+        new_mark = preview_at
 
     return progressed, new_mark
 

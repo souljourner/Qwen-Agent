@@ -31,6 +31,10 @@ _state = {
 _start_time = datetime.now()
 _PREVIEW_MIN_INTERVAL = 1.0
 _last_preview_write = 0.0
+# Wall-clock timestamp of the most recent preview write; used by cron_loop's
+# stuck-detector as a progress signal so a long but actively-printing
+# code_interpreter run (e.g. ML training) doesn't get killed.
+_last_preview_at: Optional[datetime] = None
 
 
 def model_start(model: str, task: str) -> None:
@@ -70,7 +74,7 @@ def set_agent_status(status: str = None, current_task: str = None, current_tool:
 
 def clear_agent_status() -> None:
     """Reset agent to idle."""
-    global _last_preview_write
+    global _last_preview_write, _last_preview_at
     with _lock:
         _state["agent_status"] = "idle"
         _state["current_task"] = None
@@ -78,6 +82,7 @@ def clear_agent_status() -> None:
         _state["current_preview"] = None
         _state["started_at"] = None
         _last_preview_write = 0.0
+        _last_preview_at = None
         _write()
 
 
@@ -86,11 +91,12 @@ def set_current_preview(text: Optional[str]) -> None:
 
     Throttled to ~1 write/sec to avoid flooding disk during token streaming.
     Pass None to clear immediately (bypasses the throttle)."""
-    global _last_preview_write
+    global _last_preview_write, _last_preview_at
     with _lock:
         if text is None:
             _state["current_preview"] = None
             _last_preview_write = 0.0
+            _last_preview_at = None
             _write()
             return
         now = time.monotonic()
@@ -98,7 +104,15 @@ def set_current_preview(text: Optional[str]) -> None:
             return
         _state["current_preview"] = text[-300:]
         _last_preview_write = now
+        _last_preview_at = datetime.now()  # progress signal for cron's stuck-detector
         _write()
+
+
+def get_last_preview_at() -> Optional[datetime]:
+    """Wall-clock time of the most recent preview write (None if never).
+    Used by cron_loop._is_progressing as a progress signal."""
+    with _lock:
+        return _last_preview_at
 
 
 def set_current_tool(tool_name: Optional[str]) -> None:
