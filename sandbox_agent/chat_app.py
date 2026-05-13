@@ -50,6 +50,7 @@ from qwen_agent.llm.schema import Message
 
 from sandbox_agent.chat_data_layer import make_data_layer
 from sandbox_agent.chat_logger import log_turn
+from sandbox_agent.tools.code_interpreter import register_progress_hook, unregister_progress_hook
 from sandbox_agent.config import (
     BACKGROUND_LLM_CFG,
     PRIMARY_LLM_CFG,
@@ -163,6 +164,10 @@ def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.Ab
     def _push(item):
         asyncio.run_coroutine_threadsafe(queue.put(item), loop)
 
+    # While this thread runs a code_interpreter call, its stdout streams here
+    # as ("tool_progress", text) so the on_message coroutine can show it on the
+    # live tool step. Cleared in `finally` so it doesn't leak to a later run.
+    register_progress_hook(lambda text: _push(("tool_progress", text)))
     try:
         with cancellation.begin_run(run_id):
             for chunk in agent.run(messages=messages):
@@ -174,6 +179,8 @@ def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.Ab
     except Exception as e:  # noqa: BLE001 — surface anything to the user
         logger.exception("Agent run raised")
         _push(("error", e))
+    finally:
+        unregister_progress_hook()
 
 
 # ---------------------------------------------------------------------------
@@ -463,6 +470,26 @@ class _StreamBridge:
             await state["obj"].update()
             state["streamed"] = len(args)
 
+    async def update_running_tool(self, text: str) -> None:
+        """Live stdout from a still-running tool (code_interpreter) — show it on
+        that tool's open cl.Step so a multi-minute run isn't a silent spinner.
+        There's exactly one running tool at a time (the agent loop is sequential);
+        the result message later replaces this with the final output via
+        `_close_tool_with_result`."""
+        target = None
+        for state in self._by_index.values():
+            if state.get("kind") == "tool":
+                obj = state.get("obj")
+                if obj is not None and not getattr(obj, "end", None):
+                    target = obj
+        if target is None:
+            return
+        target.output = text
+        try:
+            await target.update()
+        except Exception:  # noqa: BLE001
+            logger.debug("StreamBridge: update_running_tool failed", exc_info=True)
+
     async def _close_tool_with_result(self, msg) -> None:
         function_id = self._function_id(msg)
         target_step = None
@@ -527,6 +554,10 @@ async def on_message(message: cl.Message):
                     content=f"Agent error: {type(payload).__name__}: {payload}"
                 ).send()
                 return
+            if kind == "tool_progress":
+                # Live stdout from a running code_interpreter call.
+                await bridge.update_running_tool(payload)
+                continue
             # kind == "chunk"
             final_response = payload
             await bridge.consume(payload)

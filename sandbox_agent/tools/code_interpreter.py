@@ -2,13 +2,14 @@
 
 Each `code_interpreter` call writes the user's code (after a fixed prelude that
 imports numpy/pandas, sets DATA_DIR/PROJECTS_DIR, and — if the LLM bridge is up —
-defines llm_call()) to a temp .py file and runs it with `subprocess.Popen(...,
-start_new_session=True)` + `communicate(timeout=...)`, killing the whole process
-group on timeout/error. No persistent interpreter: state does NOT carry over
-between calls — persist anything you need to a file. This mirrors `exec_tool` and
-matches how OpenClaw/Hermes run code; it eliminates the wedged-Jupyter-kernel hang
-class. Persistence is the filesystem (DATA_DIR/PROJECTS_DIR) + the container's
-installed packages.
+defines llm_call()) to a temp .py file and runs it as a fresh `python` subprocess
+in its own session, draining its output line-by-line so progress is visible while
+it runs (no streaming = the multi-minute runs that looked frozen). Killed via the
+whole process group on timeout/error. No persistent interpreter: state does NOT
+carry over between calls — persist anything you need to a file. This mirrors
+`exec_tool` and matches how OpenClaw/Hermes run code; it eliminates the
+wedged-Jupyter-kernel hang class. Persistence is the filesystem
+(DATA_DIR/PROJECTS_DIR) + the container's installed packages.
 """
 
 import logging
@@ -16,9 +17,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
-from typing import Union
+from typing import Callable, Optional, Union
 
 from qwen_agent.tools.base import BaseTool, register_tool
 
@@ -55,6 +57,23 @@ PROJECTS_DIR = os.path.join(DATA_DIR, 'projects')
 # NameError (same as the old kernel started without the bridge).
 _llm_init_code = None
 
+# Thread-ident → callable(preview_text). chat_app registers one for the worker
+# thread running an on_message turn so a long code_interpreter call's stdout
+# streams to that turn's Chainlit tool step instead of sitting on a silent
+# spinner. No-op for cron/background runs (they don't register one).
+_progress_hooks: "dict[int, Callable[[str], None]]" = {}
+
+_PROGRESS_INTERVAL = 0.5   # seconds between live progress emits
+_PROGRESS_TAIL = 4000      # chars of recent output to surface per emit
+
+
+def register_progress_hook(fn: Callable[[str], None]) -> None:
+    _progress_hooks[threading.get_ident()] = fn
+
+
+def unregister_progress_hook() -> None:
+    _progress_hooks.pop(threading.get_ident(), None)
+
 
 def _escape_ansi(text: str) -> str:
     return re.compile(r"(?:\x1B[@-_]|[\x80-\x9F])[0-?]*[ -/]*[@-~]").sub("", text)
@@ -81,8 +100,27 @@ def _build_script(code: str) -> str:
     return INIT_CODE + "\n" + (_llm_init_code or "") + "\n\n# --- user code ---\n" + code + "\n"
 
 
+def _emit_progress(hook: Optional[Callable[[str], None]], text: str, last_line: str = "") -> None:
+    """Push a live-progress snapshot: the dashboard preview (best-effort) and,
+    if a hook is registered for this run, the recent tail of output."""
+    try:
+        from sandbox_agent.model_tracker import set_current_preview
+        snippet = (last_line or text).strip().splitlines()[-1] if (last_line or text).strip() else ""
+        set_current_preview(f"code_interpreter · {snippet[:200]}")
+    except Exception:  # noqa: BLE001
+        pass
+    if hook is None:
+        return
+    preview = text if len(text) <= _PROGRESS_TAIL else "…(earlier output truncated)…\n" + text[-_PROGRESS_TAIL:]
+    try:
+        hook(preview)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _execute_code(code: str, timeout: int = 0) -> str:
-    """Run `code` as a fresh Python subprocess; return exec-style output."""
+    """Run `code` as a fresh Python subprocess, streaming its output; return
+    exec-style output (`Exit N | Ns | M chars\\n\\n<output>` or `Timed out …`)."""
     if timeout <= 0:
         timeout = _compute_timeout(code)
 
@@ -93,52 +131,82 @@ def _execute_code(code: str, timeout: int = 0) -> str:
 
     # /app on PYTHONPATH so the script can `from sandbox_agent.tools.llm_client
     # import llm_batch` (the editable install usually covers this already, but
-    # be explicit — same as exec_tool).
+    # be explicit — same as exec_tool). PYTHONUNBUFFERED so the child flushes
+    # each line immediately — otherwise stdout-to-a-pipe is block-buffered and
+    # we'd only see output at process exit (defeating the streaming).
     env = dict(os.environ)
     existing_pp = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = "/app" + (os.pathsep + existing_pp if existing_pp else "")
+    env["PYTHONUNBUFFERED"] = "1"
 
     from sandbox_agent.cancellation import register_child_pgid, unregister_child_pgid
+    hook = _progress_hooks.get(threading.get_ident())  # capture on the worker thread
     start = time.monotonic()
     proc = None
+    lines: "list[str]" = []
     try:
         # `start_new_session=True`: the script (and anything it spawns) gets its
         # own process group / session, isolated from PID 1. A `kill 0` / `pkill`
         # inside the script can't reach the container's main process.
+        # stderr→stdout: one stream, output in the order the script wrote it.
         proc = subprocess.Popen(
             [sys.executable, script_path],
             cwd=DATA_DIR,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,  # line-buffered reads
             env=env,
             start_new_session=True,
         )
-        # Register the child's process group so cancel_task can SIGKILL it
-        # (start_new_session=True → pgid == pid).
+        # Register the child's process group so cancel_task / chat Stop can
+        # SIGKILL it (start_new_session=True → pgid == pid).
         register_child_pgid(proc.pid)
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            # SIGKILL the whole group — a `server &` may have left children.
-            kill_process_group(proc)
+
+        # Drain stdout line-by-line in a helper thread (also stops the pipe
+        # buffer from filling and deadlocking the child on a chatty script).
+        last_emit = [0.0]
+
+        def _reader():
             try:
-                stdout, stderr = proc.communicate(timeout=5)
+                for line in proc.stdout:  # type: ignore[union-attr]
+                    lines.append(line)
+                    now = time.monotonic()
+                    if len(lines) == 1 or now - last_emit[0] >= _PROGRESS_INTERVAL:
+                        last_emit[0] = now
+                        _emit_progress(hook, "".join(lines), last_line=line)
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                try:
+                    proc.stdout.close()  # type: ignore[union-attr]
+                except Exception:  # noqa: BLE001
+                    pass
+
+        reader = threading.Thread(target=_reader, name="ci-reader", daemon=True)
+        reader.start()
+
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            kill_process_group(proc)  # SIGKILL the whole group — incl. any `server &` children
+            timed_out = True
+            try:
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                stdout, stderr = "", ""
-            partial = _escape_ansi(((stdout or "") + ("\n" + stderr if stderr else "")).strip())
-            partial = truncate_output(partial, MAX_CODE_OUTPUT_TOKENS) if partial else "(no output before timeout)"
-            return f"Timed out after {timeout}s | {len(partial):,} chars\n\n{partial}"
+                pass
+        reader.join(timeout=5)  # let it flush any buffered lines
 
         duration = time.monotonic() - start
-        output = (stdout or "")
-        if stderr:
-            output += ("\n" if output else "") + stderr
+        output = _escape_ansi("".join(lines).strip()) or "(no output)"
+        output = truncate_output(output, MAX_CODE_OUTPUT_TOKENS)
+        _emit_progress(hook, output)  # final snapshot
         # NOTE: on a clean exit we deliberately do NOT kill the process group —
         # a server the script started with `&` is reparented to init and keeps
         # listening, so the agent can curl it from the next call (matches exec).
-        output = _escape_ansi(output.strip()) or "(no output)"
-        output = truncate_output(output, MAX_CODE_OUTPUT_TOKENS)
+        if timed_out:
+            return f"Timed out after {timeout}s | {len(output):,} chars\n\n{output}"
         return f"Exit {proc.returncode} | {duration:.1f}s | {len(output):,} chars\n\n{output}"
 
     except Exception as e:  # noqa: BLE001
@@ -167,7 +235,8 @@ class LocalCodeInterpreter(BaseTool):
         "Each call runs in a FRESH Python process — no variables/imports carry over between "
         "calls; persist anything you need to a file (use DATA_DIR/PROJECTS_DIR). Use plt.savefig(path), "
         "not plt.show() — there is no inline display. A server started with `&` survives to the next "
-        "call (curl it then). "
+        "call (curl it then). For long-running scripts, print() progress lines — they stream as the "
+        "script runs (stdout is unbuffered). "
         "NOTE: Only llm_call() and standard Python are available inside code. "
         "Other agent tools (web_search, project_write_file, schedule_task, etc.) "
         "are NOT available — use them as separate tool calls after code_interpreter returns. "
@@ -178,7 +247,7 @@ class LocalCodeInterpreter(BaseTool):
         '1) IMPORTANT: You must escape all inner double quotes (e.g., \\") or use single quotes for strings within the code to ensure valid JSON output. '
         "2) Write intermediate data to files (use DATA_DIR=os.getenv('DATA_DIR','data')), never to stdout. "
         "3) For multiple URLs: ONE script, for-loop, save raw content to .jsonl file, process from file with llm_call(). "
-        "4) print() ONLY a 3-5 line summary. Save full results to a file. "
+        "4) print() ONLY a 3-5 line summary at the end. Save full results to a file. "
         "5) NEVER print raw HTML/page content. NEVER make separate calls per URL."
     )
     parameters = {

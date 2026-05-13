@@ -92,6 +92,33 @@ class TestCodeExecution:
         assert result  # we got a result, and we're still alive
         assert "Exit 0" not in result  # the script was killed by the signal
 
+    def test_streams_stdout_via_progress_hook(self):
+        """A registered progress hook receives running output before the call
+        returns — so a long script isn't a silent spinner in the UI."""
+        got = []
+        ci.register_progress_hook(lambda t: got.append(t))
+        try:
+            code = (
+                "import time\n"
+                "for i in range(4):\n"
+                "    print('line', i, flush=True)\n"
+                "    time.sleep(0.4)\n"
+                "print('done')\n"
+            )
+            result = _execute_code(code, timeout=15)
+        finally:
+            ci.unregister_progress_hook()
+        assert len(got) >= 2, "expected multiple progress emits during the ~1.6s run"
+        assert "done" in got[-1]            # final snapshot has the complete output
+        assert "Exit 0" in result and "line 3" in result
+
+    def test_no_progress_hook_registered_is_fine(self, interpreter):
+        # The default path (cron/background, no hook) must not error.
+        ci.unregister_progress_hook()  # ensure none on this thread
+        result = interpreter.call('{"code": "print(\'ok\')"}')
+        assert "ok" in result and "Exit 0" in result
+
+
 class TestScriptBuilder:
 
     def test_prelude_sets_path_vars_and_disables_input(self):
