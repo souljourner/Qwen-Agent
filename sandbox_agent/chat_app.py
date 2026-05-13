@@ -24,11 +24,14 @@ import logging
 import os
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 import chainlit as cl
 from chainlit.utils import utc_now  # ISO timestamp helper Chainlit uses for step start/end
+
+from sandbox_agent import cancellation
 
 # Import tool modules to trigger @register_tool registrations. Same set as
 # sandbox_agent/main.py — the agent expects these in TOOL_REGISTRY when it
@@ -140,22 +143,37 @@ def _get_agent() -> LockingAgent:
 _DONE = object()
 
 
-def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop):
+def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, run_id: str):
     """Worker that drains `agent.run(messages)` and pushes each yielded chunk
     onto `queue` for the asyncio side to consume.
 
+    Runs inside `cancellation.begin_run(run_id)` so the chat Stop button works:
+    when the on_message coroutine is cancelled it calls `cancellation.cancel(run_id)`,
+    which sets this run's cancel flag (the agent loop raises RunCancelled at its
+    next yield, via `cancellation.guard` in `_compacting_run`) and SIGKILLs any
+    exec/code_interpreter subprocess the run is wedged in. The begin_run context
+    tags THIS thread — where `agent.run` and the tools execute — so
+    `register_child_pgid` and the loop's cancellation check see it.
+
     Sentinel values:
     - `("chunk", List[Message])` — agent yielded a cumulative thread state
-    - `("done", None)`           — generator exhausted normally
+    - `("done", None)`           — generator exhausted normally (or cancelled)
     - `("error", Exception)`     — generator raised; coroutine should re-raise
     """
+    def _push(item):
+        asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+
     try:
-        for chunk in agent.run(messages=messages):
-            asyncio.run_coroutine_threadsafe(queue.put(("chunk", chunk)), loop)
-        asyncio.run_coroutine_threadsafe(queue.put(("done", None)), loop)
+        with cancellation.begin_run(run_id):
+            for chunk in agent.run(messages=messages):
+                _push(("chunk", chunk))
+        _push(("done", None))
+    except cancellation.RunCancelled:
+        logger.info("chat run %s cancelled — agent halted", run_id)
+        _push(("done", None))
     except Exception as e:  # noqa: BLE001 — surface anything to the user
         logger.exception("Agent run raised")
-        asyncio.run_coroutine_threadsafe(queue.put(("error", e)), loop)
+        _push(("error", e))
 
 
 # ---------------------------------------------------------------------------
@@ -482,31 +500,47 @@ async def on_message(message: cl.Message):
 
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
+    # Tag this turn so the Stop button (which cancels this coroutine) can halt
+    # the agent — see _run_agent_in_thread. Prefer the on_message run-step id.
+    try:
+        run_id = cl.context.current_run.id if cl.context.current_run else None
+    except Exception:  # noqa: BLE001
+        run_id = None
+    run_id = run_id or f"chat-{uuid.uuid4().hex}"
+
     threading.Thread(
         target=_run_agent_in_thread,
-        args=(agent, history, queue, loop),
+        args=(agent, history, queue, loop, run_id),
         daemon=True,
         name="chainlit-agent-run",
     ).start()
 
     final_response: List[Message] = []
-    while True:
-        kind, payload = await queue.get()
-        if kind == "done":
-            break
-        if kind == "error":
-            await bridge.finalize()  # persist whatever did stream before the error
-            await cl.ErrorMessage(
-                content=f"Agent error: {type(payload).__name__}: {payload}"
-            ).send()
-            return
-        # kind == "chunk"
-        final_response = payload
-        await bridge.consume(payload)
+    try:
+        while True:
+            kind, payload = await queue.get()
+            if kind == "done":
+                break
+            if kind == "error":
+                await bridge.finalize()  # persist whatever did stream before the error
+                await cl.ErrorMessage(
+                    content=f"Agent error: {type(payload).__name__}: {payload}"
+                ).send()
+                return
+            # kind == "chunk"
+            final_response = payload
+            await bridge.consume(payload)
 
-    # Finalize: persist all streamed cl.Messages to the data layer. Without
-    # this, stream_token tokens reach the UI but no chat.db row is written.
-    await bridge.finalize()
+        # Finalize: persist all streamed cl.Messages to the data layer. Without
+        # this, stream_token tokens reach the UI but no chat.db row is written.
+        await bridge.finalize()
+    except asyncio.CancelledError:
+        # Stop button (or a disconnect) cancels this coroutine. Propagate it to
+        # the agent: set the run's cancel flag (its loop raises RunCancelled at
+        # the next step) and SIGKILL any subprocess it's running. Without this
+        # the worker thread keeps grinding headless — "LLM logs ≠ Chainlit".
+        cancellation.cancel(run_id)
+        raise
 
     # Persist response into agent-side history for the next turn. We feed back
     # the full thread (assistant text + function calls + function results) so
