@@ -79,6 +79,8 @@ text = resp.choices[0].message.content
 ```
 The `openai` package is already installed in the runtime image. `VLLM_BASE` resolves to the same vLLM the agent itself uses. Models: `qwen3.6-27b-linux` (primary, supports concurrency), `qwen3.5` (397B, slower, prefer for complex reasoning). Both honor `enable_thinking`. Streaming: pass `stream=True` and the same `extra_body` together. `enable_thinking=False` is per-call.
 
+**Hugging Face:** `HF_TOKEN` (and the legacy alias `HUGGINGFACE_HUB_TOKEN`) is set if the operator configured it — `huggingface_hub` / `transformers` / `datasets` pick it up automatically for gated model downloads, no per-call wiring needed. `HF_HOME=/app/data/hf_cache` so downloaded models persist across container rebuilds (it's on the DATA_DIR bind mount, visible on the host). If `HF_TOKEN` isn't set, anonymous downloads still work for public models.
+
 **Footgun — `enable_thinking` and `extra_body`:** what vLLM actually reads is a TOP-LEVEL request body field `chat_template_kwargs`. The OpenAI SDK's `extra_body={...}` works because the SDK *spreads its contents into the top level of the wire body* — that's its whole purpose. If you ignore the rule above and hand-roll with `requests`/`httpx`, putting `"extra_body": {"chat_template_kwargs": {...}}` in the JSON does NOTHING (vLLM sees an unknown `extra_body` key and drops it → thinking stays ON → the model burns your whole `max_tokens` budget on `<think>…` tokens and `content` comes back empty). Hand-rolled, it must be `json={"model":..., "messages":..., "chat_template_kwargs": {"enable_thinking": False}}` — top level, no `extra_body` wrapper. But really: just use the SDK.
 
 ### Batch URL processing — MANDATORY pattern

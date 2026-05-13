@@ -25,6 +25,15 @@ services:
       - GRADIO_SERVER_TIMEOUT=3600
       - TZ=America/Los_Angeles
       - QWEN_AGENT_MAX_LLM_CALL_PER_RUN=100
+      # Hugging Face access. Put `HF_TOKEN=hf_…` in a sibling .env file
+      # (gitignored; docker-compose reads it automatically). Empty fallback so
+      # the container boots without one. HUGGINGFACE_HUB_TOKEN mirrors the
+      # newer var for older libraries that look for the legacy name.
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN:-}
+      # Cache downloaded models under DATA_DIR (bind-mounted) so they survive
+      # rebuilds. Default would be ~/.cache/huggingface inside the container.
+      - HF_HOME=/app/data/hf_cache
       # --- Chainlit chat surface ---
       # Auth secret. Generate once with `python -c "import secrets; print(secrets.token_hex(32))"`
       # and put in a sibling .env file (which docker-compose reads automatically).

@@ -78,3 +78,6 @@ sandbox_agent/data/
 chainlit.md
 chainlit.lock
 sandbox_agent_dev_data/
+
+# Local docker-compose env file (HF_TOKEN, CHAINLIT_AUTH_SECRET, etc. — NEVER commit)
+sandbox_agent/docker/.env
