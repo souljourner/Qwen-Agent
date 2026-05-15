@@ -163,7 +163,14 @@ def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.Ab
     - `("error", Exception)`     — generator raised; coroutine should re-raise
     """
     def _push(item):
-        asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+        # call_soon_threadsafe + put_nowait is much lighter than
+        # run_coroutine_threadsafe(queue.put(...)) — the latter creates a
+        # concurrent.futures.Future *and* schedules a coroutine Task on the
+        # event loop for every push. At ~70 chunks/sec from a streaming LLM,
+        # that's ~thousands of put-tasks per turn competing with the drain
+        # coroutine for the event loop, which makes the UI lag behind. The
+        # queue is asyncio.Queue (unbounded) so put_nowait never raises.
+        loop.call_soon_threadsafe(queue.put_nowait, item)
 
     # While this thread runs a code_interpreter call, its stdout streams here
     # as ("tool_progress", text) so the on_message coroutine can show it on the
