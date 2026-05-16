@@ -39,8 +39,17 @@ def log_event(
     task_id: Optional[str] = None,
     task_name: Optional[str] = None,
     model: Optional[str] = None,
+    **extra,
 ) -> None:
-    """Log a structured activity event."""
+    """Log a structured activity event.
+
+    Named kwargs (tool_name, task_id, etc.) are mapped to specific event fields
+    for backward compatibility. Any additional `**extra` kwargs are merged into
+    the event dict as-is — used e.g. by `qwen_agent/llm/oai.py::_capture_usage`
+    to record per-call `llm_usage` events with prompt_tokens / completion_tokens
+    / total_tokens fields. Without this passthrough those calls TypeError'd and
+    got silently swallowed.
+    """
     event = {
         "ts": datetime.now().isoformat(),
         "type": event_type,
@@ -58,6 +67,10 @@ def log_event(
         event["task_name"] = task_name
     if model:
         event["model"] = model
+    # Merge any extra kwargs (caller-supplied event-specific fields).
+    for k, v in extra.items():
+        if v is not None and k not in event:
+            event[k] = v
 
     with _lock:
         _recent_events.append(event)
