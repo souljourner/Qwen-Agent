@@ -308,6 +308,13 @@ def _ensure_notifier() -> None:
 
 HISTORY_KEY = "history"
 
+# Opt-in per-drain-cycle timing log (set CHAT_DEBUG_TIMING=1 in docker-compose
+# env). Zero overhead when off. When on, every drain cycle emits one INFO line
+# with: queue depth before, coalesce count, consume time, stream_token time
+# (peak), qsize after. Use to diagnose UI-lags-behind-LLM symptoms — gives a
+# direct read on where the time actually goes vs. theorizing.
+_DEBUG_TIMING = os.environ.get("CHAT_DEBUG_TIMING", "").lower() in ("1", "true", "yes")
+
 # UI footer appended to each assistant message by on_message (token-usage line
 # right above the feedback buttons). Persisted in chat.db.output as part of the
 # message, but the agent must NOT see it in its conversation context on resume.
@@ -564,7 +571,17 @@ class _StreamBridge:
                 delta = delta.lstrip("\n")  # trim leading newlines from the bubble
                 if not delta:
                     return
-            await state["obj"].stream_token(delta)
+            if _DEBUG_TIMING:
+                _t = time.monotonic()
+                await state["obj"].stream_token(delta)
+                dt = (time.monotonic() - _t) * 1000.0
+                self._dbg_n_stream_token = getattr(self, "_dbg_n_stream_token", 0) + 1
+                if dt > getattr(self, "_dbg_peak_stream_token_ms", 0.0):
+                    self._dbg_peak_stream_token_ms = dt
+                if dt > 50:
+                    logger.info("stream_token slow: delta_len=%d dt=%.1fms", len(delta), dt)
+            else:
+                await state["obj"].stream_token(delta)
 
     async def finalize(self) -> None:
         """End-of-run cleanup. Calls update() on each streamed element so the
@@ -610,7 +627,7 @@ class _StreamBridge:
             now = time.monotonic()
             if now - self._last_update.get(key, 0.0) >= self._UPDATE_THROTTLE_S:
                 self._last_update[key] = now
-                await state["obj"].update()
+                await self._timed_update(state["obj"])
 
     async def _stream_tool_call(self, i: int, msg, function_call) -> None:
         await self._close_open_thoughts()
@@ -642,7 +659,20 @@ class _StreamBridge:
             now = time.monotonic()
             if now - self._last_update.get(i, 0.0) >= self._UPDATE_THROTTLE_S:
                 self._last_update[i] = now
-                await state["obj"].update()
+                await self._timed_update(state["obj"])
+
+    async def _timed_update(self, obj) -> None:
+        if _DEBUG_TIMING:
+            _t = time.monotonic()
+            await obj.update()
+            dt = (time.monotonic() - _t) * 1000.0
+            self._dbg_n_update_step = getattr(self, "_dbg_n_update_step", 0) + 1
+            if dt > getattr(self, "_dbg_peak_update_step_ms", 0.0):
+                self._dbg_peak_update_step_ms = dt
+            if dt > 50:
+                logger.info("update_step slow: dt=%.1fms", dt)
+        else:
+            await obj.update()
 
     async def update_running_tool(self, text: str) -> None:
         """Live stdout from a still-running tool (code_interpreter) — show it on
@@ -723,6 +753,12 @@ async def on_message(message: cl.Message):
     final_response: List[Message] = []
     held_back: Optional[tuple] = None
     turn_usage: Optional[dict] = None  # populated by worker's ("usage_summary", …)
+    # debug-timing accumulators (only used when _DEBUG_TIMING)
+    _dbg_cycle = 0
+    _dbg_total_consume_ms = 0.0
+    _dbg_total_chunks_seen = 0    # chunks observed (incl. coalesced-away)
+    _dbg_total_consumes = 0       # actual bridge.consume() calls
+    _dbg_t0 = time.monotonic()
     try:
         while True:
             if held_back is not None:
@@ -761,6 +797,8 @@ async def on_message(message: cl.Message):
             # delta computation (state["streamed"] char counters) handles a
             # "jumped forward" payload correctly. This stops the drain from
             # falling minutes behind a chatty model during streaming.
+            _dbg_q_before = queue.qsize() + 1 if _DEBUG_TIMING else 0  # +1 for the one we already have
+            _dbg_coalesced = 0
             while True:
                 try:
                     nk, np = queue.get_nowait()
@@ -768,11 +806,47 @@ async def on_message(message: cl.Message):
                     break
                 if nk == "chunk":
                     payload = np
+                    _dbg_coalesced += 1
                     continue
                 held_back = (nk, np)
                 break
             final_response = payload
-            await bridge.consume(payload)
+            if _DEBUG_TIMING:
+                _t = time.monotonic()
+                bridge._dbg_peak_stream_token_ms = 0.0   # type: ignore[attr-defined]
+                bridge._dbg_peak_update_step_ms = 0.0    # type: ignore[attr-defined]
+                bridge._dbg_n_stream_token = 0           # type: ignore[attr-defined]
+                bridge._dbg_n_update_step = 0            # type: ignore[attr-defined]
+                await bridge.consume(payload)
+                consume_ms = (time.monotonic() - _t) * 1000.0
+                _dbg_cycle += 1
+                _dbg_total_consume_ms += consume_ms
+                _dbg_total_chunks_seen += 1 + _dbg_coalesced
+                _dbg_total_consumes += 1
+                logger.info(
+                    "drain[#%d] q_before=%d coalesced=%d consume=%.1fms "
+                    "stream_token(peak=%.1fms n=%d) update_step(peak=%.1fms n=%d) qsize_after=%d",
+                    _dbg_cycle, _dbg_q_before, _dbg_coalesced, consume_ms,
+                    getattr(bridge, "_dbg_peak_stream_token_ms", 0.0),
+                    getattr(bridge, "_dbg_n_stream_token", 0),
+                    getattr(bridge, "_dbg_peak_update_step_ms", 0.0),
+                    getattr(bridge, "_dbg_n_update_step", 0),
+                    queue.qsize(),
+                )
+            else:
+                await bridge.consume(payload)
+
+        if _DEBUG_TIMING:
+            total_wall_ms = (time.monotonic() - _dbg_t0) * 1000.0
+            avg_consume_ms = (_dbg_total_consume_ms / _dbg_total_consumes) if _dbg_total_consumes else 0.0
+            logger.info(
+                "drain DONE: wall=%.1fms consumes=%d (avg %.1fms each) chunks_seen=%d "
+                "(coalesce_ratio=%.1fx) consume_total=%.1fms",
+                total_wall_ms, _dbg_total_consumes, avg_consume_ms,
+                _dbg_total_chunks_seen,
+                (_dbg_total_chunks_seen / _dbg_total_consumes) if _dbg_total_consumes else 0.0,
+                _dbg_total_consume_ms,
+            )
 
         # Append the token-usage footer to the last assistant text bubble (right
         # above the feedback buttons). finalize() below sends the update.
