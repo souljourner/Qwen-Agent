@@ -1070,7 +1070,24 @@ def _build_user_message(message: cl.Message) -> Message:
 @cl.on_message
 async def on_message(message: cl.Message):
     history: List[Message] = cl.user_session.get(HISTORY_KEY) or []
+    # One-line diagnostic for the image-upload path — surfaces what Chainlit
+    # actually hands us so we can tell if `message.elements` is populated or
+    # if the file_refs payload never reached on_message. Remove once stable.
+    _els = getattr(message, "elements", None) or []
+    if _els:
+        _summary = ", ".join(
+            f"{type(e).__name__}(mime={getattr(e,'mime',None)!r},"
+            f"path={'Y' if getattr(e,'path',None) and os.path.exists(getattr(e,'path','') or '') else 'N'},"
+            f"bytes={len(getattr(e,'content',b'') or b'')})"
+            for e in _els
+        )
+        logger.info("on_message: %d element(s) attached → %s", len(_els), _summary)
+    else:
+        logger.info("on_message: 0 elements attached (text-only)")
     user_msg = _build_user_message(message)
+    if isinstance(user_msg.content, list):
+        n_img = sum(1 for it in user_msg.content if getattr(it, "image", None))
+        logger.info("on_message: built multimodal Message with %d image part(s)", n_img)
     history.append(user_msg)
     cl.user_session.set(HISTORY_KEY, history)
 
