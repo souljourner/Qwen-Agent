@@ -223,6 +223,7 @@ _notifier_started = False
 
 
 def _format_task_notice(evt: dict) -> str:
+    """Markdown notice for the UI (shows in the chat bubble)."""
     name = evt.get("name") or evt.get("task_id") or "task"
     ok = evt.get("ok", True)
     result = (evt.get("result") or "").strip()
@@ -232,6 +233,19 @@ def _format_task_notice(evt: dict) -> str:
         snippet = result if len(result) <= 600 else result[:600].rstrip() + " …"
         return f"{head}\n\n{snippet}\n\n_(ask me about it for the full result — I'll look it up with `list_tasks`)_"
     return head
+
+
+def _format_task_notice_for_agent(evt: dict) -> str:
+    """Plain notice the agent sees in its conversation history — wrapped with
+    a [system: …] tag so the model reads it as a system event, not as a user
+    message or as something it (the assistant) said."""
+    name = evt.get("name") or evt.get("task_id") or "task"
+    ok = evt.get("ok", True)
+    result = (evt.get("result") or "").strip()
+    head = (f"background task '{name}' finished"
+            if ok else f"background task '{name}' failed")
+    body = f": {result[:600]}" if result else ""
+    return f"[system: {head}{body}]"
 
 
 async def _completion_notifier_loop() -> None:
@@ -249,11 +263,25 @@ async def _completion_notifier_loop() -> None:
                 continue  # nobody to deliver to — leave events queued
             events = task_notify.drain()
             for evt in events:
-                content = _format_task_notice(evt)
+                ui_content = _format_task_notice(evt)
+                agent_line = _format_task_notice_for_agent(evt)
                 for session in sessions:
                     try:
                         init_ws_context(session)
-                        await cl.Message(content=content, author="background task").send()
+                        # 1. Show the user (live message in the chat).
+                        await cl.Message(content=ui_content, author="background task").send()
+                        # 2. Tell the agent (append to this session's HISTORY_KEY
+                        # so the very next on_message turn — or an in-flight one's
+                        # next _call_llm via re-read — has it in context, instead
+                        # of the agent only learning on the next page reload).
+                        # cl.user_session stores the list by reference; both this
+                        # loop and on_message mutate the same list, so this is a
+                        # plain append, no clobber.
+                        hist = cl.user_session.get(HISTORY_KEY)
+                        if hist is None:
+                            hist = []
+                            cl.user_session.set(HISTORY_KEY, hist)
+                        hist.append(Message(role="user", content=agent_line))
                     except Exception:  # noqa: BLE001
                         logger.debug("notifier: deliver to session %s failed",
                                      getattr(session, "id", "?"), exc_info=True)
@@ -381,10 +409,20 @@ async def on_chat_resume(thread):
         if step_type in ("user_message", "user"):
             history.append(Message(role="user", content=output))
         elif step_type in ("assistant_message", "assistant", "ai", "llm"):
-            # Strip the UI-only token-usage footer (on_message appends it to
-            # assistant messages). It's persisted in chat.db's `output` but
-            # the agent should NOT see it in its conversation context.
-            history.append(Message(role="assistant", content=_strip_stats_footer(output)))
+            # Background-task completion notices are persisted with
+            # author="background task". Symmetric with the live path: present
+            # them to the agent as a user-role [system: …] line, not as
+            # something the assistant said.
+            if (step.get("name") or "").lower() == "background task":
+                first_line = output.strip().splitlines()[0] if output.strip() else ""
+                # strip leading emoji + markdown bold for a clean system line
+                clean = first_line.replace("**", "").lstrip("✅⚠️ ").strip()
+                history.append(Message(role="user", content=f"[system: {clean}]"))
+            else:
+                # Strip the UI-only token-usage footer (on_message appends it to
+                # assistant messages). It's persisted in chat.db's `output` but
+                # the agent should NOT see it in its conversation context.
+                history.append(Message(role="assistant", content=_strip_stats_footer(output)))
         # Tool steps and reasoning are intentionally NOT replayed into the
         # agent's input — the agent re-derives those when it processes the
         # next user turn.
