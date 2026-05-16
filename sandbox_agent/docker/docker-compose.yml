@@ -45,10 +45,6 @@ services:
       # Status server lane: set to 7861 to start it in-process from chat_app.py.
       # Set to 0 to skip (e.g. if running an external monitor).
       - STATUS_SERVER_PORT=7861
-      # Per-drain-cycle timing log (UI-lag diagnosis). Off by default.
-      # Set to 1 (in .env or here) when investigating the "UI lags behind LLM"
-      # symptom; one INFO line per drain cycle + an end-of-turn summary.
-      - CHAT_DEBUG_TIMING=${CHAT_DEBUG_TIMING:-}
 
 # Data is bind-mounted to ~/sandbox_agent_data (visible in Finder).
 # Chainlit's chat history persists at /app/data/chat.db (host: ~/sandbox_agent_data/chat.db).
