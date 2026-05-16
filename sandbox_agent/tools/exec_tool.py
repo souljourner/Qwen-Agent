@@ -36,7 +36,7 @@ def kill_process_group(proc: "subprocess.Popen") -> None:
         except (ProcessLookupError, OSError):
             pass
 
-MAX_TIMEOUT = 600  # 10 minutes
+MAX_TIMEOUT = 3600  # 1 hour
 DEFAULT_TIMEOUT = 120  # 2 minutes
 MAX_OUTPUT_TOKENS = 16000  # Same as code_interpreter
 
@@ -103,7 +103,7 @@ class ExecTool(BaseTool):
             },
             "timeout": {
                 "type": "number",
-                "description": "Timeout in seconds (default 120, max 600).",
+                "description": "Timeout in seconds (default 120, max 3600).",
             },
             "project": {
                 "type": "string",
