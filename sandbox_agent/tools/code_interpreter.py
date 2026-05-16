@@ -81,14 +81,14 @@ def _escape_ansi(text: str) -> str:
 
 MIN_TIMEOUT = 600        # 10 minutes minimum
 SECONDS_PER_TOKEN = 0.1  # ~10 tokens/sec generation speed as budget estimate
-MAX_TIMEOUT = 1200       # 20 minute hard cap (a longer job should be a scheduled task)
+MAX_TIMEOUT = 3600       # 1 hour hard cap (a longer job should be a scheduled task)
 
 
 def _compute_timeout(code: str) -> int:
     """Compute timeout based on code size. Longer code = more work = more time.
 
     Heuristic: 1 token ≈ 4 chars, budget ~0.1s per token of code.
-    Minimum 10 minutes, max 20 minutes.
+    Minimum 10 minutes, max 1 hour.
     """
     estimated_tokens = len(code) // 4
     computed = int(estimated_tokens * SECONDS_PER_TOKEN)
