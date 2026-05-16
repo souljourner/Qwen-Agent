@@ -52,6 +52,7 @@ from qwen_agent.llm.schema import Message
 from sandbox_agent.chat_data_layer import make_data_layer
 from sandbox_agent.chat_logger import log_turn
 from sandbox_agent.tools.code_interpreter import register_progress_hook, unregister_progress_hook
+from qwen_agent.llm.oai import register_usage_hook, unregister_usage_hook
 from sandbox_agent.config import (
     BACKGROUND_LLM_CFG,
     PRIMARY_LLM_CFG,
@@ -158,9 +159,11 @@ def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.Ab
     `register_child_pgid` and the loop's cancellation check see it.
 
     Sentinel values:
-    - `("chunk", List[Message])` — agent yielded a cumulative thread state
-    - `("done", None)`           — generator exhausted normally (or cancelled)
-    - `("error", Exception)`     — generator raised; coroutine should re-raise
+    - `("chunk", List[Message])`   — agent yielded a cumulative thread state
+    - `("tool_progress", str)`     — live stdout from a running code_interpreter
+    - `("usage_summary", dict)`    — per-turn token totals (prompt/completion/calls)
+    - `("done", None)`             — generator exhausted normally (or cancelled)
+    - `("error", Exception)`       — generator raised; coroutine should re-raise
     """
     def _push(item):
         # call_soon_threadsafe + put_nowait is much lighter than
@@ -176,19 +179,33 @@ def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.Ab
     # as ("tool_progress", text) so the on_message coroutine can show it on the
     # live tool step. Cleared in `finally` so it doesn't leak to a later run.
     register_progress_hook(lambda text: _push(("tool_progress", text)))
+
+    # Aggregate per-call vLLM usage across all _call_llm invocations in this turn
+    # (a turn often makes several — reasoning, then per-tool, then the final answer).
+    turn_usage = {"prompt": 0, "completion": 0, "calls": 0}
+
+    def _on_usage(info: dict) -> None:
+        turn_usage["prompt"] += int(info.get("prompt_tokens", 0) or 0)
+        turn_usage["completion"] += int(info.get("completion_tokens", 0) or 0)
+        turn_usage["calls"] += 1
+
+    register_usage_hook(_on_usage)
     try:
         with cancellation.begin_run(run_id):
             for chunk in agent.run(messages=messages):
                 _push(("chunk", chunk))
+        _push(("usage_summary", dict(turn_usage)))
         _push(("done", None))
     except cancellation.RunCancelled:
         logger.info("chat run %s cancelled — agent halted", run_id)
+        _push(("usage_summary", dict(turn_usage)))
         _push(("done", None))
     except Exception as e:  # noqa: BLE001 — surface anything to the user
         logger.exception("Agent run raised")
         _push(("error", e))
     finally:
         unregister_progress_hook()
+        unregister_usage_hook()
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +279,16 @@ def _ensure_notifier() -> None:
 # ---------------------------------------------------------------------------
 
 HISTORY_KEY = "history"
+
+# UI footer appended to each assistant message by on_message (token-usage line
+# right above the feedback buttons). Persisted in chat.db.output as part of the
+# message, but the agent must NOT see it in its conversation context on resume.
+_STATS_FOOTER_MARKER = "\n\n---\n📊 _last turn:"
+
+
+def _strip_stats_footer(text: str) -> str:
+    i = text.find(_STATS_FOOTER_MARKER)
+    return text[:i] if i != -1 else text
 
 
 @cl.on_chat_start
@@ -354,7 +381,10 @@ async def on_chat_resume(thread):
         if step_type in ("user_message", "user"):
             history.append(Message(role="user", content=output))
         elif step_type in ("assistant_message", "assistant", "ai", "llm"):
-            history.append(Message(role="assistant", content=output))
+            # Strip the UI-only token-usage footer (on_message appends it to
+            # assistant messages). It's persisted in chat.db's `output` but
+            # the agent should NOT see it in its conversation context.
+            history.append(Message(role="assistant", content=_strip_stats_footer(output)))
         # Tool steps and reasoning are intentionally NOT replayed into the
         # agent's input — the agent re-derives those when it processes the
         # next user turn.
@@ -408,6 +438,16 @@ class _StreamBridge:
             return run.id if run is not None else None
         except Exception:  # noqa: BLE001
             return None
+
+    def last_text_message(self) -> Optional["cl.Message"]:
+        """The most recently created assistant `cl.Message` (text bubble). Used
+        by on_message to append the per-turn token-usage footer right before
+        finalize persists everything."""
+        last = None
+        for state in self._by_index.values():
+            if state.get("kind") == "text":
+                last = state.get("obj")
+        return last
 
     async def consume(self, messages: List[Message]) -> None:
         for i, msg in enumerate(messages):
@@ -644,6 +684,7 @@ async def on_message(message: cl.Message):
     # it for the next iteration to keep FIFO ordering.
     final_response: List[Message] = []
     held_back: Optional[tuple] = None
+    turn_usage: Optional[dict] = None  # populated by worker's ("usage_summary", …)
     try:
         while True:
             if held_back is not None:
@@ -659,6 +700,9 @@ async def on_message(message: cl.Message):
                     content=f"Agent error: {type(payload).__name__}: {payload}"
                 ).send()
                 return
+            if kind == "usage_summary":
+                turn_usage = payload  # stash; applied just before finalize
+                continue
             if kind == "tool_progress":
                 # Live stdout from a running code_interpreter call. Drain any
                 # later progress snapshots — only the most recent matters.
@@ -691,6 +735,26 @@ async def on_message(message: cl.Message):
                 break
             final_response = payload
             await bridge.consume(payload)
+
+        # Append the token-usage footer to the last assistant text bubble (right
+        # above the feedback buttons). finalize() below sends the update.
+        if turn_usage and (turn_usage["prompt"] or turn_usage["completion"]):
+            chat_total = int(cl.user_session.get("chat_total_tokens") or 0)
+            chat_total += turn_usage["prompt"] + turn_usage["completion"]
+            cl.user_session.set("chat_total_tokens", chat_total)
+            last_msg = bridge.last_text_message()
+            if last_msg is not None:
+                p, c = turn_usage["prompt"], turn_usage["completion"]
+                n = turn_usage["calls"]
+                footer = (
+                    f"\n\n---\n"
+                    f"📊 _last turn: {p:,} in / {c:,} out ({p + c:,} total"
+                    f"{f', {n} LLM calls' if n > 1 else ''}) · "
+                    f"chat so far: {chat_total:,}_"
+                )
+                # mutate in-memory content; bridge.finalize() will call update()
+                # which sends the new step_dict (incl. content) over the socket.
+                last_msg.content = (last_msg.content or "") + footer
 
         # Finalize: persist all streamed cl.Messages to the data layer. Without
         # this, stream_token tokens reach the UI but no chat.db row is written.

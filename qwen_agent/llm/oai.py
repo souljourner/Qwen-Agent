@@ -15,8 +15,9 @@
 import copy
 import logging
 import os
+import threading
 from pprint import pformat
-from typing import Dict, Iterator, List, Optional
+from typing import Callable, Dict, Iterator, List, Optional
 
 import openai
 
@@ -31,6 +32,53 @@ from qwen_agent.llm.base import ModelServiceError, register_llm
 from qwen_agent.llm.function_calling import BaseFnCallModel
 from qwen_agent.llm.schema import ASSISTANT, FunctionCall, Message
 from qwen_agent.log import logger
+
+
+# --- LOCAL MOD (sandbox_agent) -----------------------------------------------
+# vLLM/OpenAI usage capture: emit per-call prompt/completion token counts to
+# (a) sandbox_agent's activity log (audit trail) and (b) an optional thread-
+# keyed hook (chat_app registers one per chat turn so the UI can show "last
+# turn: X in / Y out · chat total: Z"). For streaming, this needs
+# `stream_options={"include_usage": True}` on the request so vLLM emits a
+# trailing usage chunk — added below in _chat_stream.
+_usage_hooks: "Dict[int, Callable[[dict], None]]" = {}
+
+
+def register_usage_hook(fn: "Callable[[dict], None]") -> None:
+    """chat_app calls this on the worker thread that runs agent.run() so each
+    _chat_stream call's final usage event flows back into that turn's queue.
+    Hook receives {'model', 'prompt_tokens', 'completion_tokens', 'total_tokens'}."""
+    _usage_hooks[threading.get_ident()] = fn
+
+
+def unregister_usage_hook() -> None:
+    _usage_hooks.pop(threading.get_ident(), None)
+
+
+def _capture_usage(usage, model: str) -> None:
+    """Fire the activity-log + hook for a freshly received usage payload."""
+    if not usage:
+        return
+    info = {
+        'model': model,
+        'prompt_tokens': int(getattr(usage, 'prompt_tokens', 0) or 0),
+        'completion_tokens': int(getattr(usage, 'completion_tokens', 0) or 0),
+    }
+    info['total_tokens'] = info['prompt_tokens'] + info['completion_tokens']
+    try:
+        from sandbox_agent.activity_log import log_event
+        log_event('llm_usage', **info)
+    except Exception:  # noqa: BLE001 — qwen_agent must stay usable without sandbox_agent
+        pass
+    hook = _usage_hooks.get(threading.get_ident())
+    if hook is not None:
+        try:
+            hook(info)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+# -----------------------------------------------------------------------------
 
 
 def _extract_reasoning(obj) -> str:
@@ -119,10 +167,18 @@ class TextChatAtOAI(BaseFnCallModel):
     ) -> Iterator[List[Message]]:
         messages = self.convert_messages_to_dicts(messages)
         logger.debug(f'LLM Input generate_cfg: \n{generate_cfg}')
+        # LOCAL MOD: request a trailing usage chunk so we can capture prompt /
+        # completion token counts on every streamed call. vLLM honors this.
+        gc = dict(generate_cfg)
+        opts = dict(gc.get('stream_options') or {})
+        opts.setdefault('include_usage', True)
+        gc['stream_options'] = opts
         try:
-            response = self._chat_complete_create(model=self.model, messages=messages, stream=True, **generate_cfg)
+            response = self._chat_complete_create(model=self.model, messages=messages, stream=True, **gc)
             if delta_stream:
                 for chunk in response:
+                    if getattr(chunk, 'usage', None):
+                        _capture_usage(chunk.usage, self.model)
                     if chunk.choices:
                         delta_reasoning = _extract_reasoning(chunk.choices[0].delta)
                         if delta_reasoning:
@@ -138,6 +194,8 @@ class TextChatAtOAI(BaseFnCallModel):
                 full_reasoning_content = ''
                 full_tool_calls = []
                 for chunk in response:
+                    if getattr(chunk, 'usage', None):
+                        _capture_usage(chunk.usage, self.model)
                     if chunk.choices:
                         delta_reasoning = _extract_reasoning(chunk.choices[0].delta)
                         if delta_reasoning:
@@ -182,6 +240,7 @@ class TextChatAtOAI(BaseFnCallModel):
         messages = self.convert_messages_to_dicts(messages)
         try:
             response = self._chat_complete_create(model=self.model, messages=messages, stream=False, **generate_cfg)
+            _capture_usage(getattr(response, 'usage', None), self.model)
             msg_reasoning = _extract_reasoning(response.choices[0].message)
             if msg_reasoning:
                 return [
