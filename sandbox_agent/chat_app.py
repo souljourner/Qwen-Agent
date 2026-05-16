@@ -190,11 +190,20 @@ def _run_agent_in_thread(
 
     # Aggregate per-call vLLM usage across all _call_llm invocations in this turn
     # (a turn often makes several — reasoning, then per-tool, then the final answer).
-    turn_usage = {"prompt": 0, "completion": 0, "calls": 0}
+    # Track per-turn: the LARGEST single prompt the model processed (= the
+    # context-window high-water mark — what we'd hit the 256k cap with) and
+    # the SUM of completions (= total work generated this turn). Per-call
+    # prompt sums (a.k.a. "billable tokens") aren't useful here since we run
+    # against a local vLLM, not a paid API — what we want to see is how close
+    # any single call got to the context limit.
+    turn_usage = {"max_prompt": 0, "completion_total": 0, "calls": 0}
 
     def _on_usage(info: dict) -> None:
-        turn_usage["prompt"] += int(info.get("prompt_tokens", 0) or 0)
-        turn_usage["completion"] += int(info.get("completion_tokens", 0) or 0)
+        p = int(info.get("prompt_tokens", 0) or 0)
+        c = int(info.get("completion_tokens", 0) or 0)
+        if p > turn_usage["max_prompt"]:
+            turn_usage["max_prompt"] = p
+        turn_usage["completion_total"] += c
         turn_usage["calls"] += 1
 
     register_usage_hook(_on_usage)
@@ -361,6 +370,12 @@ def _ensure_notifier() -> None:
 # ---------------------------------------------------------------------------
 
 HISTORY_KEY = "history"
+
+# Model context window — used to render "max ctx N (P% of 256k)" in the
+# per-turn footer so you can see at a glance how close any single LLM call
+# this turn got to the limit. The primary model (qwen3.6-27b-linux) and
+# backup (qwen3.5) both support 256k; bump this if the deployed model changes.
+_CONTEXT_WINDOW_TOKENS = 256_000
 
 # UI footer appended to each assistant message by on_message (token-usage line
 # right above the feedback buttons). Persisted in chat.db.output as part of the
@@ -894,21 +909,26 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
             final_response = payload
             await bridge.consume(payload)
 
-        # Append the token-usage footer to the last assistant text bubble (right
-        # above the feedback buttons). finalize() below sends the update.
-        if turn_usage and (turn_usage["prompt"] or turn_usage["completion"]):
-            chat_total = int(cl.user_session.get("chat_total_tokens") or 0)
-            chat_total += turn_usage["prompt"] + turn_usage["completion"]
-            cl.user_session.set("chat_total_tokens", chat_total)
+        # Append the context-usage footer to the last assistant text bubble
+        # (right above the feedback buttons). finalize() below sends the
+        # update. What we show is "how close any single call this turn got to
+        # the model's context window" — NOT a billing sum. Per-call max prompt
+        # is what trips the 256k cap; cumulative billable tokens aren't useful
+        # against a local vLLM.
+        if turn_usage and (turn_usage["max_prompt"] or turn_usage["completion_total"]):
+            max_p = turn_usage["max_prompt"]
+            chat_hi = max(int(cl.user_session.get("chat_max_prompt_tokens") or 0), max_p)
+            cl.user_session.set("chat_max_prompt_tokens", chat_hi)
             last_msg = bridge.last_text_message()
             if last_msg is not None:
-                p, c = turn_usage["prompt"], turn_usage["completion"]
+                c = turn_usage["completion_total"]
                 n = turn_usage["calls"]
+                pct = (chat_hi / _CONTEXT_WINDOW_TOKENS) * 100.0
                 footer = (
                     f"\n\n---\n"
-                    f"📊 _last turn: {p:,} in / {c:,} out ({p + c:,} total"
-                    f"{f', {n} LLM calls' if n > 1 else ''}) · "
-                    f"chat so far: {chat_total:,}_"
+                    f"📊 _last turn: max ctx {max_p:,} / {c:,} out"
+                    f"{f' · {n} LLM calls' if n > 1 else ''} · "
+                    f"chat high-water: {chat_hi:,} ({pct:.0f}% of {_CONTEXT_WINDOW_TOKENS // 1000}k)_"
                 )
                 # mutate in-memory content; bridge.finalize() will call update()
                 # which sends the new step_dict (incl. content) over the socket.
