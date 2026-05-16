@@ -270,10 +270,7 @@ async def _completion_notifier_loop() -> None:
                         init_ws_context(session)
                         # 1. Show the user (live message in the chat).
                         await cl.Message(content=ui_content, author="background task").send()
-                        # 2. Tell the agent (append to this session's HISTORY_KEY
-                        # so the very next on_message turn — or an in-flight one's
-                        # next _call_llm via re-read — has it in context, instead
-                        # of the agent only learning on the next page reload).
+                        # 2. Tell the agent (append to this session's HISTORY_KEY).
                         # cl.user_session stores the list by reference; both this
                         # loop and on_message mutate the same list, so this is a
                         # plain append, no clobber.
@@ -282,6 +279,20 @@ async def _completion_notifier_loop() -> None:
                             hist = []
                             cl.user_session.set(HISTORY_KEY, hist)
                         hist.append(Message(role="user", content=agent_line))
+                        # 3. Trigger a synthetic agent turn right now so it can
+                        # follow up (read a result file, schedule the next step,
+                        # send a notification) without waiting for the user.
+                        # Serialized with on_message via the per-session lock.
+                        try:
+                            async with _get_turn_lock():
+                                await _execute_agent_turn(_get_agent(), hist, log_user_msg=None)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:  # noqa: BLE001
+                            logger.debug("notifier: synthetic agent turn failed",
+                                         exc_info=True)
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:  # noqa: BLE001
                         logger.debug("notifier: deliver to session %s failed",
                                      getattr(session, "id", "?"), exc_info=True)
@@ -758,18 +769,34 @@ class _StreamBridge:
             logger.debug("StreamBridge: failed to update closed tool step", exc_info=True)
 
 
-@cl.on_message
-async def on_message(message: cl.Message):
-    history: List[Message] = cl.user_session.get(HISTORY_KEY) or []
-    history.append(Message(role="user", content=message.content))
+def _get_turn_lock() -> asyncio.Lock:
+    """Per-session lock that serializes agent turns — both user-initiated
+    (`on_message`) and notifier-initiated (synthetic system-event turns). Without
+    it the two could interleave UI output on the same session. Stored lazily on
+    cl.user_session so each session gets its own."""
+    lock = cl.user_session.get("_turn_lock")
+    if lock is None:
+        lock = asyncio.Lock()
+        cl.user_session.set("_turn_lock", lock)
+    return lock
 
-    agent = _get_agent()
+
+async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Optional[Message] = None) -> None:
+    """Run one agent turn against `history` (last item = the triggering message —
+    user message, or a synthesized [system: …] line from the notifier).
+
+    Streams output into the active Chainlit session, persists everything,
+    appends the agent's response to `history` (in place) and to
+    cl.user_session[HISTORY_KEY], and (if log_user_msg given) appends the
+    user-facing exchange to the daily markdown log. Caller must already hold
+    `_get_turn_lock()` and have a valid cl.context set."""
     bridge = _StreamBridge()
-
     queue: asyncio.Queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
-    # Tag this turn so the Stop button (which cancels this coroutine) can halt
-    # the agent — see _run_agent_in_thread. Prefer the on_message run-step id.
+    # Tag this turn so the Stop button (which cancels the on_message coroutine)
+    # can halt the agent — see _run_agent_in_thread. cl.context.current_run is
+    # set when called from on_message; for notifier-initiated turns it's None
+    # and we fall back to a uuid (Stop doesn't reach notifier turns anyway).
     try:
         run_id = cl.context.current_run.id if cl.context.current_run else None
     except Exception:  # noqa: BLE001
@@ -909,10 +936,10 @@ async def on_message(message: cl.Message):
         # this, stream_token tokens reach the UI but no chat.db row is written.
         await bridge.finalize()
     except asyncio.CancelledError:
-        # Stop button (or a disconnect) cancels this coroutine. Propagate it to
-        # the agent: set the run's cancel flag (its loop raises RunCancelled at
-        # the next step) and SIGKILL any subprocess it's running. Without this
-        # the worker thread keeps grinding headless — "LLM logs ≠ Chainlit".
+        # Stop button (or a disconnect) cancels the on_message coroutine.
+        # Propagate it to the agent: set the run's cancel flag (its loop raises
+        # RunCancelled at the next step) and SIGKILL any subprocess it's
+        # running. Without this the worker keeps grinding headless.
         cancellation.cancel(run_id)
         raise
 
@@ -920,7 +947,6 @@ async def on_message(message: cl.Message):
     # the full thread (assistant text + function calls + function results) so
     # the agent has continuity. Reasoning_content is intentionally NOT carried
     # forward — it inflates the prompt and the model re-derives it on demand.
-    user_msg = history[-1]  # the user message we appended at the top
     for msg in final_response:
         if msg.role in ("assistant", "function") and (
             (msg.content and (isinstance(msg.content, str) or isinstance(msg.content, list)))
@@ -929,9 +955,22 @@ async def on_message(message: cl.Message):
             history.append(msg)
     cl.user_session.set(HISTORY_KEY, history)
 
-    # Append to the daily markdown chat log — separate from Chainlit's SQLite
-    # persistence; markdown is the human-readable, exportable archive.
-    try:
-        log_turn(user_msg, final_response)
-    except Exception:  # noqa: BLE001 — never let logging kill the chat
-        logger.exception("log_turn failed (chat already delivered)")
+    if log_user_msg is not None:
+        # Daily markdown log — only for user-initiated turns (synthetic
+        # system-event turns aren't logged as "user said X").
+        try:
+            log_turn(log_user_msg, final_response)
+        except Exception:  # noqa: BLE001 — never let logging kill the chat
+            logger.exception("log_turn failed (chat already delivered)")
+
+
+@cl.on_message
+async def on_message(message: cl.Message):
+    history: List[Message] = cl.user_session.get(HISTORY_KEY) or []
+    user_msg = Message(role="user", content=message.content)
+    history.append(user_msg)
+    cl.user_session.set(HISTORY_KEY, history)
+
+    agent = _get_agent()
+    async with _get_turn_lock():
+        await _execute_agent_turn(agent, history, log_user_msg=user_msg)
