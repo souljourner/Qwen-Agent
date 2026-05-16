@@ -236,16 +236,23 @@ def _format_task_notice(evt: dict) -> str:
 
 
 def _format_task_notice_for_agent(evt: dict) -> str:
-    """Plain notice the agent sees in its conversation history — wrapped with
-    a [system: …] tag so the model reads it as a system event, not as a user
-    message or as something it (the assistant) said."""
+    """Plain notice the agent sees in its conversation history, injected as a
+    role='system' message (qwen-agent / Qwen chat template tolerate mid-thread
+    system messages — they render as `<|im_start|>system\\n…<|im_end|>`).
+
+    Phrased as a directive so the agent knows to consider follow-up actions
+    rather than just acknowledge."""
     name = evt.get("name") or evt.get("task_id") or "task"
     ok = evt.get("ok", True)
     result = (evt.get("result") or "").strip()
-    head = (f"background task '{name}' finished"
-            if ok else f"background task '{name}' failed")
-    body = f": {result[:600]}" if result else ""
-    return f"[system: {head}{body}]"
+    verb = "finished" if ok else "failed"
+    body = f": {result[:600]}" if result else "."
+    return (
+        f"A background task '{name}' {verb}{body} "
+        f"If a follow-up is warranted (read result files via project_read_file, "
+        f"schedule the next step, send a notification, alert the user, etc.), "
+        f"do it now; otherwise stay silent."
+    )
 
 
 async def _completion_notifier_loop() -> None:
@@ -278,7 +285,7 @@ async def _completion_notifier_loop() -> None:
                         if hist is None:
                             hist = []
                             cl.user_session.set(HISTORY_KEY, hist)
-                        hist.append(Message(role="user", content=agent_line))
+                        hist.append(Message(role="system", content=agent_line))
                         # 3. Trigger a synthetic agent turn right now so it can
                         # follow up (read a result file, schedule the next step,
                         # send a notification) without waiting for the user.
@@ -428,14 +435,14 @@ async def on_chat_resume(thread):
             history.append(Message(role="user", content=output))
         elif step_type in ("assistant_message", "assistant", "ai", "llm"):
             # Background-task completion notices are persisted with
-            # author="background task". Symmetric with the live path: present
-            # them to the agent as a user-role [system: …] line, not as
-            # something the assistant said.
+            # author="background task". Symmetric with the live path: rebuild
+            # them as role="system" messages (not as something the assistant
+            # said). qwen-agent passes mid-thread system messages through.
             if (step.get("name") or "").lower() == "background task":
                 first_line = output.strip().splitlines()[0] if output.strip() else ""
                 # strip leading emoji + markdown bold for a clean system line
                 clean = first_line.replace("**", "").lstrip("✅⚠️ ").strip()
-                history.append(Message(role="user", content=f"[system: {clean}]"))
+                history.append(Message(role="system", content=clean))
             else:
                 # Strip the UI-only token-usage footer (on_message appends it to
                 # assistant messages). It's persisted in chat.db's `output` but
