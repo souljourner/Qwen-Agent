@@ -30,7 +30,7 @@ else:
 
 from qwen_agent.llm.base import ModelServiceError, register_llm
 from qwen_agent.llm.function_calling import BaseFnCallModel
-from qwen_agent.llm.schema import ASSISTANT, FunctionCall, Message
+from qwen_agent.llm.schema import ASSISTANT, ContentItem, FunctionCall, Message
 from qwen_agent.log import logger
 
 
@@ -53,6 +53,30 @@ def register_usage_hook(fn: "Callable[[dict], None]") -> None:
 
 def unregister_usage_hook() -> None:
     _usage_hooks.pop(threading.get_ident(), None)
+
+
+def _multimodal_to_oai_dict(msg: Message) -> dict:
+    """Build the OpenAI multimodal `content: [parts]` wire shape for a Message
+    whose content is a List[ContentItem]. Text items → {type:'text',text:...};
+    image items → {type:'image_url', image_url:{url:...}} where `url` is the
+    ContentItem.image value (data URL or http URL, set by the chat surface).
+    file / audio / video items are skipped here — the chat path only uploads
+    images. Preserves `name` and `function_call` if present on the Message."""
+    parts: List[dict] = []
+    for it in msg.content:
+        if not isinstance(it, ContentItem):
+            continue
+        if getattr(it, "text", None):
+            parts.append({"type": "text", "text": it.text})
+        if getattr(it, "image", None):
+            parts.append({"type": "image_url", "image_url": {"url": it.image}})
+    d: dict = {"role": msg.role, "content": parts}
+    if getattr(msg, "name", None):
+        d["name"] = msg.name
+    fc = getattr(msg, "function_call", None)
+    if fc is not None:
+        d["function_call"] = fc.model_dump() if hasattr(fc, "model_dump") else dict(fc)
+    return d
 
 
 def _capture_usage(usage, model: str) -> None:
@@ -257,9 +281,24 @@ class TextChatAtOAI(BaseFnCallModel):
         # TODO: Change when the VLLM deployed model needs to pass reasoning_complete.
         #  At this time, in order to be compatible with lower versions of vLLM,
         #  and reasoning content is currently not useful
-        messages = [format_as_text_message(msg, add_upload_info=False) for msg in messages]
-        messages = [msg.model_dump() for msg in messages]
-        messages = self._conv_qwen_agent_messages_to_oai(messages)
+        #
+        # LOCAL MOD (sandbox_agent): preserve multimodal content for vision
+        # models. format_as_text_message() text-flattens content (discards
+        # image / file / audio / video items), so by the time it hit vLLM we
+        # were sending text-only requests even when the user uploaded an
+        # image. Messages whose content is a List[ContentItem] with at least
+        # one image item now go through _multimodal_to_oai_dict, which emits
+        # OpenAI's parts wire format ({type:text,...}, {type:image_url,
+        # image_url:{url:...}}). Text-only messages take the original path.
+        out: List[dict] = []
+        for msg in messages:
+            if isinstance(msg.content, list) and any(
+                isinstance(it, ContentItem) and getattr(it, "image", None) for it in msg.content
+            ):
+                out.append(_multimodal_to_oai_dict(msg))
+            else:
+                out.append(format_as_text_message(msg, add_upload_info=False).model_dump())
+        messages = self._conv_qwen_agent_messages_to_oai(out)
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(f'LLM Input: \n{pformat(messages, indent=2)}')

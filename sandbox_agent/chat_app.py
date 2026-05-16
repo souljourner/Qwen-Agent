@@ -19,8 +19,10 @@ Or from the container after Phase 4 cutover:
 """
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import sqlite3
 import threading
@@ -47,7 +49,7 @@ import sandbox_agent.tools.notification_tools  # noqa: F401
 import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 
-from qwen_agent.llm.schema import Message
+from qwen_agent.llm.schema import ContentItem, Message
 
 from sandbox_agent.chat_data_layer import make_data_layer
 from sandbox_agent.chat_logger import log_turn
@@ -470,13 +472,47 @@ async def on_chat_resume(thread):
     """
     history: List[Message] = []
     steps = thread.get("steps", []) if isinstance(thread, dict) else []
+    # Index thread elements by the step they belong to, so a user_message
+    # rebuild can re-attach any persisted images (Chainlit saved them to
+    # disk; we re-encode as data URLs the same way on_message does).
+    elements_by_step: Dict[str, List[dict]] = {}
+    for el in (thread.get("elements") or []) if isinstance(thread, dict) else []:
+        fid = el.get("forId") or el.get("for_id")
+        if fid:
+            elements_by_step.setdefault(fid, []).append(el)
     for step in steps:
         step_type = (step.get("type") or "").lower()
         output = step.get("output") or ""
-        if not output:
+        if not output and not elements_by_step.get(step.get("id")):
             continue
         if step_type in ("user_message", "user"):
-            history.append(Message(role="user", content=output))
+            # Try to rebuild a multimodal user message if this step had image
+            # elements persisted alongside.
+            attached = elements_by_step.get(step.get("id") or "", [])
+            image_parts: List[ContentItem] = []
+            for el in attached:
+                mime = (el.get("mime") or "").lower()
+                if not mime.startswith("image/"):
+                    continue
+                path = el.get("path")
+                if not path or not os.path.exists(path):
+                    continue
+                try:
+                    with open(path, "rb") as f:
+                        data = f.read()
+                except OSError:
+                    continue
+                image_parts.append(ContentItem(
+                    image=f"data:{mime};base64,{base64.b64encode(data).decode()}"
+                ))
+            if image_parts:
+                parts: List[ContentItem] = []
+                if output:
+                    parts.append(ContentItem(text=output))
+                parts.extend(image_parts)
+                history.append(Message(role="user", content=parts))
+            else:
+                history.append(Message(role="user", content=output))
         elif step_type in ("assistant_message", "assistant", "ai", "llm"):
             # Background-task completion notices are persisted with
             # author="background task". Symmetric with the live path: rebuild
@@ -966,10 +1002,75 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
             logger.exception("log_turn failed (chat already delivered)")
 
 
+def _image_element_to_data_url(el) -> Optional[str]:
+    """Read a Chainlit image element off disk (where Chainlit persists it) and
+    return a base64 data URL. We use data URLs (not paths) because vLLM is on
+    a different host — paths/URLs that only resolve in the agent container
+    aren't reachable from the LLM box. Returns None if we can't recover the
+    bytes."""
+    path = getattr(el, "path", None)
+    mime = (getattr(el, "mime", None)
+            or (mimetypes.guess_type(path)[0] if path else None)
+            or "image/png")
+    data: Optional[bytes] = None
+    if path and os.path.exists(path):
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            logger.debug("on_message: failed to read image at %s", path, exc_info=True)
+    if data is None:
+        raw = getattr(el, "content", None)
+        if isinstance(raw, (bytes, bytearray)):
+            data = bytes(raw)
+        elif isinstance(raw, str):
+            data = raw.encode()
+    if data is None:
+        url = getattr(el, "url", None)
+        if url:
+            return url   # let vLLM fetch it if it can
+        return None
+    return f"data:{mime};base64,{base64.b64encode(data).decode()}"
+
+
+def _build_user_message(message: cl.Message) -> Message:
+    """Build a `qwen_agent.llm.schema.Message` from a Chainlit incoming message.
+    Plain text → `content=str`. With any image attachment → `content=List
+    [ContentItem]` (text part + one image part per uploaded image). qwen-agent's
+    oai.py local-mod (`_multimodal_to_oai_dict`) preserves the parts on the
+    wire so vision-capable vLLM models actually see them."""
+    text = message.content or ""
+    elements = getattr(message, "elements", None) or []
+
+    def _is_image(el) -> bool:
+        mime = (getattr(el, "mime", None) or "").lower()
+        if mime.startswith("image/"):
+            return True
+        # cl.Image instances may not always carry mime; fall back to class name.
+        return type(el).__name__.lower() == "image"
+
+    image_elems = [el for el in elements if _is_image(el)]
+    if not image_elems:
+        return Message(role="user", content=text)
+
+    parts: List[ContentItem] = []
+    if text:
+        parts.append(ContentItem(text=text))
+    for el in image_elems:
+        data_url = _image_element_to_data_url(el)
+        if data_url:
+            parts.append(ContentItem(image=data_url))
+    if not any(getattr(p, "image", None) for p in parts):
+        # All image reads failed — fall back to plain text so we don't send
+        # an empty multimodal message.
+        return Message(role="user", content=text)
+    return Message(role="user", content=parts)
+
+
 @cl.on_message
 async def on_message(message: cl.Message):
     history: List[Message] = cl.user_session.get(HISTORY_KEY) or []
-    user_msg = Message(role="user", content=message.content)
+    user_msg = _build_user_message(message)
     history.append(user_msg)
     cl.user_session.set(HISTORY_KEY, history)
 
