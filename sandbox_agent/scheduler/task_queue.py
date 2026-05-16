@@ -125,8 +125,14 @@ class TaskQueue:
         depends_on: Optional[List[str]] = None,
         priority: int = 0,
         project: Optional[str] = None,
+        origin: Optional[dict] = None,
     ) -> Task:
-        """Create and enqueue a new task."""
+        """Create and enqueue a new task.
+
+        `origin` is the chat session that scheduled this task — passed by
+        scheduler_tools / pipeline_tools reading `chat_origin.current_origin()`.
+        The notifier uses it to route the completion notice back to that
+        session only, instead of broadcasting to every connected tab."""
         task_id = uuid.uuid4().hex[:12]
         now = datetime.now()
 
@@ -154,6 +160,7 @@ class TaskQueue:
             depends_on=depends_on or [],
             priority=priority,
             project=project,
+            origin=origin,
             created_at=now,
         )
 

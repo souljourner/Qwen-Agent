@@ -527,32 +527,43 @@ def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_befo
     """Execute one cron task. Runs inside a worker thread so the cron loop can
     enforce a wall-clock timeout on it; wrapped in a cancellation run so
     `cancel_task` (or the stuck-detector) can interrupt it mid-flight."""
-    from sandbox_agent import cancellation
+    from sandbox_agent import cancellation, chat_origin
+    # Carry the originating chat (if any) forward so sub-tasks scheduled
+    # during this cron run inherit the same origin and route back to the
+    # original chat too. Cleared on finally so it doesn't leak to the next
+    # task on this pooled worker thread.
+    chat_origin.set_current_origin(getattr(task, "origin", None))
     try:
-        with cancellation.begin_run(task.id):
-            _execute_cron_task(task, system_message, task_queue, events_before)
-    except cancellation.RunCancelled:
-        # `cancel_task` already removed the task from the queue (or the
-        # stuck-detector marked it failed); the worker just unwinds.
-        logger.info(f"Cron: task [{task.id}] run cancelled mid-flight")
-        log_event("cron_cancelled", task_id=task.id, task_name=task.name)
-        clear_state()
-    except Exception as e:
-        logger.exception(f"Cron: task [{task.id}] failed")
-        log_event("cron_failed", task_id=task.id, task_name=task.name, detail=str(e)[:300])
-        add_digest_entry(
-            project=task.project,
-            task_name=task.name,
-            summary=f"FAILED: {str(e)[:400]}",
-            source="cron",
-        )
-        task_queue.update_task(task.id, status="failed", last_error=str(e)[:500])
         try:
-            from sandbox_agent import task_notify
-            task_notify.notify_task_done(task.id, task.name, f"FAILED: {str(e)[:400]}", source="cron", ok=False)
-        except Exception:  # noqa: BLE001
-            pass
-        clear_state()
+            with cancellation.begin_run(task.id):
+                _execute_cron_task(task, system_message, task_queue, events_before)
+        except cancellation.RunCancelled:
+            # `cancel_task` already removed the task from the queue (or the
+            # stuck-detector marked it failed); the worker just unwinds.
+            logger.info(f"Cron: task [{task.id}] run cancelled mid-flight")
+            log_event("cron_cancelled", task_id=task.id, task_name=task.name)
+            clear_state()
+        except Exception as e:
+            logger.exception(f"Cron: task [{task.id}] failed")
+            log_event("cron_failed", task_id=task.id, task_name=task.name, detail=str(e)[:300])
+            add_digest_entry(
+                project=task.project,
+                task_name=task.name,
+                summary=f"FAILED: {str(e)[:400]}",
+                source="cron",
+            )
+            task_queue.update_task(task.id, status="failed", last_error=str(e)[:500])
+            try:
+                from sandbox_agent import task_notify
+                task_notify.notify_task_done(
+                    task.id, task.name, f"FAILED: {str(e)[:400]}",
+                    source="cron", ok=False, origin=getattr(task, "origin", None),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            clear_state()
+    finally:
+        chat_origin.set_current_origin(None)
 
 
 def _execute_cron_task(task, system_message: str, task_queue: TaskQueue, events_before: int) -> None:
@@ -571,7 +582,10 @@ def _execute_cron_task(task, system_message: str, task_queue: TaskQueue, events_
         )
         try:
             from sandbox_agent import task_notify
-            task_notify.notify_task_done(task.id, task.name, result_text, source="pipeline")
+            task_notify.notify_task_done(
+                task.id, task.name, result_text,
+                source="pipeline", origin=getattr(task, "origin", None),
+            )
         except Exception:  # noqa: BLE001
             pass
         logger.info(f"Cron: pipeline task [{task.id}] completed")
@@ -613,7 +627,10 @@ def _execute_cron_task(task, system_message: str, task_queue: TaskQueue, events_
     )
     try:
         from sandbox_agent import task_notify
-        task_notify.notify_task_done(task.id, task.name, digest_summary or result_text, source="cron")
+        task_notify.notify_task_done(
+            task.id, task.name, digest_summary or result_text,
+            source="cron", origin=getattr(task, "origin", None),
+        )
     except Exception:  # noqa: BLE001
         pass
     logger.info(f"Cron: task [{task.id}] completed")

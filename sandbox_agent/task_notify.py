@@ -12,12 +12,20 @@ to the UI lives in `chat_app`; nothing here knows about Chainlit.
 
 import queue
 import time
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 _events: "queue.Queue[Dict]" = queue.Queue()
 
 
-def notify_task_done(task_id: str, name: str, result: str = "", *, source: str = "cron", ok: bool = True) -> None:
+def notify_task_done(
+    task_id: str,
+    name: str,
+    result: str = "",
+    *,
+    source: str = "cron",
+    ok: bool = True,
+    origin: Optional[Dict] = None,
+) -> None:
     """Record that a background task finished. Thread-safe — called from the
     cron worker thread.
 
@@ -27,6 +35,10 @@ def notify_task_done(task_id: str, name: str, result: str = "", *, source: str =
         result: a short result/summary (truncated here to 1000 chars).
         source: "cron" | "pipeline" — for display/routing.
         ok: True on success, False if the task failed.
+        origin: chat origin `{session_id, thread_id}` if the task was scheduled
+            from a chat (passed through from `task.origin`). The notifier
+            routes the completion notice + synthetic agent turn only to that
+            session. None → fall back to broadcast (legacy behavior).
     """
     _events.put({
         "task_id": task_id,
@@ -35,6 +47,7 @@ def notify_task_done(task_id: str, name: str, result: str = "", *, source: str =
         "ts": time.time(),
         "source": source,
         "ok": ok,
+        "origin": origin,
     })
 
 

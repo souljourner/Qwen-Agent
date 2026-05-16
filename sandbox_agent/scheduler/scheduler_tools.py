@@ -100,6 +100,7 @@ class ScheduleTask(BaseTool):
             else:
                 run_at = datetime.fromisoformat(raw)
 
+        from sandbox_agent.chat_origin import current_origin
         task = tq.add_task(
             name=params["name"],
             description=params["description"],
@@ -110,6 +111,7 @@ class ScheduleTask(BaseTool):
             depends_on=params.get("depends_on"),
             priority=params.get("priority", 0),
             project=params.get("project"),
+            origin=current_origin(),  # stamp the originating chat (None if outside chat)
         )
         return json.dumps({
             "status": "scheduled",

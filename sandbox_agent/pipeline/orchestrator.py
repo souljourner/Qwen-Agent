@@ -414,12 +414,15 @@ def _schedule_stage(state: PipelineState, stage_number: int) -> None:
     task_name = f"pipeline:{state.project_name}:stage_{stage_number}"
     stage_defn = get_stages(state.pipeline_type)[stage_number]
 
+    from sandbox_agent.chat_origin import current_origin
     task = tq.add_task(
         name=task_name,
         description=f"Pipeline stage {stage_number} ({stage_defn['name']}) for {state.project_name}",
         schedule_type="at",
         run_at=datetime.now(),
         project=state.project_name,
+        origin=current_origin(),  # carries the chat that kicked off the pipeline; cron
+                                  # propagates this to subsequent stages via _run_cron_task.
     )
     state.stages[stage_number].task_id = task.id
     save_state(state)

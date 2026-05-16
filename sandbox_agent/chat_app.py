@@ -146,7 +146,15 @@ def _get_agent() -> LockingAgent:
 _DONE = object()
 
 
-def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop, run_id: str):
+def _run_agent_in_thread(
+    agent,
+    messages,
+    queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+    run_id: str,
+    session_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+):
     """Worker that drains `agent.run(messages)` and pushes each yielded chunk
     onto `queue` for the asyncio side to consume.
 
@@ -190,6 +198,13 @@ def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.Ab
         turn_usage["calls"] += 1
 
     register_usage_hook(_on_usage)
+    # Stamp this worker thread with the originating chat so that any tool the
+    # agent calls (schedule_task, start_pipeline, …) can read it via
+    # chat_origin.current_origin() and tag the task it creates. The notifier
+    # then routes that task's completion notice back to THIS session only.
+    from sandbox_agent import chat_origin
+    if session_id or thread_id:
+        chat_origin.set_current_origin({"session_id": session_id, "thread_id": thread_id})
     try:
         with cancellation.begin_run(run_id):
             for chunk in agent.run(messages=messages):
@@ -206,6 +221,7 @@ def _run_agent_in_thread(agent, messages, queue: asyncio.Queue, loop: asyncio.Ab
     finally:
         unregister_progress_hook()
         unregister_usage_hook()
+        chat_origin.set_current_origin(None)
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +288,25 @@ async def _completion_notifier_loop() -> None:
             for evt in events:
                 ui_content = _format_task_notice(evt)
                 agent_line = _format_task_notice_for_agent(evt)
-                for session in sessions:
+                # Route by origin: if the task was scheduled from a specific
+                # chat session, deliver only there. Match session_id first
+                # (same tab still open), then thread_id (reconnected tab on
+                # the same thread). If origin is set but no session matches,
+                # fall back to broadcast so the user still sees it somewhere.
+                target_sessions = sessions
+                origin = evt.get("origin") if isinstance(evt, dict) else None
+                if origin:
+                    by_session = [s for s in sessions if origin.get("session_id") and getattr(s, "id", None) == origin["session_id"]]
+                    by_thread = [s for s in sessions if origin.get("thread_id") and getattr(s, "thread_id", None) == origin["thread_id"]]
+                    matched = by_session or by_thread
+                    if matched:
+                        target_sessions = matched
+                    else:
+                        logger.info(
+                            "notifier: origin session/thread no longer open (task=%s) — broadcasting",
+                            evt.get("task_id"),
+                        )
+                for session in target_sessions:
                     try:
                         init_ws_context(session)
                         # 1. Show the user (live message in the chat).
@@ -810,9 +844,21 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
         run_id = None
     run_id = run_id or f"chat-{uuid.uuid4().hex}"
 
+    # Capture the originating session/thread on the asyncio side (cl.context is
+    # per-asyncio-Task — invalid on the worker thread). Passed into the worker
+    # which stamps `chat_origin` so any task it schedules carries this origin.
+    session_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    try:
+        if cl.context.session is not None:
+            session_id = getattr(cl.context.session, "id", None)
+            thread_id = getattr(cl.context.session, "thread_id", None)
+    except Exception:  # noqa: BLE001
+        pass
+
     threading.Thread(
         target=_run_agent_in_thread,
-        args=(agent, history, queue, loop, run_id),
+        args=(agent, history, queue, loop, run_id, session_id, thread_id),
         daemon=True,
         name="chainlit-agent-run",
     ).start()

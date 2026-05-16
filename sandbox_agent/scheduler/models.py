@@ -41,6 +41,14 @@ class Task(BaseModel):
     max_retries: int = 3
     last_error: Optional[str] = None
 
+    # Chat origin that scheduled this task — `{session_id, thread_id}` of the
+    # Chainlit session whose agent run created it. None for tasks created
+    # outside a chat (cron-spawned subtasks without parent origin, heartbeat,
+    # REPL). The notifier uses this to route the completion notice + synthetic
+    # follow-up agent turn only to the originating session, instead of
+    # broadcasting to every connected tab.
+    origin: Optional[Dict[str, Any]] = None
+
     # Timestamps
     created_at: datetime = Field(default_factory=datetime.now)
     updated_at: Optional[datetime] = None

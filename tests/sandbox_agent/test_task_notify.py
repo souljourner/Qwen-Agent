@@ -14,10 +14,20 @@ def test_notify_and_drain_fifo():
     evts = task_notify.drain()
     assert [e["task_id"] for e in evts] == ["t1", "t2"]  # FIFO
     assert evts[0] == {"task_id": "t1", "name": "task one", "result": "did a thing",
-                       "ts": evts[0]["ts"], "source": "cron", "ok": True}
+                       "ts": evts[0]["ts"], "source": "cron", "ok": True, "origin": None}
     assert evts[1]["source"] == "pipeline"
+    assert evts[1]["origin"] is None  # default when not passed
     assert task_notify.pending_count() == 0
     assert task_notify.drain() == []  # already drained
+
+
+def test_origin_is_carried_through():
+    task_notify.notify_task_done(
+        "t99", "moon-ai-bench", "result snippet",
+        source="cron", origin={"session_id": "S", "thread_id": "T"},
+    )
+    (evt,) = task_notify.drain()
+    assert evt["origin"] == {"session_id": "S", "thread_id": "T"}
 
 
 def test_failure_event():

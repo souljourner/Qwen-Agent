@@ -232,7 +232,7 @@ def stubbed_scheduler(monkeypatch):
         def __init__(self):
             self.added = []
 
-        def add_task(self, *, name, description, schedule_type, run_at, project):
+        def add_task(self, *, name, description, schedule_type, run_at, project, origin=None):
             task = _FakeTask(name, project)
             self.added.append(task)
             return task
