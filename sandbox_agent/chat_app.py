@@ -456,6 +456,16 @@ class _StreamBridge:
     # update (via _close_open_thoughts / _close_tool_with_result) + finalize()
     # flush the final state with no throttle.
     _UPDATE_THROTTLE_S = 0.2
+    # Server-side stream_token batching. The drain is fast (~66/sec) but Chainlit's
+    # React frontend re-parses markdown per stream_token event — for long messages
+    # that's ~300ms/event on the client. So 70 events/sec from the backend get
+    # rendered at ~3/sec, you watch the catch-up after the LLM finishes. Solution:
+    # accumulate per-token deltas and emit one stream_token per BATCH_INTERVAL
+    # (or sooner if the unflushed delta gets large). Each batched event = one
+    # client render, but a chunkier one — net renders go from 70/sec → ~12/sec
+    # while the visible streaming experience stays smooth.
+    _STREAM_TOKEN_BATCH_INTERVAL = 0.08   # ~12 emits/sec
+    _STREAM_TOKEN_BATCH_MAX_CHARS = 200   # also flush if unflushed delta exceeds this
 
     def __init__(self):
         # Per-message-index UI state.
@@ -466,6 +476,9 @@ class _StreamBridge:
         self._tool_by_function_id: Dict[str, "cl.Step"] = {}
         # key (matches _by_index key) → monotonic time of last awaited update()
         self._last_update: Dict = {}
+        # Per-text-message: unflushed delta + last emit time. See _stream_text.
+        self._text_pending: Dict[int, str] = {}
+        self._text_last_emit: Dict[int, float] = {}
 
     @staticmethod
     def _function_id(msg) -> Optional[str]:
@@ -571,17 +584,28 @@ class _StreamBridge:
                 delta = delta.lstrip("\n")  # trim leading newlines from the bubble
                 if not delta:
                     return
+            # Batch into ~12 emits/sec (or sooner if the buffer is large) — the
+            # client's per-event markdown re-parse can't keep up with 70/sec.
+            self._text_pending[i] = self._text_pending.get(i, "") + delta
+            now = time.monotonic()
+            last = self._text_last_emit.get(i, 0.0)
+            if (now - last) < self._STREAM_TOKEN_BATCH_INTERVAL and \
+               len(self._text_pending[i]) < self._STREAM_TOKEN_BATCH_MAX_CHARS:
+                return  # keep accumulating; finalize() will flush leftovers
+            batched = self._text_pending[i]
+            self._text_pending[i] = ""
+            self._text_last_emit[i] = now
             if _DEBUG_TIMING:
                 _t = time.monotonic()
-                await state["obj"].stream_token(delta)
+                await state["obj"].stream_token(batched)
                 dt = (time.monotonic() - _t) * 1000.0
                 self._dbg_n_stream_token = getattr(self, "_dbg_n_stream_token", 0) + 1
                 if dt > getattr(self, "_dbg_peak_stream_token_ms", 0.0):
                     self._dbg_peak_stream_token_ms = dt
                 if dt > 50:
-                    logger.info("stream_token slow: delta_len=%d dt=%.1fms", len(delta), dt)
+                    logger.info("stream_token slow: batched_len=%d dt=%.1fms", len(batched), dt)
             else:
-                await state["obj"].stream_token(delta)
+                await state["obj"].stream_token(batched)
 
     async def finalize(self) -> None:
         """End-of-run cleanup. Calls update() on each streamed element so the
@@ -590,6 +614,19 @@ class _StreamBridge:
         sets `end` on any cl.Step that's still "running" so its spinner clears
         — covers thought steps (no natural close event) and tool steps whose
         result never came back."""
+        # Flush any text deltas that were batched but not yet emitted (the
+        # accumulator in _stream_text holds back small/fresh deltas).
+        for i, pending in list(self._text_pending.items()):
+            if not pending:
+                continue
+            state = self._by_index.get(i)
+            if state and state.get("kind") == "text":
+                try:
+                    await state["obj"].stream_token(pending)
+                except Exception:  # noqa: BLE001
+                    logger.debug("finalize: flushing pending text failed", exc_info=True)
+            self._text_pending[i] = ""
+
         for state in self._by_index.values():
             obj = state.get("obj")
             if obj is None:
