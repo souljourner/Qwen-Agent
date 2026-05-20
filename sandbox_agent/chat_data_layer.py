@@ -175,4 +175,8 @@ def _ensure_sqlite_schema(conninfo: str) -> None:
 def make_data_layer() -> SQLAlchemyDataLayer:
     conninfo = resolve_conninfo()
     _ensure_sqlite_schema(conninfo)
-    return SQLAlchemyDataLayer(conninfo=conninfo)
+    # storage_provider lets create_element persist element blobs (images/PDFs from
+    # display_doc) so they survive a reload — without it Chainlit drops elements
+    # entirely. LocalFsStorageClient stores them under DATA_DIR/.cl_elements.
+    from sandbox_agent.chat_storage import LocalFsStorageClient
+    return SQLAlchemyDataLayer(conninfo=conninfo, storage_provider=LocalFsStorageClient())

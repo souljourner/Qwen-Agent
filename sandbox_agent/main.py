@@ -46,6 +46,7 @@ import sandbox_agent.tools.exec_tool  # noqa: F401
 import sandbox_agent.chat_logger  # noqa: F401 (registers list_chat_logs, read_chat_log)
 import sandbox_agent.tools.project_tools  # noqa: F401
 import sandbox_agent.tools.notification_tools  # noqa: F401
+import sandbox_agent.tools.display_tools  # noqa: F401
 import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 

@@ -48,12 +48,14 @@ import sandbox_agent.tools.project_tools  # noqa: F401
 import sandbox_agent.tools.notification_tools  # noqa: F401
 import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
+import sandbox_agent.tools.display_tools  # noqa: F401
 
 from qwen_agent.llm.schema import ContentItem, Message
 
 from sandbox_agent.chat_data_layer import make_data_layer
 from sandbox_agent.chat_logger import log_turn
 from sandbox_agent.tools.code_interpreter import register_progress_hook, unregister_progress_hook
+from sandbox_agent.tools.display_tools import register_display_hook, unregister_display_hook
 from qwen_agent.llm.oai import register_usage_hook, unregister_usage_hook
 from sandbox_agent.config import (
     BACKGROUND_LLM_CFG,
@@ -68,6 +70,31 @@ from sandbox_agent.main import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Serve persisted Chainlit element blobs (display_doc images / PDFs / files) so
+# they survive a page reload. LocalFsStorageClient writes them under
+# DATA_DIR/.cl_elements and hands the data layer /cl-elements/<key> URLs; this
+# route serves those bytes — same origin as Chainlit (:7860), so no CORS. The
+# {object_key:path} matcher captures the slash in Chainlit's "<user>/<elem>" keys;
+# resolve_object_path() rejects traversal.
+try:
+    from chainlit.server import app as _cl_app
+    from fastapi import HTTPException as _HTTPException
+    from fastapi.responses import FileResponse as _FileResponse
+    from sandbox_agent.chat_storage import resolve_object_path as _resolve_object_path
+
+    @_cl_app.get("/cl-elements/{object_key:path}")
+    async def _serve_cl_element(object_key: str):
+        try:
+            full = _resolve_object_path(object_key)
+        except ValueError:
+            raise _HTTPException(status_code=400, detail="bad object key")
+        if not os.path.isfile(full):
+            raise _HTTPException(status_code=404, detail="not found")
+        return _FileResponse(full)
+except Exception:  # noqa: BLE001 — never let route setup break app import
+    logger.exception("Failed to mount /cl-elements route; persisted element reload may not work")
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +216,9 @@ def _run_agent_in_thread(
     # as ("tool_progress", text) so the on_message coroutine can show it on the
     # live tool step. Cleared in `finally` so it doesn't leak to a later run.
     register_progress_hook(lambda text: _push(("tool_progress", text)))
+    # display_doc pushes ("display_doc", payload) so the doc is rendered to the
+    # user out-of-band — its content never enters the agent's message stream.
+    register_display_hook(lambda payload: _push(("display_doc", payload)))
 
     # Aggregate per-call vLLM usage across all _call_llm invocations in this turn
     # (a turn often makes several — reasoning, then per-tool, then the final answer).
@@ -231,6 +261,7 @@ def _run_agent_in_thread(
         _push(("error", e))
     finally:
         unregister_progress_hook()
+        unregister_display_hook()
         unregister_usage_hook()
         chat_origin.set_current_origin(None)
 
@@ -514,12 +545,17 @@ async def on_chat_resume(thread):
             else:
                 history.append(Message(role="user", content=output))
         elif step_type in ("assistant_message", "assistant", "ai", "llm"):
+            author = (step.get("name") or "").lower()
+            # display_doc output is persisted (so it reloads in the UI) but must
+            # NEVER re-enter the agent's context — skip it from the rebuild.
+            if author == "document":
+                continue
             # Background-task completion notices are persisted with
             # author="background task". Symmetric with the live path: rebuild
             # them as role="user" with a `[system event]` tag (vLLM rejects
             # mid-thread role="system" with HTTP 400 — see the live-path
             # comment in _format_task_notice_for_agent).
-            if (step.get("name") or "").lower() == "background task":
+            if author == "background task":
                 first_line = output.strip().splitlines()[0] if output.strip() else ""
                 # strip leading emoji + markdown bold for a clean system line
                 clean = first_line.replace("**", "").lstrip("✅⚠️ ").strip()
@@ -807,6 +843,32 @@ class _StreamBridge:
         except Exception:  # noqa: BLE001
             logger.debug("StreamBridge: update_running_tool failed", exc_info=True)
 
+    async def display_document(self, payload: dict) -> None:
+        """Render a display_doc payload to the user — out-of-band from the agent's
+        message stream, so the content never enters the agent's context. Sent with
+        author='document' so on_chat_resume skips it on reload (shown to the user,
+        never fed back to the model). Text persists as message content (no storage
+        client needed); image/pdf/file ride as elements (persisted via
+        LocalFsStorageClient → reloadable)."""
+        kind = payload.get("kind")
+        name = payload.get("name") or "document"
+        path = payload.get("path")
+        try:
+            if kind == "text":
+                await cl.Message(content=payload.get("text") or "(empty file)",
+                                 author="document").send()
+            elif kind == "image":
+                await cl.Message(content=f"📄 {name}", author="document",
+                                 elements=[cl.Image(path=path, name=name, display="inline")]).send()
+            elif kind == "pdf":
+                await cl.Message(content=f"📄 {name}", author="document",
+                                 elements=[cl.Pdf(path=path, name=name, display="inline")]).send()
+            else:
+                await cl.Message(content=f"📄 {name}", author="document",
+                                 elements=[cl.File(path=path, name=name)]).send()
+        except Exception:  # noqa: BLE001 — a render failure shouldn't kill the turn
+            logger.exception("display_document: failed to render %s (kind=%s)", name, kind)
+
     async def _close_tool_with_result(self, msg) -> None:
         function_id = self._function_id(msg)
         target_step = None
@@ -911,6 +973,10 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
                 return
             if kind == "usage_summary":
                 turn_usage = payload  # stash; applied just before finalize
+                continue
+            if kind == "display_doc":
+                # display_doc tool — render the file to the user out-of-band.
+                await bridge.display_document(payload)
                 continue
             if kind == "tool_progress":
                 # Live stdout from a running code_interpreter call. Drain any

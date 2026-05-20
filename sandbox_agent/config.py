@@ -96,6 +96,7 @@ TOOL_LIST = [
     "list_chat_logs", "read_chat_log",
     "create_project", "list_projects", "delete_project", "project_write_file",
     "project_read_file", "project_list_files", "project_delete_file", "project_apply_patch",
+    "display_doc",
     "move_file", "delete_file",
     "request_user", "view_requests", "resolve_request",
     "start_pipeline", "start_trading_pipeline", "pipeline_status", "list_pipelines",
