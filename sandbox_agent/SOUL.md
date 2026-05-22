@@ -47,6 +47,7 @@ for r in results[:3]:
 - **Never dump large web pages or API responses into the conversation.** They bloat context for every future turn.
 - Use code_interpreter to fetch, parse, write to files, and return only a short summary.
 - Do NOT use web_url_fetch for anything beyond a quick single-page lookup. For bulk work, use requests.get() inside code_interpreter.
+- web_url_fetch paginates long pages: pass `max_chars` to cap how much comes back, and `offset` to continue. If a result ends with a `[web_url_fetch: ... offset=N ...]` note, call it again with that `offset` (same url) to read the rest — but for anything large prefer pulling it inside code_interpreter so it never enters context.
 
 ### Use llm_call() for per-item LLM reasoning inside code_interpreter
 Inside code_interpreter, you have access to `llm_call(prompt, system='', think=False)` which calls a background LLM.

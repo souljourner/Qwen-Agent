@@ -32,11 +32,18 @@ def _rate_limit_brave_search():
         _brave_search_last_call = time.monotonic()
 
 
-def _call_tool_api(tool_name: str, arguments: dict, timeout: int = API_TIMEOUT) -> str:
+def _call_tool_api(tool_name: str,
+                   arguments: dict,
+                   timeout: int = API_TIMEOUT,
+                   return_obj: bool = False) -> Union[str, dict, list]:
     """Call the local tools API via SSE and return the result.
 
     POST /api/tools/execute with {"name": tool_name, "arguments": {...}}
     Parses SSE stream: collects event:result data.
+
+    If ``return_obj`` is True, success results are returned as the parsed
+    ``results`` object (dict/list) instead of a JSON-dumped string. Errors are
+    always returned as an "Error: ..." string regardless of ``return_obj``.
     """
     url = f"{TOOLS_API_BASE}/api/tools/execute"
     payload = {"name": tool_name, "arguments": arguments}
@@ -91,8 +98,12 @@ def _call_tool_api(tool_name: str, arguments: dict, timeout: int = API_TIMEOUT) 
         return f"Error: {result_data['error']}"
 
     if isinstance(result_data, dict) and "results" in result_data:
+        if return_obj:
+            return result_data["results"]
         return json.dumps(result_data["results"], ensure_ascii=False, indent=2)
 
+    if return_obj:
+        return result_data
     return json.dumps(result_data, ensure_ascii=False, indent=2)
 
 
@@ -120,27 +131,77 @@ class BraveWebSearch(BaseTool):
         return sanitize_web_content(raw_result)
 
 
+def _format_fetch_result(results: dict) -> str:
+    """Sanitize the fetched page content and append a pagination hint.
+
+    The server returns {"content", "total_chars", "offset", "returned_chars",
+    "has_more", ...}. Only the page content is run through sanitize_web_content
+    (it's untrusted web text); the pagination hint we generate ourselves is
+    appended after the [TOOL_OUTPUT] delimiters so it stays trusted.
+    """
+    content = results.get("content") or ""
+    body = sanitize_web_content(content)
+
+    if results.get("has_more"):
+        offset = results.get("offset") or 0
+        returned = results.get("returned_chars")
+        if returned is None:
+            returned = len(content)
+        total = results.get("total_chars")
+        next_offset = offset + returned
+        remaining = f"{total - next_offset} more chars" if isinstance(total, int) else "more content"
+        body += (f"\n\n[web_url_fetch: showing chars {offset}-{next_offset} of {total}. "
+                 f"{remaining} available — call again with the same url and offset={next_offset} "
+                 f"to continue.]")
+    return body
+
+
 @register_tool("web_url_fetch")
 class WebUrlFetch(BaseTool):
     """Fetch a URL and return its content as markdown."""
 
     name = "web_url_fetch"
-    description = "Fetch a URL and return its content as markdown or plain text."
+    description = (
+        "Fetch a single web page and return its text content as markdown. Best for a quick "
+        "lookup of one page. Long pages are paginated: the result reports how many characters "
+        "are left and gives you the offset to continue from. For fetching many URLs or doing "
+        "bulk/heavy processing, use requests.get() inside code_interpreter instead — that keeps "
+        "the raw content out of your context.")
     parameters = {
         "type": "object",
         "properties": {
             "url": {
                 "type": "string",
                 "description": "The URL to fetch.",
-            }
+            },
+            "offset": {
+                "type": "integer",
+                "description": ("Character offset to start from within the page's content. "
+                                "Use it to page through a long page (default 0)."),
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": ("Maximum number of characters to return from the offset. Omit to "
+                                "return as much as available; if the page is longer the result is "
+                                "flagged so you can fetch the rest with a larger offset."),
+            },
         },
         "required": ["url"],
     }
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
         params = self._verify_json_format_args(params)
-        raw_result = _call_tool_api("web_url_fetch", {"url": params["url"]})
-        return sanitize_web_content(raw_result)
+        args = {"url": params["url"]}
+        if params.get("offset") is not None:
+            args["offset"] = params["offset"]
+        if params.get("max_chars") is not None:
+            args["max_chars"] = params["max_chars"]
+        result = _call_tool_api("web_url_fetch", args, return_obj=True)
+        if isinstance(result, str):
+            return result  # error string ("Error: ...") or "(no result ...)"
+        if isinstance(result, dict):
+            return _format_fetch_result(result)
+        return sanitize_web_content(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 @register_tool("stock_price")

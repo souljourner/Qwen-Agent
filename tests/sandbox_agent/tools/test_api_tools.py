@@ -119,7 +119,12 @@ class TestToolSchemas:
         tool = WebUrlFetch()
         func = tool.function
         assert func["name"] == "web_url_fetch"
-        assert "url" in func["parameters"]["properties"]
+        props = func["parameters"]["properties"]
+        assert "url" in props
+        # New paginated signature
+        assert "offset" in props
+        assert "max_chars" in props
+        assert func["parameters"]["required"] == ["url"]
 
     def test_stock_price_schema(self):
         from sandbox_agent.tools.api_tools import StockPrice
@@ -127,3 +132,85 @@ class TestToolSchemas:
         func = tool.function
         assert func["name"] == "stock_price"
         assert "symbol" in func["parameters"]["properties"]
+
+
+def _fetch_sse(results: dict):
+    """Build a FakeResponse carrying a web_url_fetch result envelope."""
+    return FakeResponse([
+        "event: result",
+        f"data: {json.dumps({'results': results})}",
+        "",
+    ])
+
+
+class TestWebUrlFetch:
+
+    def test_forwards_offset_and_max_chars(self):
+        from sandbox_agent.tools.api_tools import WebUrlFetch
+        captured = {}
+
+        def fake_api(tool_name, arguments, **kwargs):
+            captured["name"] = tool_name
+            captured["args"] = arguments
+            return {"content": "hi", "total_chars": 2, "offset": 5, "returned_chars": 2, "has_more": False}
+
+        with patch("sandbox_agent.tools.api_tools._call_tool_api", side_effect=fake_api):
+            WebUrlFetch().call({"url": "http://x", "offset": 5, "max_chars": 100})
+
+        assert captured["name"] == "web_url_fetch"
+        assert captured["args"] == {"url": "http://x", "offset": 5, "max_chars": 100}
+
+    def test_omits_unset_optional_params(self):
+        from sandbox_agent.tools.api_tools import WebUrlFetch
+        captured = {}
+
+        def fake_api(tool_name, arguments, **kwargs):
+            captured["args"] = arguments
+            return {"content": "hi", "total_chars": 2, "offset": 0, "returned_chars": 2, "has_more": False}
+
+        with patch("sandbox_agent.tools.api_tools._call_tool_api", side_effect=fake_api):
+            WebUrlFetch().call({"url": "http://x"})
+
+        assert captured["args"] == {"url": "http://x"}  # no offset / max_chars keys
+
+    @patch("sandbox_agent.tools.api_tools.requests.post")
+    def test_extracts_content_not_raw_json(self, mock_post):
+        from sandbox_agent.tools.api_tools import WebUrlFetch
+        mock_post.return_value = _fetch_sse({
+            "url": "http://x", "content": "# Heading\n\nbody text",
+            "content_type": "markdown", "total_chars": 20, "offset": 0,
+            "returned_chars": 20, "has_more": False,
+        })
+        out = WebUrlFetch().call({"url": "http://x"})
+        assert "# Heading" in out
+        assert "body text" in out
+        assert "[TOOL_OUTPUT]" in out          # sanitizer wrapped the content
+        assert "\"total_chars\"" not in out      # metadata not dumped to the model
+        assert "web_url_fetch:" not in out       # no pagination hint when has_more=False
+
+    @patch("sandbox_agent.tools.api_tools.requests.post")
+    def test_pagination_hint_when_has_more(self, mock_post):
+        from sandbox_agent.tools.api_tools import WebUrlFetch
+        mock_post.return_value = _fetch_sse({
+            "url": "http://x", "content": "first chunk",
+            "content_type": "markdown", "total_chars": 34024, "offset": 0,
+            "returned_chars": 500, "has_more": True,
+        })
+        out = WebUrlFetch().call({"url": "http://x", "max_chars": 500})
+        assert "first chunk" in out
+        assert "offset=500" in out               # next page offset = offset + returned_chars
+        assert "34024" in out
+        # hint sits outside the sanitized tool-output block
+        assert out.index("[/TOOL_OUTPUT]") < out.index("web_url_fetch:")
+
+    @patch("sandbox_agent.tools.api_tools.requests.post")
+    def test_error_passes_through(self, mock_post):
+        from sandbox_agent.tools.api_tools import WebUrlFetch
+        mock_post.return_value = FakeResponse([
+            "event: result",
+            'data: {"error": "fetch failed"}',
+            "",
+        ])
+        out = WebUrlFetch().call({"url": "http://x"})
+        assert "Error: fetch failed" in out
+        assert "[TOOL_OUTPUT]" not in out
