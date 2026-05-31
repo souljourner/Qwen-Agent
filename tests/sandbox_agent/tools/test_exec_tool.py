@@ -119,3 +119,67 @@ class TestOutputTruncation:
             "command": "python3 -c \"print('x' * 100000)\"",
         }))
         assert "TRUNCATED" in result or "truncated" in result.lower() or len(result) < 100000
+
+
+class TestProjectVenv:
+    """Per-project venv isolation: exec with project= activates that project's
+    .venv so pip installs and `python` are isolated from other projects."""
+
+    def _mk_venv(self, project_dir):
+        bindir = os.path.join(project_dir, ".venv", "bin")
+        os.makedirs(bindir, exist_ok=True)
+        open(os.path.join(bindir, "python"), "w").close()
+        return os.path.join(project_dir, ".venv")
+
+    def test_activates_when_venv_exists(self, tmp_path):
+        import sandbox_agent.tools.exec_tool as et
+        proj = str(tmp_path / "proj")
+        venv = self._mk_venv(proj)
+        base = {"PATH": "/usr/bin", "PYTHONHOME": "/should/be/removed"}
+        env = et._project_venv_env(base, proj)
+        assert env["VIRTUAL_ENV"] == venv
+        assert env["PATH"].startswith(os.path.join(venv, "bin") + os.pathsep)
+        assert "PYTHONHOME" not in env          # cleared so the venv python wins
+        assert base.get("PATH") == "/usr/bin"   # original not mutated
+
+    def test_noop_when_no_venv(self, tmp_path):
+        import sandbox_agent.tools.exec_tool as et
+        proj = str(tmp_path / "proj")
+        os.makedirs(proj)
+        base = {"PATH": "/usr/bin"}
+        env = et._project_venv_env(base, proj)
+        assert "VIRTUAL_ENV" not in env
+        assert env["PATH"] == "/usr/bin"
+
+    def test_ensure_skips_when_venv_present(self, tmp_path, monkeypatch):
+        import sandbox_agent.tools.exec_tool as et
+        proj = str(tmp_path / "proj")
+        self._mk_venv(proj)
+        calls = []
+        monkeypatch.setattr(et.subprocess, "run", lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(et, "PROJECT_VENV_ENABLED", True)
+        et._ensure_project_venv(proj)
+        assert calls == []   # already there → don't invoke uv
+
+    def test_ensure_disabled_by_flag(self, tmp_path, monkeypatch):
+        import sandbox_agent.tools.exec_tool as et
+        proj = str(tmp_path / "proj")
+        os.makedirs(proj)
+        calls = []
+        monkeypatch.setattr(et.subprocess, "run", lambda *a, **k: calls.append(a))
+        monkeypatch.setattr(et, "PROJECT_VENV_ENABLED", False)
+        et._ensure_project_venv(proj)
+        assert calls == []
+
+    def test_ensure_creates_with_uv_when_missing(self, tmp_path, monkeypatch):
+        import sandbox_agent.tools.exec_tool as et
+        proj = str(tmp_path / "proj")
+        os.makedirs(proj)
+        calls = []
+        monkeypatch.setattr(et.subprocess, "run", lambda *a, **k: calls.append(list(a[0])))
+        monkeypatch.setattr(et, "PROJECT_VENV_ENABLED", True)
+        monkeypatch.setattr(et, "UV_BIN", "uv")
+        et._ensure_project_venv(proj)
+        assert len(calls) == 1
+        assert calls[0][:2] == ["uv", "venv"]
+        assert calls[0][2].endswith(os.path.join("proj", ".venv"))

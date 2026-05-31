@@ -154,6 +154,12 @@ def _ensure_sqlite_schema(conninfo: str) -> None:
         return
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     with sqlite3.connect(db_path) as conn:
+        # WAL is a persistent property of the DB file. Switch it on once here so
+        # concurrent readers don't block the single writer — without it every
+        # Chainlit persist (fire-and-forget create_step/update_step tasks, dozens
+        # per multi-step turn) contends on a global lock, exhausting the
+        # connection pool and starving the event loop that streams tokens.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_CHAINLIT_SCHEMA_SQL)
         conn.commit()
 
@@ -172,6 +178,33 @@ def _ensure_sqlite_schema(conninfo: str) -> None:
     logger.info("Chainlit SQLite schema applied at %s", db_path)
 
 
+def _harden_sqlite_engine(engine) -> None:
+    """Apply SQLite pragmas to every pooled connection.
+
+    Chainlit persists each step send/update via a fire-and-forget
+    `asyncio.create_task(data_layer.update_step(...))` — a chatty multi-step
+    turn spawns dozens of concurrent DB writes. In the default journal_mode
+    (DELETE) each write locks the whole file, so those tasks block on the lock
+    while holding one of the engine's 15 pooled connections; the pool exhausts
+    ("QueuePool limit ... reached, connection timed out") and the aiosqlite
+    worker threads thrash the GIL, starving the event loop that emits stream
+    tokens — the chat lags to ~1 token / 5s. WAL lets readers run during a
+    write; busy_timeout makes the rare writer-vs-writer clash wait instead of
+    erroring; synchronous=NORMAL drops the per-write fsync (safe under WAL).
+    """
+    from sqlalchemy import event
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=30000")
+            cur.execute("PRAGMA synchronous=NORMAL")
+        finally:
+            cur.close()
+
+
 def make_data_layer() -> SQLAlchemyDataLayer:
     conninfo = resolve_conninfo()
     _ensure_sqlite_schema(conninfo)
@@ -179,4 +212,9 @@ def make_data_layer() -> SQLAlchemyDataLayer:
     # display_doc) so they survive a reload — without it Chainlit drops elements
     # entirely. LocalFsStorageClient stores them under DATA_DIR/.cl_elements.
     from sandbox_agent.chat_storage import LocalFsStorageClient
-    return SQLAlchemyDataLayer(conninfo=conninfo, storage_provider=LocalFsStorageClient())
+    dl = SQLAlchemyDataLayer(conninfo=conninfo, storage_provider=LocalFsStorageClient())
+    # Harden the SQLite connection pool against write-lock contention (the cause
+    # of the QueuePool-exhaustion + streaming-lag). No-op for non-SQLite backends.
+    if _sqlite_path_from_conninfo(conninfo):
+        _harden_sqlite_engine(dl.engine)
+    return dl

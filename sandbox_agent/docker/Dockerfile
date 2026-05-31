@@ -19,6 +19,11 @@ RUN pip install --no-cache-dir "/app/Qwen-Agent[gui]" croniter numpy soundfile \
     pandas requests Pillow beautifulsoup4 lxml \
     chainlit aiosqlite "sqlalchemy>=2.0"
 
+# uv = default package manager for per-project venvs (cache-backed, near-instant
+# re-installs). Its own layer so it doesn't bust the heavy install above — keeps
+# rebuilds fast.
+RUN pip install --no-cache-dir uv
+
 # Copy sandbox_agent
 COPY sandbox_agent/ /app/sandbox_agent/
 

@@ -614,6 +614,12 @@ class _StreamBridge:
         # Per-text-message: unflushed delta + last emit time. See _stream_text.
         self._text_pending: Dict[int, str] = {}
         self._text_last_emit: Dict[int, float] = {}
+        # Tool steps whose result has already been applied. consume() re-scans
+        # the full cumulative thread on every chunk, so without this a finished
+        # tool result would be re-update()d (socket emit + DB persist of the
+        # whole step) on every subsequent chunk — O(tool count) wasted writes
+        # per chunk that bog the event loop down as a multi-tool turn grows.
+        self._resolved_tool_steps: set = set()
 
     @staticmethod
     def _function_id(msg) -> Optional[str]:
@@ -732,15 +738,12 @@ class _StreamBridge:
             self._text_last_emit[i] = now
             await state["obj"].stream_token(batched)
 
-    async def finalize(self) -> None:
-        """End-of-run cleanup. Calls update() on each streamed element so the
-        final content is persisted (Chainlit's stream_token does not persist
-        on its own — explicit update is required after the last token), and
-        sets `end` on any cl.Step that's still "running" so its spinner clears
-        — covers thought steps (no natural close event) and tool steps whose
-        result never came back."""
-        # Flush any text deltas that were batched but not yet emitted (the
-        # accumulator in _stream_text holds back small/fresh deltas).
+    async def flush_pending_text(self) -> None:
+        """Emit any text deltas the batcher is still holding back (small/fresh
+        deltas accumulated in _stream_text). Must be called before the per-turn
+        stats footer is appended to the last message — otherwise the footer is
+        inserted ahead of the still-pending tail and ends up spliced into the
+        middle of the model's final sentence."""
         for i, pending in list(self._text_pending.items()):
             if not pending:
                 continue
@@ -749,8 +752,19 @@ class _StreamBridge:
                 try:
                     await state["obj"].stream_token(pending)
                 except Exception:  # noqa: BLE001
-                    logger.debug("finalize: flushing pending text failed", exc_info=True)
+                    logger.debug("flush_pending_text: flushing pending text failed", exc_info=True)
             self._text_pending[i] = ""
+
+    async def finalize(self) -> None:
+        """End-of-run cleanup. Calls update() on each streamed element so the
+        final content is persisted (Chainlit's stream_token does not persist
+        on its own — explicit update is required after the last token), and
+        sets `end` on any cl.Step that's still "running" so its spinner clears
+        — covers thought steps (no natural close event) and tool steps whose
+        result never came back."""
+        # Flush any text deltas still batched (no-op if already flushed before
+        # the footer was appended).
+        await self.flush_pending_text()
 
         for state in self._by_index.values():
             obj = state.get("obj")
@@ -875,14 +889,23 @@ class _StreamBridge:
         if function_id:
             target_step = self._tool_by_function_id.get(function_id)
         if target_step is None:
-            # Fallback: most recent open tool step with matching name.
+            # Fallback: most recent matching-name tool step we haven't resolved
+            # yet (skip already-resolved ones so repeat calls of the same-named
+            # tool each pair with their own step).
             tool_name = getattr(msg, "name", None)
             for state in reversed(list(self._by_index.values())):
-                if state.get("kind") == "tool" and state.get("name") == tool_name:
+                if (state.get("kind") == "tool" and state.get("name") == tool_name
+                        and id(state["obj"]) not in self._resolved_tool_steps):
                     target_step = state["obj"]
                     break
         if target_step is None:
             return
+        # Apply the result exactly once. consume() re-scans the whole thread per
+        # chunk; re-running update() here every time is what made long multi-tool
+        # turns crawl to ~2 tok/s.
+        if id(target_step) in self._resolved_tool_steps:
+            return
+        self._resolved_tool_steps.add(id(target_step))
         result = getattr(msg, "content", "")
         if not isinstance(result, str):
             result = str(result)
@@ -1010,6 +1033,11 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
                 break
             final_response = payload
             await bridge.consume(payload)
+
+        # Flush any text the batcher is still holding back BEFORE appending the
+        # footer — otherwise the footer is spliced ahead of the pending tail and
+        # lands in the middle of the model's last sentence.
+        await bridge.flush_pending_text()
 
         # Append the context-usage footer to the last assistant text bubble
         # (right above the feedback buttons). finalize() below sends the

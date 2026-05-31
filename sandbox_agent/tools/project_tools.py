@@ -173,6 +173,105 @@ class DeleteProject(BaseTool):
         return f"Deleted project '{params['project']}' ({file_count} files removed)"
 
 
+@register_tool("rename_project")
+class RenameProject(BaseTool):
+    """Rename an existing project (folder + metadata); files are preserved."""
+
+    name = "rename_project"
+    description = (
+        "Rename an existing project. Renames the project's folder and updates its metadata; "
+        "all files inside are preserved. The new name is slugified the same way as "
+        "create_project (lowercased, spaces become hyphens). Fails if a project with the "
+        "new name already exists."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "description": "Current project name.",
+            },
+            "new_name": {
+                "type": "string",
+                "description": "New project name (e.g., 'q3-launch-plan').",
+            },
+        },
+        "required": ["project", "new_name"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        try:
+            src = _project_dir(params["project"])
+            dst = _project_dir(params["new_name"])
+        except ValueError as e:
+            return f"Error: {e}"
+
+        if not os.path.exists(src):
+            return f"Project '{params['project']}' not found."
+        if os.path.abspath(src) == os.path.abspath(dst):
+            return f"Project is already named '{os.path.basename(dst)}'."
+        if os.path.exists(dst):
+            return f"A project named '{os.path.basename(dst)}' already exists."
+
+        shutil.move(src, dst)
+
+        # Keep metadata in sync with the new name.
+        meta = _load_meta(dst)
+        meta["name"] = params["new_name"]
+        meta["updated_at"] = datetime.now().isoformat()
+        _save_meta(dst, meta)
+
+        old_slug, new_slug = os.path.basename(src), os.path.basename(dst)
+        autocommit("projects/", f"Rename project '{old_slug}' → '{new_slug}'")
+        return f"Renamed project '{old_slug}' → '{new_slug}'"
+
+
+@register_tool("update_project")
+class UpdateProject(BaseTool):
+    """Update a project's description in its metadata (does not rename or touch files)."""
+
+    name = "update_project"
+    description = (
+        "Update a project's description (the summary shown by list_projects). Use this to "
+        "revise a project's goal after creation. Does not rename the project (use "
+        "rename_project for that) and does not modify README.md or any other files."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "description": "Project name.",
+            },
+            "description": {
+                "type": "string",
+                "description": "New project description.",
+            },
+        },
+        "required": ["project", "description"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        try:
+            pdir = _project_dir(params["project"])
+        except ValueError as e:
+            return f"Error: {e}"
+
+        if not os.path.exists(pdir):
+            return f"Project '{params['project']}' not found."
+
+        meta = _load_meta(pdir)
+        meta["description"] = params["description"]
+        meta["updated_at"] = datetime.now().isoformat()
+        _save_meta(pdir, meta)
+
+        slug = os.path.basename(pdir)
+        autocommit(f"projects/{slug}/.project.json", f"Update description for project '{slug}'")
+        return f"Updated description for project '{slug}'."
+
+
 @register_tool("project_write_file")
 class ProjectWriteFile(BaseTool):
     """Write, append, or overwrite a file in a project workspace."""

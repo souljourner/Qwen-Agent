@@ -83,6 +83,14 @@ COMPACTION_TIMEOUT = int(os.getenv("COMPACTION_TIMEOUT", "120"))
 COMPACTION_MODEL = os.getenv("COMPACTION_MODEL", "qwen3.6-27b-linux")
 COMPACTION_URL = os.getenv("COMPACTION_URL", "http://192.168.4.66:8000")
 
+# Per-project dependency isolation: `exec` with project= runs inside that
+# project's own .venv (created with uv), so projects can't clobber each other's
+# packages. UV is the default package manager (cache-backed → near-instant
+# re-installs). Set PROJECT_VENV_ENABLED=false to fall back to the shared
+# global environment.
+PROJECT_VENV_ENABLED = os.getenv("PROJECT_VENV_ENABLED", "true").lower() == "true"
+UV_BIN = os.getenv("UV_BIN", "uv")
+
 TOOLS_API_BASE = os.getenv("TOOLS_API_BASE", "http://localhost:8080")
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "3600"))  # 1 hour
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
@@ -94,7 +102,7 @@ TOOL_LIST = [
     "read_memories", "add_memory",
     "code_interpreter", "exec",
     "list_chat_logs", "read_chat_log",
-    "create_project", "list_projects", "delete_project", "project_write_file",
+    "create_project", "list_projects", "delete_project", "rename_project", "update_project", "project_write_file",
     "project_read_file", "project_list_files", "project_delete_file", "project_apply_patch",
     "display_doc",
     "move_file", "delete_file",

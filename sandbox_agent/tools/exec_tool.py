@@ -14,10 +14,41 @@ from typing import Union
 
 from qwen_agent.tools.base import BaseTool, register_tool
 
-from sandbox_agent.config import DATA_DIR
+from sandbox_agent.config import DATA_DIR, PROJECT_VENV_ENABLED, UV_BIN
 from sandbox_agent.token_budget import truncate_output
 
 logger = logging.getLogger(__name__)
+
+
+def _project_venv_env(base_env: dict, workdir: str) -> dict:
+    """If `workdir` has a usable `.venv`, return a COPY of base_env with that
+    venv activated — VIRTUAL_ENV set, its bin/ prepended to PATH, PYTHONHOME
+    cleared — so `python`, `pip`, and `uv pip` target the project's own
+    environment. Returns base_env unchanged if there's no venv."""
+    bindir = os.path.join(workdir, ".venv", "bin")
+    if not os.path.isdir(bindir):
+        return base_env
+    env = dict(base_env)
+    env["VIRTUAL_ENV"] = os.path.join(workdir, ".venv")
+    env["PATH"] = bindir + os.pathsep + env.get("PATH", "")
+    env.pop("PYTHONHOME", None)
+    return env
+
+
+def _ensure_project_venv(workdir: str) -> None:
+    """Create `workdir/.venv` with `uv venv` if it's missing. Best-effort:
+    uv's hardlink cache makes this near-instant, but if uv is unavailable or
+    fails we log and return — exec then falls back to the shared global env."""
+    if not PROJECT_VENV_ENABLED:
+        return
+    venv_path = os.path.join(workdir, ".venv")
+    if os.path.isdir(os.path.join(venv_path, "bin")):
+        return  # already present
+    try:
+        subprocess.run([UV_BIN, "venv", venv_path], cwd=workdir,
+                       capture_output=True, timeout=120, check=False)
+    except (FileNotFoundError, OSError, subprocess.SubprocessError) as e:
+        logger.warning("Could not create project venv at %s (%s) — using global env", venv_path, e)
 
 
 def kill_process_group(proc: "subprocess.Popen") -> None:
@@ -84,11 +115,16 @@ class ExecTool(BaseTool):
     name = "exec"
     description = (
         "Run a shell command. Supports pipes, redirects, && chains. "
-        "Use for: npm/pip install, build tools, git, file operations, starting servers, "
+        "Use for: package installs, build tools, git, file operations, starting servers, "
         "running tests, and any CLI tool. "
         "For Python data work and llm_call(), prefer code_interpreter. "
         "For building apps: use exec for installs and builds, project_write_file for source code. "
-        "Commands run in DATA_DIR by default, or in a project directory if 'project' is set."
+        "ALWAYS pass 'project' for project work: it runs in that project's own .venv so "
+        "dependencies are isolated from other projects (and pipelines don't clobber each "
+        "other). Use uv for packages — `uv pip install <pkg>` and `uv venv` — it's the default "
+        "package manager and is cache-backed (near-instant re-installs). The project venv is "
+        "auto-created on first use and is already activated, so `python`/`pip` also target it. "
+        "Commands run in DATA_DIR by default, or in the project directory if 'project' is set."
     )
     parameters = {
         "type": "object",
@@ -119,7 +155,8 @@ class ExecTool(BaseTool):
         timeout = min(int(params.get("timeout", DEFAULT_TIMEOUT)), MAX_TIMEOUT)
 
         # Resolve working directory
-        if params.get("project"):
+        is_project = bool(params.get("project"))
+        if is_project:
             workdir = os.path.join(DATA_DIR, "projects", params["project"])
             if not os.path.isdir(workdir):
                 return f"Error: project '{params['project']}' not found."
@@ -151,6 +188,13 @@ class ExecTool(BaseTool):
         env = dict(os.environ)
         existing_pp = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = "/app" + (os.pathsep + existing_pp if existing_pp else "")
+
+        # Per-project dependency isolation: project-scoped exec runs inside the
+        # project's own .venv (created on first use) so pip installs don't leak
+        # across projects. Falls back to the global env if disabled/unavailable.
+        if is_project:
+            _ensure_project_venv(workdir)
+            env = _project_venv_env(env, workdir)
 
         # Execute. `start_new_session=True` puts the shell (and everything it
         # spawns) in its own process group / session, isolated from PID 1.
