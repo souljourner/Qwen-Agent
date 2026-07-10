@@ -319,7 +319,10 @@ class ProjectWriteFile(BaseTool):
     }
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
-        params = self._verify_json_format_args(params)
+        try:
+            params = self._verify_json_format_args(params)
+        except Exception as e:  # noqa: BLE001 — surface schema errors as a clean tool result
+            return f"Error: invalid arguments — {e}"
         pdir = _project_dir(params["project"])
 
         if not os.path.exists(pdir):
@@ -333,10 +336,27 @@ class ProjectWriteFile(BaseTool):
         full_path = os.path.join(pdir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
-        mode = params.get("mode", "write")
+        # Mode validation: an EXPLICIT empty/blank mode is an error (don't silently
+        # default — the caller showed intent to specify one). Omitting the key
+        # entirely is fine and falls back to "write".
+        if "mode" in params:
+            raw_mode = params["mode"]
+            if not isinstance(raw_mode, str) or not raw_mode.strip():
+                return "Error: 'mode' must not be empty. Use 'write', 'append', or 'edit'."
+            mode = raw_mode.strip()
+        else:
+            mode = "write"
+        if mode not in ("write", "append", "edit"):
+            return f"Error: invalid mode '{mode}'. Use 'write', 'append', or 'edit'."
+
+        # Content validation: write/append must have non-empty content. (edit
+        # uses old_text/new_text, not content, so this check doesn't apply.)
+        if mode in ("write", "append"):
+            content = params.get("content", "")
+            if not content:
+                return f"Error: 'content' must not be empty for {mode} mode."
 
         if mode == "append":
-            content = params.get("content", "")
             with open(full_path, "a") as f:
                 f.write(content)
             result_msg = f"Appended to {params['path']} ({len(content)} chars)"
@@ -377,7 +397,6 @@ class ProjectWriteFile(BaseTool):
                 f.write(existing)
 
         else:  # write mode (default)
-            content = params.get("content", "")
             with open(full_path, "w") as f:
                 f.write(content)
             result_msg = f"Written: {params['path']} ({len(content)} chars)"

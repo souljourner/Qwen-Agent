@@ -104,7 +104,9 @@ TOOL_LIST = [
     "list_chat_logs", "read_chat_log",
     "create_project", "list_projects", "delete_project", "rename_project", "update_project", "project_write_file",
     "project_read_file", "project_list_files", "project_delete_file", "project_apply_patch",
-    "display_doc",
+    "display_doc", "download_file",
+    "browser_navigate", "browser_screenshot", "browser_click", "browser_type", "browser_scroll",
+    "browser_save_credentials", "browser_get_credentials",
     "move_file", "delete_file",
     "request_user", "view_requests", "resolve_request",
     "start_pipeline", "start_trading_pipeline", "pipeline_status", "list_pipelines",
@@ -144,17 +146,23 @@ def load_system_message() -> str:
     return soul + memories + "\n\n" + SYSTEM_PROMPT_SUFFIX
 
 
-def session_metadata() -> str:
-    """One-time metadata injected only into the main agent's first system message.
+def format_datetime() -> str:
+    """Return current local date/time as '2026-06-15 03:30pm PDT'."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).astimezone()
+    tz_abbr = now.strftime('%Z') or 'UTC'
+    return f"{now.strftime('%Y-%m-%d %I:%M')}{now.strftime('%p').lower().strip()} {tz_abbr}"
 
-    Includes current date/time and location. NOT used for background sessions
-    to keep their system prompts static for KV cache.
+
+def session_metadata() -> str:
+    """Fresh metadata injected into the agent's system message each turn.
+
+    Includes current date/time with actual local timezone. NOT used for
+    background sessions to keep their system prompts static for KV cache.
     """
-    from datetime import datetime
-    now = datetime.now()
     return (
         f"\n\n## Session Metadata\n"
-        f"- Current date and time: {now.strftime('%A, %B %d, %Y at %I:%M %p')}\n"
+        f"- Current date and time: {format_datetime()}\n"
         f"- Location: San Mateo, California\n"
         f"- Timezone: US/Pacific"
     )

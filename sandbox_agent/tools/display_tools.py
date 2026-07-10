@@ -131,3 +131,51 @@ class DisplayDoc(BaseTool):
             f"The content was shown to the user directly and is NOT in your context — "
             f"use project_read_file if you need to read it yourself."
         )
+
+
+@register_tool("download_file")
+class DownloadFile(BaseTool):
+    """Offer a file from a project directory for download in the chat UI."""
+
+    name = "download_file"
+    description = (
+        "Offer a file from a project directory for download in the chat UI. "
+        "Use for binary files (archives, executables, etc.) that don't render as text, image, or PDF. "
+        "For documents, charts, or images, use display_doc instead. "
+        "Addressed like display_doc: by `project` + `path`."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project": {"type": "string", "description": "Project name."},
+            "path": {"type": "string", "description": "File path within the project."},
+        },
+        "required": ["project", "path"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        try:
+            pdir = _project_dir(params["project"])
+        except ValueError as e:
+            return f"Invalid project: {e}"
+
+        rel = os.path.normpath(params["path"])
+        if rel.startswith("..") or rel.startswith("/"):
+            return "Invalid path: must be relative within the project."
+        full_path = os.path.join(pdir, rel)
+        if not os.path.isfile(full_path):
+            return f"File not found: {params['path']} in project '{params['project']}'"
+
+        name = os.path.basename(full_path)
+        size = os.path.getsize(full_path)
+        payload = {"path": full_path, "name": name, "kind": "file", "size": size}
+
+        hook = _display_hooks.get(threading.get_ident())
+        if hook is None:
+            return f"download_file: no interactive chat surface (not in a chat session)."
+        try:
+            hook(payload)
+        except Exception as e:
+            return f"download_file: failed to offer '{name}': {e}"
+        return f"Download link offered for '{name}' ({_human_size(size)}) in the chat."

@@ -145,3 +145,69 @@ def test_update_autocommit_invoked(projects, monkeypatch):
 def test_update_registered():
     from qwen_agent.tools.base import TOOL_REGISTRY
     assert "update_project" in TOOL_REGISTRY
+
+
+# --- project_write_file validation ---------------------------------------
+
+from sandbox_agent.tools.project_tools import ProjectWriteFile  # noqa: E402
+
+
+def _write(pdir, slug, **kwargs):
+    _make_project(pdir, slug)
+    args = {"project": slug, "path": "f.md"}
+    args.update(kwargs)
+    return ProjectWriteFile().call(args)
+
+
+def test_write_empty_content_rejected(projects):
+    out = _write(projects, "a", content="")
+    assert out.lower().startswith("error")
+    assert "content" in out.lower()
+    assert not (projects / "a" / "f.md").exists()
+
+
+def test_write_missing_content_rejected(projects):
+    out = _write(projects, "b")  # no content key at all
+    assert out.lower().startswith("error")
+    assert "content" in out.lower()
+    assert not (projects / "b" / "f.md").exists()
+
+
+def test_append_empty_content_rejected(projects):
+    _make_project(projects, "c")
+    (projects / "c" / "f.md").write_text("existing")
+    out = ProjectWriteFile().call({"project": "c", "path": "f.md", "mode": "append", "content": ""})
+    assert out.lower().startswith("error")
+    assert "content" in out.lower()
+    assert (projects / "c" / "f.md").read_text() == "existing"  # untouched
+
+
+def test_edit_mode_does_not_require_content(projects):
+    """edit uses old_text/new_text, not content — empty content must NOT block edit."""
+    _make_project(projects, "d")
+    (projects / "d" / "f.md").write_text("hello world")
+    out = ProjectWriteFile().call({
+        "project": "d", "path": "f.md", "mode": "edit",
+        "old_text": "hello", "new_text": "hi",
+    })
+    assert not out.lower().startswith("error"), out
+    assert (projects / "d" / "f.md").read_text() == "hi world"
+
+
+def test_explicit_empty_mode_rejected(projects):
+    out = _write(projects, "e", mode="", content="x")
+    assert out.lower().startswith("error")
+    assert "mode" in out.lower()
+
+
+def test_unknown_mode_rejected(projects):
+    out = _write(projects, "f", mode="overwrite", content="x")
+    assert out.lower().startswith("error")
+    assert "mode" in out.lower()
+
+
+def test_default_mode_still_works_when_content_provided(projects):
+    """Mode key absent → 'write' default — still allowed (only empty mode is rejected)."""
+    out = _write(projects, "g", content="hi")
+    assert not out.lower().startswith("error"), out
+    assert (projects / "g" / "f.md").read_text() == "hi"

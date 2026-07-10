@@ -49,6 +49,7 @@ import sandbox_agent.tools.notification_tools  # noqa: F401
 import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 import sandbox_agent.tools.display_tools  # noqa: F401
+import sandbox_agent.tools.browser_tools  # noqa: F401
 
 from qwen_agent.llm.schema import ContentItem, Message
 
@@ -60,7 +61,9 @@ from qwen_agent.llm.oai import register_usage_hook, unregister_usage_hook
 from sandbox_agent.config import (
     BACKGROUND_LLM_CFG,
     PRIMARY_LLM_CFG,
+    format_datetime,
     load_system_message,
+    session_metadata,
 )
 from sandbox_agent.main import (
     LockingAgent,
@@ -183,6 +186,7 @@ def _run_agent_in_thread(
     run_id: str,
     session_id: Optional[str] = None,
     thread_id: Optional[str] = None,
+    frozen_metadata: str = "",
 ):
     """Worker that drains `agent.run(messages)` and pushes each yielded chunk
     onto `queue` for the asyncio side to consume.
@@ -246,6 +250,14 @@ def _run_agent_in_thread(
     from sandbox_agent import chat_origin
     if session_id or thread_id:
         chat_origin.set_current_origin({"session_id": session_id, "thread_id": thread_id})
+    # Freeze date/time ONCE per conversation and bake into both agents'
+    # system_message. The timestamp is captured on the asyncio side and passed
+    # in as frozen_metadata → vLLM KV prefix cache stays stable.
+    if frozen_metadata:
+        fresh_sys = load_system_message() + frozen_metadata
+        agent._inner.system_message = fresh_sys
+        agent._backup.system_message = fresh_sys
+
     try:
         with cancellation.begin_run(run_id):
             for chunk in agent.run(messages=messages):
@@ -308,7 +320,7 @@ def _format_task_notice_for_agent(evt: dict) -> str:
     verb = "finished" if ok else "failed"
     body = f": {result[:600]}" if result else "."
     return (
-        f"[system event] A background task '{name}' {verb}{body} "
+        f"[{format_datetime()}] [system event] A background task '{name}' {verb}{body} "
         f"If a follow-up is warranted (read result files via project_read_file, "
         f"schedule the next step, send a notification, alert the user, etc.), "
         f"do it now; otherwise stay silent."
@@ -517,6 +529,17 @@ async def on_chat_resume(thread):
         if not output and not elements_by_step.get(step.get("id")):
             continue
         if step_type in ("user_message", "user"):
+            # Pull the per-message timestamp persisted on cl.Message.metadata
+            # (see on_message). Handle dict or json-string hydration depending
+            # on data-layer behavior. Empty / missing → no prefix (graceful
+            # degradation for messages saved before this feature).
+            md = step.get("metadata") or {}
+            if isinstance(md, str):
+                try:
+                    md = json.loads(md)
+                except Exception:  # noqa: BLE001
+                    md = {}
+            sent_at = (md or {}).get("sent_at") or ""
             # Try to rebuild a multimodal user message if this step had image
             # elements persisted alongside.
             attached = elements_by_step.get(step.get("id") or "", [])
@@ -541,9 +564,11 @@ async def on_chat_resume(thread):
                 if output:
                     parts.append(ContentItem(text=output))
                 parts.extend(image_parts)
-                history.append(Message(role="user", content=parts))
+                msg = Message(role="user", content=parts)
             else:
-                history.append(Message(role="user", content=output))
+                msg = Message(role="user", content=output)
+            _prepend_ts_to_agent_msg(msg, sent_at)
+            history.append(msg)
         elif step_type in ("assistant_message", "assistant", "ai", "llm"):
             author = (step.get("name") or "").lower()
             # display_doc output is persisted (so it reloads in the UI) but must
@@ -561,9 +586,8 @@ async def on_chat_resume(thread):
                 clean = first_line.replace("**", "").lstrip("✅⚠️ ").strip()
                 history.append(Message(role="user", content=f"[system event] {clean}"))
             else:
-                # Strip the UI-only token-usage footer (on_message appends it to
-                # assistant messages). It's persisted in chat.db's `output` but
-                # the agent should NOT see it in its conversation context.
+                # Strip the UI-only token-usage footer and timestamp prefix so
+                # the agent context stays clean on resume.
                 history.append(Message(role="assistant", content=_strip_stats_footer(output)))
         # Tool steps and reasoning are intentionally NOT replayed into the
         # agent's input — the agent re-derives those when it processes the
@@ -705,8 +729,14 @@ class _StreamBridge:
     async def _stream_text(self, i: int, text: str) -> None:
         await self._close_open_thoughts()
         state = self._by_index.get(i)
-        first = False
         if state is None or state["kind"] != "text":
+            # New message — compute what we'd stream first. Don't create the
+            # cl.Message / store state until we know there's real content.
+            # (Models often emit leading newlines before a tool call; creating
+            # the message for whitespace-only content leaves empty DB rows.)
+            delta = text.lstrip("\n")
+            if not delta:
+                return  # whitespace-only — skip, no message created
             cl_msg = cl.Message(content="")
             # Send IMMEDIATELY to claim the message's position in the chat
             # history (relative to any cl.Step we've already sent). Without
@@ -715,16 +745,22 @@ class _StreamBridge:
             # mid-stream. Also: stream_token does NOT auto-persist; the
             # initial send() is required for the data layer to track it.
             await cl_msg.send()
-            state = {"kind": "text", "obj": cl_msg, "streamed": 0}
+            state = {"kind": "text", "obj": cl_msg, "streamed": len(text)}
             self._by_index[i] = state
-            first = True
+            # Feed the stripped delta into the batcher for immediate emit.
+            self._text_pending[i] = delta
+            now = time.monotonic()
+            if (now - self._text_last_emit.get(i, 0.0)) < self._STREAM_TOKEN_BATCH_INTERVAL and \
+               len(self._text_pending[i]) < self._STREAM_TOKEN_BATCH_MAX_CHARS:
+                return
+            batched = self._text_pending[i]
+            self._text_pending[i] = ""
+            self._text_last_emit[i] = now
+            await cl_msg.stream_token(batched)
+            return
         if len(text) > state["streamed"]:
             delta = text[state["streamed"]:]
             state["streamed"] = len(text)
-            if first:
-                delta = delta.lstrip("\n")  # trim leading newlines from the bubble
-                if not delta:
-                    return
             # Batch into ~12 emits/sec (or sooner if the buffer is large) — the
             # client's per-event markdown re-parse can't keep up with 70/sec.
             self._text_pending[i] = self._text_pending.get(i, "") + delta
@@ -965,9 +1001,17 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
     except Exception:  # noqa: BLE001
         pass
 
+    # Capture frozen metadata on the asyncio side (cl.context is per-Task, not
+    # available on the worker thread). Freeze once per conversation for KV cache
+    # stability — first turn generates it, subsequent turns reuse the cached value.
+    frozen_meta = cl.user_session.get("_frozen_metadata")
+    if not frozen_meta:
+        frozen_meta = session_metadata()
+        cl.user_session.set("_frozen_metadata", frozen_meta)
+
     threading.Thread(
         target=_run_agent_in_thread,
-        args=(agent, history, queue, loop, run_id, session_id, thread_id),
+        args=(agent, history, queue, loop, run_id, session_id, thread_id, frozen_meta),
         daemon=True,
         name="chainlit-agent-run",
     ).start()
@@ -1058,7 +1102,8 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
                     f"\n\n---\n"
                     f"📊 _last turn: max ctx {max_p:,} / {c:,} out"
                     f"{f' · {n} LLM calls' if n > 1 else ''} · "
-                    f"chat high-water: {chat_hi:,} ({pct:.0f}% of {_CONTEXT_WINDOW_TOKENS // 1000}k)_"
+                    f"chat high-water: {chat_hi:,} ({pct:.0f}% of {_CONTEXT_WINDOW_TOKENS // 1000}k)"
+                    f" · 📅 {format_datetime()}_"
                 )
                 # mutate in-memory content; bridge.finalize() will call update()
                 # which sends the new step_dict (incl. content) over the socket.
@@ -1127,6 +1172,27 @@ def _image_element_to_data_url(el) -> Optional[str]:
     return f"data:{mime};base64,{base64.b64encode(data).decode()}"
 
 
+def _prepend_ts_to_agent_msg(msg: Message, sent_at: str) -> None:
+    """Mutate an agent-side user Message in place to carry a `[sent_at] ` prefix
+    so the agent sees per-message time. Handles plain-text and multimodal
+    (ContentItem list) content. The displayed cl.Message is untouched — this
+    only modifies the qwen-agent Message that's appended to HISTORY_KEY."""
+    if not sent_at:
+        return
+    prefix = f"[{sent_at}] "
+    if isinstance(msg.content, str):
+        msg.content = prefix + msg.content
+        return
+    if isinstance(msg.content, list):
+        for item in msg.content:
+            if getattr(item, "text", None) is not None:
+                item.text = prefix + item.text
+                return
+        # No text part — insert one at the front so the prefix is the first
+        # thing the model reads on this turn.
+        msg.content.insert(0, ContentItem(text=prefix.rstrip()))
+
+
 def _build_user_message(message: cl.Message) -> Message:
     """Build a `qwen_agent.llm.schema.Message` from a Chainlit incoming message.
     Plain text → `content=str`. With any image attachment → `content=List
@@ -1143,8 +1209,21 @@ def _build_user_message(message: cl.Message) -> Message:
         # cl.Image instances may not always carry mime; fall back to class name.
         return type(el).__name__.lower() == "image"
 
+    def _is_file(el) -> bool:
+        """Check if element is a non-image file (PDF, doc, etc.)."""
+        name = type(el).__name__.lower()
+        if name in ("pdf", "file"):
+            return True
+        mime = (getattr(el, "mime", None) or "").lower()
+        if mime in ("application/pdf",) or not mime.startswith("image/"):
+            return True
+        return False
+
     image_elems = [el for el in elements if _is_image(el)]
-    if not image_elems:
+    file_elems = [el for el in elements if _is_file(el)]
+    has_media = image_elems or file_elems
+
+    if not has_media:
         return Message(role="user", content=text)
 
     parts: List[ContentItem] = []
@@ -1154,8 +1233,12 @@ def _build_user_message(message: cl.Message) -> Message:
         data_url = _image_element_to_data_url(el)
         if data_url:
             parts.append(ContentItem(image=data_url))
-    if not any(getattr(p, "image", None) for p in parts):
-        # All image reads failed — fall back to plain text so we don't send
+    for el in file_elems:
+        path = getattr(el, "path", None)
+        if path and os.path.exists(path):
+            parts.append(ContentItem(file=path))
+    if not any(getattr(p, "image", None) for p in parts) and not any(getattr(p, "file", None) for p in parts):
+        # All media reads failed — fall back to plain text so we don't send
         # an empty multimodal message.
         return Message(role="user", content=text)
     return Message(role="user", content=parts)
@@ -1182,6 +1265,22 @@ async def on_message(message: cl.Message):
     if isinstance(user_msg.content, list):
         n_img = sum(1 for it in user_msg.content if getattr(it, "image", None))
         logger.info("on_message: built multimodal Message with %d image part(s)", n_img)
+
+    # Hidden per-message timestamp (host_mlx-style separate field, not inline
+    # in displayed text): persist `sent_at` on cl.Message.metadata so it lands
+    # in chat.db's metadata JSONB column (survives reloads), and prepend it to
+    # the AGENT-SIDE Message.content only. message.content stays untouched →
+    # the chat bubble shows whatever the user typed, with no timestamp visible.
+    sent_at = format_datetime()
+    md = dict(getattr(message, "metadata", None) or {})
+    md["sent_at"] = sent_at
+    message.metadata = md
+    try:
+        await message.update()
+    except Exception:  # noqa: BLE001
+        logger.debug("on_message: persisting sent_at metadata failed", exc_info=True)
+    _prepend_ts_to_agent_msg(user_msg, sent_at)
+
     history.append(user_msg)
     cl.user_session.set(HISTORY_KEY, history)
 

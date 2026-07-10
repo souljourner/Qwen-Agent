@@ -16,6 +16,7 @@ services:
     ports:
       - "7860:7860"
       - "7861:7861"
+      - "6080:6080"
     environment:
       - TOOLS_API_BASE=http://host.docker.internal:8080
       - VLLM_BASE=http://192.168.4.66:8000/v1
@@ -45,6 +46,7 @@ services:
       # Status server lane: set to 7861 to start it in-process from chat_app.py.
       # Set to 0 to skip (e.g. if running an external monitor).
       - STATUS_SERVER_PORT=7861
+      - XVFB_ENABLED=${XVFB_ENABLED:-false}
 
 # Data is bind-mounted to ~/sandbox_agent_data (visible in Finder).
 # Chainlit's chat history persists at /app/data/chat.db (host: ~/sandbox_agent_data/chat.db).

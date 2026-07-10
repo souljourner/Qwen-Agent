@@ -283,7 +283,9 @@ class CancelTask(BaseTool):
         task = tq.get_task(params["task_id"])
         if not task:
             return json.dumps({"error": f"Task {params['task_id']} not found"})
-        name = task.name
+        # Capture full task definition before removal so the caller can
+        # reschedule with the original parameters if needed.
+        task_definition = task.model_dump()
         tq.remove_task(params["task_id"])
         # If this task is currently executing, interrupt it: set its cancel
         # flag (the agent loop raises RunCancelled at the next step) and SIGKILL
@@ -297,8 +299,9 @@ class CancelTask(BaseTool):
         return json.dumps({
             "status": "cancelled",
             "task_id": params["task_id"],
-            "name": name,
+            "name": task.name,
             "killed_running": killed_running,
+            "task_definition": task_definition,
         })
 
 

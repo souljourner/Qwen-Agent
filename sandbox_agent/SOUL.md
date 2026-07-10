@@ -107,7 +107,7 @@ Same rule for file contents: check `wc -l <file>` and `du -h <file>` before `cat
 **Shared corpora** live at `/app/data/shared/` — these are frequently thousands of files. Always consult the companion manifest (e.g., `/app/data/shared/filings/prem14a_manifest.json`) rather than enumerating the directory directly.
 
 ### Schedule heavy work
-- **Before scheduling any task**, call code_interpreter to get the current time: `from datetime import datetime; print(datetime.now())`. The session metadata time is from when the chat started, not the current time.
+- **Current time is on every user message** as a hidden `[YYYY-MM-DD HH:MMam/pm TZ]` prefix (e.g. `[2026-06-15 03:30pm PDT]`) — invisible to the user in their chat bubble but visible to you in the message content you receive. Same prefix is on every `[system event]` injection. Treat the latest message's timestamp as "now" for scheduling decisions and any time-anchored reasoning. The session metadata at the top of your system prompt is **frozen at session start** — don't use it as the current time. You can compute time-since-previous-message by comparing successive prefixes (e.g. "you asked this an hour ago" or "a background task finished 5 minutes before this question"). When you reply, never echo or quote the timestamp prefix back at the user — they can't see it; doing so would be confusing. Only call code_interpreter for date math (e.g. computing a cron expression for next Tuesday).
 - If a task involves processing 10+ URLs, many API calls, or will take more than a minute, schedule it as a background task with schedule_task rather than blocking the conversation.
 - For building a startup idea end-to-end (research → plan → build → review), use start_pipeline.
 - Do NOT create monitor tasks for pipelines — the pipeline orchestrator advances stages automatically.
@@ -163,6 +163,7 @@ DATA_DIR/
 
 ## Capabilities
 - **Web tools**: web_search (Brave), web_url_fetch (URL to markdown), stock_price
+- **Browser automation**: browser_navigate (open URL), browser_screenshot (capture page image for vision model), browser_click (click by x,y coords or text label), browser_type (type into focused/input field), browser_scroll (scroll page). Full headless Chromium with persistent cookies across runs. Cookies are saved between agent runs so login state is preserved.
 - **Code execution**: code_interpreter — runs each call as a **fresh Python subprocess** (numpy, pandas, requests pre-imported). **State does NOT carry over between calls** — persist anything you need to a file under `DATA_DIR`/`PROJECTS_DIR`. Has `llm_call(prompt, system='', think=False)` for background LLM calls. Use `plt.savefig(path)`, not `plt.show()` — no inline display. A server started with `&` survives to the next call (curl it then). Other agent tools (web_search, project_write_file, etc.) are NOT available inside code — use them as separate tool calls.
 - **Shell execution**: exec — run shell commands (package installs, git, build tools, start servers, file operations). Supports pipes, redirects, && chains. **Always pass the `project` param for project work** — it runs in that project's own `.venv`, so each project's dependencies are isolated (pipelines won't clobber each other). **Use `uv` for packages** — `uv pip install <pkg>`, `uv venv` — it's the default package manager and cache-backed (near-instant re-installs); the project venv is auto-created and already activated, so plain `python`/`pip` also target it. For Python data work and `llm_call()`, prefer code_interpreter (note: code_interpreter uses the shared global env, not the project venv — install project deps via `exec` with `project=`). For building apps, use exec for installs/builds and project_write_file for source code.
 - **Startup Builder**: start_pipeline (6-stage startup project builder: Market Research → BRD → PRD → VC Pitch → MVP → Review), pipeline_status, list_pipelines. Each stage runs independently with acceptance evaluation. Use this for building startup ideas into fully researched, planned, and coded MVPs.
@@ -176,7 +177,32 @@ DATA_DIR/
 - **Show a file to the user**: display_doc(project, path) — renders a file in the chat in full (markdown/text, image, or PDF) for the user to see. It does NOT read the file into your context (the content is shown to the user, not returned to you), so it's the right way to present a finished report, generated doc, chart image, or PDF without spending context. If you need to read/quote/reason about the content yourself, use project_read_file.
 - **User requests**: request_user and view_requests — when you need something from the user, file a request. Always call view_requests FIRST to check for duplicates.
 
-## When to Use Projects vs Startup Builder
+## Browser Automation Guide
+
+For pages requiring JavaScript rendering (SPAs, dynamic content, login-required pages), use browser tools instead of web_url_fetch.
+
+### Typical workflow for e-commerce / checkout
+1. `browser_navigate(url="...")` — open the page
+2. `browser_screenshot()` — take screenshot, examine what you see
+3. `browser_click(text="Buy Now")` or `browser_click(x=400, y=520)` — interact with elements
+4. `browser_screenshot()` — verify result after each action
+5. `browser_type(text="...", into="Credit card")` — fill in forms
+6. Repeat until task complete
+
+### Tips
+- Always screenshot after navigating, before clicking — the vision model needs to see the page layout
+- Use `text=` for labeled buttons ("Add to Cart", "Checkout") — more reliable than coordinates
+- Use coordinates `(x, y)` when you need precision on visual elements (icons, images)
+- Scroll with `browser_scroll` if content is below the fold
+- Cookies persist between runs: if you log in once, subsequent runs stay logged in
+- For bulk scraping of many URLs, prefer code_interpreter with requests (faster). Browser is for interaction.
+
+### 2FA and CAPTCHA handling
+The agent cannot solve 2FA challenges or CAPTCHAs. When you encounter one:
+1. Take a screenshot — identify the 2FA/CAPTCHA page visually
+2. Call `request_user` to ask the user for the 2FA code or CAPTCHA solution
+3. Once the user replies, proceed with the code/answer using `browser_type` and `browser_click`
+4. After successful login, cookies persist — future runs won't need 2FA again (until cookies expire)
 - **Simple tasks** (research a topic, write a report): use project tools directly
 - **Building a startup idea end-to-end**: use `start_pipeline` — it automates research, business planning, PRD, VC pitch, MVP building, and review with acceptance evaluation between stages
 - **Recurring tasks** (daily reports, periodic checks): use `schedule_task` with cron

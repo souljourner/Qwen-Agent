@@ -18,7 +18,7 @@ from typing import Dict, Iterator, List, Literal, Optional, Union
 
 from qwen_agent import Agent
 from qwen_agent.llm import BaseChatModel
-from qwen_agent.llm.schema import ASSISTANT, DEFAULT_SYSTEM_MESSAGE, FUNCTION, USER, Message
+from qwen_agent.llm.schema import ASSISTANT, DEFAULT_SYSTEM_MESSAGE, FUNCTION, USER, ContentItem, Message
 from qwen_agent.memory import Memory
 from qwen_agent.settings import MAX_LLM_CALL_PER_RUN
 from qwen_agent.tools import BaseTool
@@ -121,15 +121,44 @@ class FnCallAgent(Agent):
                         # truncated from the end, so a leading note survives.
                         if num_llm_calls_available <= _BUDGET_PRESSURE_AT:
                             _note = (f'[budget: {num_llm_calls_available} tool calls left this run — '
-                                     f'start consolidating; deliver your answer before you run out]')
-                            _body = tool_result if isinstance(tool_result, str) else str(tool_result)
-                            tool_result = _note + '\n\n' + _body
-                        fn_msg = Message(role=FUNCTION,
-                                         name=tool_name,
-                                         content=tool_result,
-                                         extra={'function_id': out.extra.get('function_id', '1')})
-                        messages.append(fn_msg)
-                        response.append(fn_msg)
+                                    f'start consolidating; deliver your answer before you run out]')
+                            if isinstance(tool_result, str):
+                                tool_result = _note + '\n\n' + tool_result
+                            elif isinstance(tool_result, list):
+                                # Prepend budget note to the first text item
+                                for _ci in tool_result:
+                                    if isinstance(_ci, ContentItem) and getattr(_ci, 'text', None):
+                                        _ci.text = _note + '\n\n' + _ci.text
+                                        break
+                        # LOCAL MOD: split multimodal tool results. Function messages must have
+                        # string content for the OpenAI/vLLM API. Image items are emitted as a
+                        # separate USER message so convert_messages_to_dicts routes them through
+                        # _multimodal_to_oai_dict which produces proper {type:image_url,...} parts.
+                        _function_id = out.extra.get('function_id', '1')
+                        if isinstance(tool_result, list) and any(
+                                isinstance(ci, ContentItem) and getattr(ci, 'image', None)
+                                for ci in tool_result):
+                            # Split into text-only (FUNCTION msg) and image (USER msg)
+                            _text_items = [ci for ci in tool_result if isinstance(ci, ContentItem) and getattr(ci, 'text', None)]
+                            _image_items = [ci for ci in tool_result if isinstance(ci, ContentItem) and getattr(ci, 'image', None)]
+                            _fn_content = '\n'.join(ci.text for ci in _text_items) if _text_items else ''
+                            fn_msg = Message(role=FUNCTION,
+                                              name=tool_name,
+                                              content=_fn_content,
+                                              extra={'function_id': _function_id})
+                            messages.append(fn_msg)
+                            response.append(fn_msg)
+                            if _image_items:
+                                img_msg = Message(role=USER, content=_image_items)
+                                messages.append(img_msg)
+                                response.append(img_msg)
+                        else:
+                            fn_msg = Message(role=FUNCTION,
+                                              name=tool_name,
+                                              content=tool_result,
+                                              extra={'function_id': _function_id})
+                            messages.append(fn_msg)
+                            response.append(fn_msg)
                         yield response
                         used_any_tool = True
                 if not used_any_tool:

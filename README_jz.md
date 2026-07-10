@@ -33,6 +33,7 @@ python -m sandbox_agent.main --mode repl
 | **vLLM (primary)** | 192.168.4.66:8000 | qwen3.6-27b-linux | Main conversation + background tasks; vLLM-side concurrency ~16 |
 | **vLLM (backup)** | 192.168.4.66:8000 | qwen3.5 (397B MoE) | Chat fallback when primary slots saturated; also fallback for `llm_call()` |
 | **Tools API** | localhost:8080 (host) / `host.docker.internal:8080` (container) | — | Web search (Brave), URL fetch with pagination, stock prices via SSE |
+| **Browser (in-container)** | Playwright headless Chromium | — | Navigate, screenshot, click, type, scroll. Persistent cookies. Optional headed mode via Xvfb + noVNC on port 6080 |
 | **Chainlit chat** | localhost:7860 | — | Chat UI (replaces the legacy Gradio path) |
 | **Status server** | localhost:7861 | — | Live activity monitor, digest, agent requests |
 | **Data** | `~/sandbox_agent_data/` | — | Bind-mounted volume (Mac Finder–visible). Includes `chat.db`, `.cl_elements/`, `projects/`, `activity.jsonl`, daily logs |
@@ -115,18 +116,19 @@ When a cron task / pipeline stage completes, `task_notify.put(...)` enqueues an 
 2. Injects a `role="user"` message tagged `[system event]` into the originating chat's HISTORY_KEY (vLLM rejects mid-thread `role="system"` with HTTP 400). The agent reads it and decides whether to act.
 3. Routes to the right session via `chat_origin` (the worker thread stamps `{session_id, thread_id}` on the task when scheduled; the notifier reads it back).
 
-## Tools (38 registered)
+## Tools (46 registered)
 
 | Category | Tools | Notes |
 |---|---|---|
 | **Web** | `web_search`, `web_url_fetch`, `stock_price` | Call port 8080 API via SSE; outputs sanitized (`sanitize_web_content`). `web_url_fetch` supports `offset`/`max_chars` for pagination with a trusted hint appended when `has_more`. Brave Search rate-limited to 1 req / 2s. |
+| **Browser** | `browser_navigate`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_save_credentials`, `browser_get_credentials` | Playwright headless Chromium with persistent cookies (`DATA_DIR/browser_state/`). Stealth mode (disable-blink-features, disable-http2, masked navigator.webdriver). `browser_screenshot` returns `List[ContentItem]` with base64 PNG for vision model. Optional headed mode via Xvfb + noVNC on port 6080 (`XVFB_ENABLED=true`). Encrypted credential storage. |
 | **Code execution** | `code_interpreter`, `exec` | Both stateless subprocesses with `start_new_session=True` + killpg on timeout. `code_interpreter`: fresh Python per call (numpy/pandas/requests pre-imported), `llm_call()` via the in-process bridge, 1-hour max timeout. `exec`: any shell command; with `project=` it **runs inside that project's `.venv`** (auto-created with `uv venv`, activated via PATH+VIRTUAL_ENV) — see "Per-project dependency isolation" below. |
 | **Scheduling** | `schedule_task`, `list_tasks`, `complete_task`, `cancel_task`, `pause_task`, `resume_task`, `update_task_checkpoint` | JSON-backed queue (`tasks.json`, completed/cancelled archived to separate files). |
 | **Pipeline** | `start_pipeline`, `start_trading_pipeline`, `pipeline_status`, `list_pipelines` | Two pipeline kinds (startup builder + trading research); see Pipeline section. |
 | **Self-edit** | `update_soul`, `update_heartbeat` | Section patches (not full file replacement); auto-committed to git. |
 | **Memory** | `read_memories`, `add_memory` | `MEMORIES.md` dated entries, auto-loaded into the system prompt. |
 | **Projects** | `create_project`, `list_projects`, `delete_project`, `rename_project`, `update_project`, `project_write_file`, `project_read_file`, `project_list_files`, `project_delete_file`, `project_apply_patch` | Persistent file workspaces under `projects/<slug>/`. `project_write_file` supports write/append/edit modes. `project_apply_patch` does OpenClaw-style multi-file context-matching patches. `rename_project` renames the folder + updates `.project.json`. `update_project` updates the description without touching files. |
-| **Display** | `display_doc` | Out-of-band file display in Chainlit (text/markdown/code, images, PDFs) — content **does NOT enter the agent's context**; a thread-keyed display hook pushes the payload to `_StreamBridge.display_document()`. Persists as an element so it survives reload. |
+| **Display** | `display_doc`, `download_file` | Out-of-band file display in Chainlit (text/markdown/code, images, PDFs) — content **does NOT enter the agent's context**; a thread-keyed display hook pushes the payload to `_StreamBridge.display_document()`. `download_file` offers project files for download (binary/archives). Both restricted to project directories. Persists as an element so it survives reload. |
 | **Filesystem** | `move_file`, `delete_file` | Generic file ops within DATA_DIR. |
 | **Chat logs** | `list_chat_logs`, `read_chat_log` | Daily markdown logs at `DATA_DIR/chat_logs/YYYY-MM-DD.md`. |
 | **Notifications** | `request_user`, `view_requests`, `resolve_request` | Structured pending/resolved JSON requests with dedup. **File-based only — no push/email/Slack.** |
@@ -284,8 +286,12 @@ load_system_message():
   + "## Your Memories (auto-loaded from MEMORIES.md)" + MEMORIES.md
   + SYSTEM_PROMPT_SUFFIX  (token-efficiency reminder)
 
-Main chat agent only:
-  + session_metadata()    (date, time, location: San Mateo CA, US/Pacific)
+Main chat agent only (Chainlit):
+  + session_metadata()    (frozen once per conversation, format: 2026-06-15 03:30pm PDT)
+  Cached in cl.user_session["_frozen_metadata"] on first turn. Both agents'
+  system_message are updated with this frozen value before each agent.run() call.
+  The timestamp never changes mid-conversation → vLLM KV prefix cache stays stable.
+  The Gradio/REPL path still uses the one-time boot-time snapshot.
 ```
 
 Background sessions (cron, heartbeat) use the metadata-free base to preserve the vLLM prefix cache.
