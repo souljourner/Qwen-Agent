@@ -351,18 +351,19 @@ Background sessions (cron, heartbeat) use the metadata-free base to preserve the
 - **Multi-language `exec` / `code_interpreter`** — JS/Go/shell beyond Python.
 - **Real-time `exec` output streaming to chat** — currently buffered until process exit.
 
-## Known shortcomings (current state)
+## Known weaknesses (current state)
 
-- **Resume drops tool context.** `on_chat_resume` rebuilds history from user + assistant text only, intentionally dropping all 200k+ chars of tool results and reasoning per long thread. The agent loses everything it gathered whenever the page reloads. Roadmap above has the fix candidates.
-- **Pipelines serialize globally.** A single file lock + `_background_work_lock` + `max_workers=1` cron executor means only one pipeline runs at a time across the system. Phase B fixes this.
-- **`code_interpreter` shares the global env.** Per-project venv isolation only applies to `exec`. Project deps installed via `exec(project=X, "uv pip install …")` won't be visible to `code_interpreter` in the same project unless the interpreter is also scoped (planned).
-- **`_background_work_lock` has no timeout.** A hung LLM call can block heartbeat + cron indefinitely. `clear_lock_on_startup()` only helps after restart.
-- **`LockingAgent.run()` releases its semaphore on generator exhaustion.** Early break by a caller = held lock until the generator object is GC'd. Should be a context manager.
-- **vLLM contention is real-but-bounded.** Both primary and 397B share one vLLM on one GPU. The 397B request is dispatched correctly when the primary saturates, but vLLM's scheduler can deprioritize it under GPU pressure. User-stated tolerance: ~16 concurrent at marginal cost.
-- **Pipeline stage truncation loop (residual).** Long stages occasionally produce output that exceeds the per-call output cap and gets truncated; the `part-completion` mechanism handles most cases but not all.
-- **vLLM thinking-token leakage** (model-dependent). Fix requires server-side `--chat-template-kwargs '{"enable_thinking": false}'` or top-level `chat_template_kwargs` in the request (not in `extra_body`). See `feedback_thinking_tokens.md`.
-- **Invalid JSON tool arguments.** The model occasionally emits malformed JSON (escaped quotes in long `schedule_task` descriptions). qwen-agent retries internally but it's a recurring failure mode.
-- **Single-user.** No auth, no session isolation beyond Chainlit's own. Don't expose beyond LAN.
+**The prioritized weakness assessment lives in [`weaknesses_to_resolve.md`](weaknesses_to_resolve.md)** — seven structural weaknesses with status and what "resolved" looks like. Summary (as of 2026-07-11):
+
+1. **The agent grades its own homework** — only the trading pipeline has ground-truth gates; all other work products (reports, updates, digests) are unverified LLM output. *Not resolved.*
+2. **It can't remember its own conclusions** — resume drops tool context (~44k ceiling), no session search, no cross-project knowledge flow. *Direction chosen (OpenClaw-style resume restoration, then Hermes-style session search); not implemented.*
+3. **One process, one GPU, one point of failure** — all lanes in one Python process; both models share one GPU; no cloud failover. *Not resolved.*
+4. **Capability has outgrown the security model** — exec + browser credential store + send_email + readable `.env` = a real prompt-injection exfiltration chain; defense is single-user-LAN. *Not resolved.*
+5. **Failures don't teach it anything** — *RESOLVED 2026-07-11*: deterministic health monitoring (`health.py`) emails failure bursts + stale requests directly and feeds heartbeat investigate-items; stage instructions now DATA_DIR-overridable so stage-6 review suggestions are actually appliable.
+6. **Tests validate parts, not the machine** — 574 unit tests, no end-to-end pipeline test with a stubbed LLM, no CI. *Not resolved.*
+7. **Consistency by hand** — SOUL/skills/tool-descriptions/acceptance-criteria drift is manual to catch. *Partially mitigated (a few lock-in tests).*
+
+Smaller known issues: `code_interpreter` uses the global env (not project venvs); `_background_work_lock` has no timeout; `LockingAgent.run()` releases its semaphore only on generator exhaustion; pipelines serialize globally (Phase B pending); occasional malformed-JSON tool args; vLLM thinking-token leakage (server-side flag); single-user only — don't expose beyond LAN.
 
 ## Recent fixes (this session — most need a rebuild to deploy)
 
