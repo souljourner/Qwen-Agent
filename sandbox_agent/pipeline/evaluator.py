@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 DecisionType = str  # One of: converge | needs_more_data | iterate | infeasible_data
                     # | insufficient_signal | dead_end | terminate | reject
+                    # | insane_metrics (pilot metrics failed consistency sanity)
 
 
 @dataclass
@@ -224,9 +225,25 @@ def _stage_specific_checks(
     (`evaluate_trading_stage_2_decision`) and does not route through here."""
     if pipeline_type == "trading":
         if stage_number == 3:
-            return _check_full_validation_metrics(project_dir)
+            acct_passed, acct_msg = _check_uses_vetted_accounting(project_dir)
+            if not acct_passed:
+                return False, acct_msg
+            passed, msg = _check_full_validation_metrics(project_dir)
+            if passed:
+                # Contract: stamp the metrics file (schema_version, hash,
+                # strategy_version) and pin the hash into pipeline state.
+                # Stage 4's verdict must cite this exact hash — see
+                # _check_verdict_matches_metrics.
+                _stamp_and_pin_full_metrics(project_dir)
+            return passed, msg
         if stage_number == 4:
-            return _check_verdict_matches_metrics(project_dir)
+            passed, msg = _check_verdict_matches_metrics(project_dir)
+            if passed:
+                # pipeline/metrics.json is evaluator-written (agents used to
+                # write it with contradictory content — gates_passed:0 next to
+                # a PROMOTE). Written only after the verdict gate passes.
+                _write_pipeline_metrics_summary(project_dir)
+            return passed, msg
         if stage_number == 5:
             return _check_paper_deploy_compiles(project_dir)
     if pipeline_type == "startup":
@@ -575,6 +592,31 @@ def sanitize_loop_state_file(loop_state_path: str) -> bool:
         logger.info(f"sanitize_loop_state: discarding non-canonical current_phase={cp!r}")
         loop_state["current_phase"] = None
         changed = True
+
+    # Quarantine pilot_history rows with insane metrics (consistency-based —
+    # see metrics_sanity; legitimate short-strategy blowups are NOT flagged).
+    # Rejected rows move to pilot_history_rejected with their violations
+    # attached, so _decide_from_pilot_history never bases a decision on
+    # fabricated numbers (observed: +1,399,591% returns entering history).
+    from sandbox_agent.pipeline.metrics_sanity import validate_metrics
+    history = loop_state.get("pilot_history") or []
+    kept, rejected = [], []
+    for row in history:
+        violations = validate_metrics(row) if isinstance(row, dict) else ["row is not a dict"]
+        if violations:
+            row = dict(row) if isinstance(row, dict) else {"raw": row}
+            row["_violations"] = violations
+            rejected.append(row)
+        else:
+            kept.append(row)
+    if rejected:
+        logger.warning(
+            f"sanitize_loop_state: quarantined {len(rejected)} pilot_history row(s) "
+            f"with insane metrics")
+        loop_state["pilot_history"] = kept
+        loop_state.setdefault("pilot_history_rejected", []).extend(rejected)
+        changed = True
+
     if changed:
         try:
             with open(loop_state_path, "w") as f:
@@ -667,6 +709,21 @@ def evaluate_trading_stage_2_decision(project_name: str) -> StageDecision:
             ),
         )
 
+    # Gate 3b: vetted accounting lineage — backtests must use the Ledger/
+    # compute_metrics module, not hand-rolled equity math.
+    acct_passed, acct_msg = _check_uses_vetted_accounting(project_dir)
+    if not acct_passed:
+        return _write_decision(
+            loop_state_path, loop_state,
+            StageDecision(
+                type="infeasible_data",
+                passed=False,
+                feedback=acct_msg,
+                next_step="revise_strategy_code",
+                next_phase="revise_strategy_code",
+            ),
+        )
+
     # Gate 4: llm_cache variance (not a degenerate single-class classifier).
     var_passed, var_msg = _check_llm_cache_variance(project_dir)
     if not var_passed:
@@ -720,6 +777,63 @@ def evaluate_trading_stage_2_decision(project_name: str) -> StageDecision:
                 next_phase="revise_strategy_code",
             ),
         )
+
+    # Gate 7: numeric sanity (consistency-based; short blowups allowed).
+    # (a) If the sanitizer quarantined the NEWEST pilot row, the just-run pilot
+    # produced insane metrics — tell the agent to fix its ledger, not iterate.
+    rejected = loop_state.get("pilot_history_rejected") or []
+    kept = loop_state.get("pilot_history") or []
+    if rejected:
+        def _ver(row):
+            try:
+                return int(row.get("version", 0) or 0)
+            except (TypeError, ValueError):
+                return 0
+        newest_rejected = max(_ver(r) for r in rejected)
+        newest_kept = max((_ver(r) for r in kept), default=0)
+        if newest_rejected > newest_kept:
+            bad = max(rejected, key=_ver)
+            return _write_decision(
+                loop_state_path, loop_state,
+                StageDecision(
+                    type="insane_metrics",
+                    passed=False,
+                    feedback=(
+                        "The latest pilot backtest produced internally inconsistent "
+                        f"metrics and was quarantined: {'; '.join(bad.get('_violations', []))}. "
+                        "This is almost always broken accounting in the backtest script "
+                        "(e.g. trading past a blowup, mis-computed equity). Fix the "
+                        "ledger/accounting code and re-run the pilot. The quarantined row "
+                        "is in pilot_history_rejected for reference."
+                    ),
+                    next_step="revise_strategy_code",
+                    next_phase="revise_strategy_code",
+                ),
+            )
+    # (b) metrics_latest.json — same sanity bar as the history rows.
+    from sandbox_agent.pipeline.metrics_sanity import validate_metrics as _vm
+    metrics_latest = os.path.join(project_dir, "backtest", "pilot", "metrics_latest.json")
+    if os.path.exists(metrics_latest):
+        try:
+            with open(metrics_latest) as f:
+                latest = json.load(f)
+            violations = _vm(latest)
+        except Exception as e:
+            violations = [f"cannot parse metrics_latest.json: {e}"]
+        if violations:
+            return _write_decision(
+                loop_state_path, loop_state,
+                StageDecision(
+                    type="insane_metrics",
+                    passed=False,
+                    feedback=(
+                        "backtest/pilot/metrics_latest.json fails numeric sanity: "
+                        f"{'; '.join(violations)}. Fix the backtest accounting and re-run."
+                    ),
+                    next_step="revise_strategy_code",
+                    next_phase="revise_strategy_code",
+                ),
+            )
 
     # All gates passed — now consult pilot_history for the actual decision.
     return _write_decision(
@@ -1073,6 +1187,40 @@ def _check_strategy_reads_llm_cache(project_dir: str) -> Tuple[bool, str]:
     )
 
 
+def _check_uses_vetted_accounting(project_dir: str) -> Tuple[bool, str]:
+    """Every strategy/backtest script must import
+    `sandbox_agent.trading_accounting` (the vetted Ledger + compute_metrics).
+    Hand-rolled equity/return/drawdown accounting is how impossible numbers
+    (post-blowup trading, -235% drawdowns) entered pilot_history."""
+    script_dirs = [
+        os.path.join(project_dir, "backtest", "pilot"),
+        os.path.join(project_dir, "backtest", "full"),
+    ]
+    scripts = []
+    for d in script_dirs:
+        if os.path.isdir(d):
+            scripts.extend(os.path.join(d, n) for n in os.listdir(d) if n.endswith(".py"))
+    if not scripts:
+        return True, ""  # nothing to check yet (other gates demand the scripts)
+    offenders = []
+    for p in scripts:
+        try:
+            with open(p) as f:
+                txt = f.read()
+        except Exception:
+            continue
+        if "trading_accounting" not in txt:
+            offenders.append(os.path.relpath(p, project_dir))
+    if offenders:
+        return False, (
+            "Strategy/backtest script(s) do not use the vetted accounting module: "
+            f"{', '.join(offenders[:5])}. All backtests MUST use "
+            "`from sandbox_agent.trading_accounting import Ledger, compute_metrics` "
+            "for fills, equity, and metrics — hand-rolled accounting fails acceptance."
+        )
+    return True, ""
+
+
 def _check_llm_cache_variance(project_dir: str) -> Tuple[bool, str]:
     """Reject if classifier output is degenerate: any one value appears
     > 60% of the time, or < 3 distinct values exist. A monotone classifier
@@ -1286,6 +1434,13 @@ def _check_full_validation_metrics(project_dir: str) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Cannot parse backtest/full/metrics.json: {e}"
 
+    # Numeric sanity first — statistical gates are meaningless on internally
+    # inconsistent numbers (see metrics_sanity; short blowups allowed).
+    from sandbox_agent.pipeline.metrics_sanity import validate_metrics as _vm
+    sanity_errs = _vm(m)
+    if sanity_errs:
+        return False, "Full-validation metrics fail numeric sanity: " + "; ".join(sanity_errs)
+
     def _num(key: str) -> Optional[float]:
         v = m.get(key)
         if v is None:
@@ -1360,10 +1515,70 @@ def _check_full_validation_metrics(project_dir: str) -> Tuple[bool, str]:
     return True, ""
 
 
+def _stamp_and_pin_full_metrics(project_dir: str) -> None:
+    """After stage 3 passes: stamp backtest/full/metrics.json with the contract
+    fields and pin its canonical hash into pipeline state. Evaluator-owned —
+    the agent never computes these, which is what makes the pin trustworthy."""
+    from sandbox_agent.pipeline.metrics_sanity import stamp_metrics_file
+    from sandbox_agent.pipeline.orchestrator import load_state, save_state
+
+    path = os.path.join(project_dir, "backtest", "full", "metrics.json")
+    project_name = os.path.basename(os.path.normpath(project_dir))
+    try:
+        # Best-effort strategy version from the metrics file itself.
+        with open(path) as f:
+            version = str(json.load(f).get("strategy_version") or "unversioned")
+        stamped = stamp_metrics_file(path, strategy_version=version)
+        state = load_state(project_name)
+        if state:
+            state.pinned_full_metrics_hash = stamped["content_hash"]
+            save_state(state)
+            logger.info(
+                f"Stage 3 pass: pinned full-metrics hash {stamped['content_hash'][:12]}… "
+                f"for {project_name}")
+    except Exception:
+        logger.exception("Failed to stamp/pin full metrics (stage 3 still passes)")
+
+
+def _write_pipeline_metrics_summary(project_dir: str) -> None:
+    """After stage 4 passes: the EVALUATOR writes pipeline/metrics.json
+    (verdict, gates_passed, hash). Previously agent-written, which produced
+    files claiming gates_passed:0 / verdict:null alongside a PROMOTE."""
+    from sandbox_agent.pipeline.metrics_sanity import canonical_hash
+    from sandbox_agent.pipeline.orchestrator import load_state
+
+    project_name = os.path.basename(os.path.normpath(project_dir))
+    try:
+        verdict_text = open(os.path.join(project_dir, "pipeline", "verdict.md")).read()
+        rec = _extract_final_recommendation(verdict_text) or "unknown"
+        full_path = os.path.join(project_dir, "backtest", "full", "metrics.json")
+        with open(full_path) as f:
+            full_metrics = json.load(f)
+        state = load_state(project_name)
+        summary = {
+            "verdict": rec,
+            "gates_passed": True,
+            "metrics_hash": canonical_hash(full_metrics),
+            "pinned_hash": state.pinned_full_metrics_hash if state else None,
+            "strategy_version": full_metrics.get("strategy_version"),
+            "written_by": "evaluator",
+        }
+        out = os.path.join(project_dir, "pipeline", "metrics.json")
+        tmp = out + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        os.replace(tmp, out)
+    except Exception:
+        logger.exception("Failed to write pipeline/metrics.json summary (stage 4 still passes)")
+
+
 def _check_verdict_matches_metrics(project_dir: str) -> Tuple[bool, str]:
     """Stage-4 gate. Re-run the stage-3 gate against metrics.json; require the
     verdict's Final Recommendation to agree: all pass → 'promote', any fail →
-    'reject'. Mismatches fail acceptance and the verdict is rewritten."""
+    'reject'. Also enforce the metrics-hash pin: the metrics file must be the
+    EXACT one stage 3 passed (canonical hash match) and the verdict must cite
+    it — otherwise the verdict was rendered on different numbers than the file
+    now holds ("phantom promote"). Mismatches fail acceptance."""
     verdict_path = os.path.join(project_dir, "pipeline", "verdict.md")
     if not os.path.exists(verdict_path):
         return False, "Missing artifact: pipeline/verdict.md"
@@ -1380,6 +1595,33 @@ def _check_verdict_matches_metrics(project_dir: str) -> Tuple[bool, str]:
             "pipeline/verdict.md is missing a `Final Recommendation` line "
             "with a `promote` or `reject` keyword."
         )
+
+    # Metrics-hash pin (skipped for legacy pipelines with no pin).
+    from sandbox_agent.pipeline.metrics_sanity import canonical_hash
+    from sandbox_agent.pipeline.orchestrator import load_state
+    project_name = os.path.basename(os.path.normpath(project_dir))
+    state = load_state(project_name)
+    pin = state.pinned_full_metrics_hash if state else None
+    if pin:
+        full_path = os.path.join(project_dir, "backtest", "full", "metrics.json")
+        try:
+            with open(full_path) as f:
+                current_hash = canonical_hash(json.load(f))
+        except Exception as e:
+            return False, f"Cannot hash backtest/full/metrics.json: {e}"
+        if current_hash != pin:
+            return False, (
+                f"Metrics changed since stage 3 passed (hash {current_hash[:12]}… != "
+                f"pinned {pin[:12]}…) — the verdict would be judging numbers that never "
+                f"passed validation. Stage 3 must re-run on the current metrics. "
+                f"RESET_STAGE:3"
+            )
+        if f"Metrics Hash: {pin}" not in verdict_text:
+            return False, (
+                f"pipeline/verdict.md must cite the validated metrics with the literal "
+                f"line `Metrics Hash: {pin}` so the verdict is pinned to the exact "
+                f"numbers stage 3 passed. Add that line and re-submit."
+            )
 
     metrics_passed, metrics_msg = _check_full_validation_metrics(project_dir)
     expected = "promote" if metrics_passed else "reject"

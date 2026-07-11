@@ -22,14 +22,14 @@ If `pipeline/verdict.md` has "Final Recommendation: reject", this stage is **ski
    - ## Deployment Readiness (is this strategy ready for paper trading? For live trading with real money? What risks should the user be aware of?)
    - ## Learnings (what worked, what didn't, what would you change)
    - ## Recommended Next Steps (parameter tuning, regime filters, additional universe diversification, risk overlays)
-3. Update `status.md` with the final pipeline status.
+
+Do NOT write to `status.md`, `pipeline/state.json`, or any pipeline-state file — pipeline status is tracked automatically by the orchestrator, and writes to those files are rejected.
 
 ## If Previous Output Exists
 Tighten the assessment with newer data. Preserve honest criticism — don't soften weaknesses just because you're rerunning.
 
 ## Output Files
 - `pipeline/review.md` — full assessment
-- `status.md` — final pipeline status (auto-generated mostly, but can be enriched)
 
 ## Tools to Use
 - `project_read_file` for loading all prior artifacts

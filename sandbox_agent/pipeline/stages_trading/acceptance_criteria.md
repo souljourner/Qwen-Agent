@@ -21,14 +21,18 @@ Each invocation produces ONE step. The evaluator runs these gates in order; any 
 - **Hypothesis feasibility**: latest `hypothesis_v{N}.md` declares `required_data_types`; every entry appears as a source in `research/data-landscape.md`.
 - **OOS avoidance**: no pilot file references `oos/` or `data/processed/oos/`; `oos_cutoff_date` in `loop_state.json` unchanged since first fetch.
 - **Positive lineage**: latest `backtest/pilot/strategy_v{N}.py` references `data/processed/llm_cache/pilot/`.
+- **Vetted accounting**: every `backtest/**/*.py` imports `sandbox_agent.trading_accounting` (Ledger + compute_metrics). Hand-rolled equity/return math fails.
 - **Cache variance**: max classification bucket ≤ 60% AND ≥ 3 distinct output values.
 - **Cache coverage**: ≥ 80% of universe tickers have cache entries.
 - **Mock-signal phrase blacklist** on pilot results (hashlib.md5, "simulated", "mock", "synthetic", "fake", etc.).
+- **Numeric sanity (consistency-based)**: pilot_history rows and `metrics_latest.json` must be internally consistent — declared return/DD matching the equity curve when present; no NaN/inf; no trades after an equity ≤ 0 blowup; unverifiable claims capped (|return| ≤ 100x). Insane rows are quarantined to `pilot_history_rejected` and the decision becomes `insane_metrics` → fix the accounting. Short-strategy blowups (DD beyond −100% with a curve that really goes ≤ 0) are LEGITIMATE results, not violations.
 
-After gates pass, the evaluator computes a decision from `pilot_history`: `converge` / `iterate` / `needs_more_data` / `infeasible_data` / `insufficient_signal` / `dead_end` / `terminate`. The decision is written back to `loop_state.json` as `next_step` + `current_phase` — the LLM does not choose what happens next.
+After gates pass, the evaluator computes a decision from `pilot_history`: `converge` / `iterate` / `needs_more_data` / `infeasible_data` / `insufficient_signal` / `dead_end` / `terminate` / `insane_metrics`. The decision is written back to `loop_state.json` as `next_step` + `current_phase` — the LLM does not choose what happens next.
 
 ### Stage 3 (full_validation)
-- `backtest/full/metrics.json` present with required numeric fields.
+- `backtest/full/metrics.json` present with required numeric fields, passing the same numeric-sanity bar.
+- Every `backtest/**/*.py` imports `sandbox_agent.trading_accounting`.
+- On pass, the evaluator STAMPS metrics.json (schema_version, content_hash, strategy_version) and pins the hash in pipeline state.
 - `oos_sharpe / pilot_sharpe >= 0.5`.
 - `walk_forward_win_rate >= 0.6`.
 - `total_trades >= 100`.
@@ -41,6 +45,8 @@ After gates pass, the evaluator computes a decision from `pilot_history`: `conve
 ### Stage 4 (verdict)
 - `pipeline/verdict.md` has a `## Final Recommendation` section with `promote` or `reject` as the first word.
 - The recommendation **must match** the pass/fail of Stage 3 gates (recomputed here). Mismatch fails the stage.
+- **Metrics-hash pin**: `backtest/full/metrics.json` must hash-match what stage 3 stamped, and verdict.md must contain the literal `Metrics Hash: <hash>` line. If the metrics changed after stage 3 passed, the stage fails and stage 3 is automatically re-scheduled (RESET_STAGE:3).
+- `pipeline/metrics.json` is written by the EVALUATOR after the gate passes — agent writes to it are rejected.
 
 ### Stage 5 (paper_trading)
 - `paper/deploy.py` passes `python -m py_compile`.

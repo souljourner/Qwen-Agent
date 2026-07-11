@@ -58,3 +58,10 @@ class PipelineState(BaseModel):
     updated_at: Optional[datetime] = None
     lock_holder: Optional[str] = None
     pilot_llm_cost_usd: float = 0.0
+    # Set by the evaluator when trading stage 3 passes: canonical hash of the
+    # exact backtest/full/metrics.json that passed the gates. Stage 4's verdict
+    # must cite this hash — if the metrics change afterwards, the skew fails
+    # acceptance and stage 3 re-runs (prevents "phantom promote" where the
+    # verdict was rendered on different metrics than the file now holds).
+    # None = legacy pipeline predating this contract; the hash gate is skipped.
+    pinned_full_metrics_hash: Optional[str] = None

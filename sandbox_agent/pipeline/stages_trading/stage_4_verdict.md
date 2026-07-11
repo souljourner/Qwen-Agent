@@ -14,15 +14,17 @@ The "Final Recommendation" field in `pipeline/verdict.md` **must match** the pas
 A verdict narrative that says "reject" while metrics pass all gates will be rejected, as will the reverse.
 
 ## Instructions
-1. Read `backtest/full/metrics.json`.
+1. Read `backtest/full/metrics.json`. Do NOT modify it — if the numbers look wrong, say so in the verdict; changing the file after Stage 3 validated it fails acceptance (hash pin).
 2. Read `backtest/full/results.md`.
 3. Read `strategy/loop_state.json` (the full hypothesis_notes + pilot_history history).
 4. Read `strategy/hypothesis_v{final}.md`.
-5. Write `pipeline/verdict.md` with the required sections below.
-6. Write `pipeline/metrics.json` — a copy of `backtest/full/metrics.json` alongside the decision for downstream consumers.
+5. Write `pipeline/verdict.md` with the required sections below. If your prompt shows a "Validated Metrics Pin" block, include its exact `Metrics Hash: <hash>` line in verdict.md.
+
+(`pipeline/metrics.json` is written automatically by the evaluator after your verdict passes acceptance — do not write it yourself; agent writes to it are rejected.)
 
 ## Required sections in verdict.md
 - `## Final Recommendation` — one word on its own line: `promote` or `reject`.
+- `Metrics Hash: <hash>` — the literal line from the Validated Metrics Pin block (required whenever the pin appears in your prompt).
 - `## Rationale` — the "why" in plain English, grounded in the specific gates that passed/failed. Cite numbers.
 - `## Strategy Summary` — one-paragraph recap of the converged hypothesis, universe, and signal mechanics.
 - `## Research History` — one sentence per hypothesis attempted (from hypothesis_notes), plus final iteration count.

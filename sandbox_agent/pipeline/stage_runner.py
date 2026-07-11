@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import List, Optional
 
@@ -28,6 +29,25 @@ from sandbox_agent.pipeline.orchestrator import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_stage_task_name(task_name: str) -> tuple:
+    """Parse "pipeline:{project}:stage_{n}[optional-suffix]" -> (project, n).
+
+    Tolerates agent-created variants like "pipeline:X:stage_4_verdict" — the
+    old int(replace(...)) parser crashed on those and the failed task then
+    re-queued forever."""
+    parts = task_name.split(":")
+    if len(parts) < 3:
+        raise ValueError(f"Invalid pipeline task name: {task_name}")
+    project_name = parts[1]
+    m = re.match(r"stage_(\d+)", parts[2])
+    if not m:
+        raise ValueError(f"Cannot parse stage number from: {parts[2]}")
+    stage_number = int(m.group(1))
+    if stage_number < 1 or stage_number > 6:
+        raise ValueError(f"Unknown stage number: {stage_number}")
+    return project_name, stage_number
+
+
 def run_pipeline_stage(task, system_message: str) -> str:
     """Run a single pipeline stage. Called by cron_loop when task name starts with 'pipeline:'.
 
@@ -38,20 +58,7 @@ def run_pipeline_stage(task, system_message: str) -> str:
     Returns:
         Result text from the agent
     """
-    # Parse task name: "pipeline:{project}:stage_{n}"
-    parts = task.name.split(":")
-    if len(parts) < 3:
-        raise ValueError(f"Invalid pipeline task name: {task.name}")
-
-    project_name = parts[1]
-    stage_str = parts[2]  # "stage_1", "stage_2", etc.
-    try:
-        stage_number = int(stage_str.replace("stage_", ""))
-    except ValueError:
-        raise ValueError(f"Cannot parse stage number from: {stage_str}")
-
-    if stage_number < 1 or stage_number > 6:
-        raise ValueError(f"Unknown stage number: {stage_number}")
+    project_name, stage_number = _parse_stage_task_name(task.name)
 
     # Acquire pipeline lock
     if not acquire_lock(task.id):
@@ -83,6 +90,33 @@ def _execute_stage(project_name: str, stage_number: int, task_id: str, system_me
     stage = state.stages.get(stage_number)
     if not stage:
         return f"Stage {stage_number} not found in pipeline state"
+
+    # Terminal guard: a finished stage must never re-run. Stale duplicate tasks
+    # (incl. agent-created ones like "stage_4_verdict") used to re-execute
+    # completed stages and corrupt state ("phantom promote").
+    if stage.status in ("completed", "completed-no-more-attempts", "failed-no-more-attempts"):
+        logger.warning(
+            f"Pipeline {project_name} stage {stage_number}: skip — status '{stage.status}' is terminal")
+        return f"Skip: stage {stage_number} is terminal ({stage.status}); not re-running."
+
+    # Orphan guard: only the task the orchestrator scheduled may run the stage.
+    # A stale/duplicate task with a different id is skipped.
+    if stage.task_id and task_id and stage.task_id != task_id:
+        logger.warning(
+            f"Pipeline {project_name} stage {stage_number}: skip — task {task_id} is stale "
+            f"(current task is {stage.task_id})")
+        return f"Skip: task {task_id} is stale for stage {stage_number}; current task is {stage.task_id}."
+
+    # Budget enforcement: budget_seconds was previously prompt-advisory only.
+    # When the cumulative wall-clock since first start exceeds it, finalize the
+    # stage (proceed best-effort or fail) instead of running the agent again.
+    if stage.budget_seconds and stage.first_started_at:
+        elapsed = (datetime.now() - stage.first_started_at).total_seconds()
+        if elapsed > stage.budget_seconds:
+            from sandbox_agent.pipeline.orchestrator import finalize_stage_budget_exhausted
+            finalize_stage_budget_exhausted(project_name, stage_number)
+            return (f"Stage {stage_number} budget exhausted "
+                    f"({int(elapsed)}s > {stage.budget_seconds}s) — finalized without another run.")
 
     # Verdict-skip guard: for trading stages 5 and 6, skip execution entirely
     # when pipeline/verdict.md declares a rejection. The orchestrator already
@@ -144,15 +178,30 @@ def _load_artifacts(state: PipelineState, stage_number: int) -> str:
     inputs = get_stage_inputs(stage_number, state.pipeline_type)
     parts = []
 
+    stage_defn = get_stages(state.pipeline_type).get(stage_number, {})
+    max_chars = int(stage_defn.get("input_max_chars", 120000))
+
     for artifact_path in inputs:
         full_path = os.path.join(project_dir, artifact_path)
         if os.path.exists(full_path):
             try:
                 with open(full_path) as f:
                     content = f.read()
+                # loop_state as a downstream INPUT (stages 3/6): the evaluator
+                # needs the full history, the prompt doesn't — drop the bulky
+                # run_notes to keep the artifact block lean and prompt-stable.
+                if artifact_path.endswith("loop_state.json") and stage_number != 2:
+                    try:
+                        ls = json.loads(content)
+                        if "run_notes" in ls:
+                            n = len(ls.pop("run_notes") or [])
+                            ls["run_notes_omitted"] = f"{n} run notes omitted from this view"
+                        content = json.dumps(ls, indent=2)
+                    except Exception:  # noqa: BLE001 — fall back to raw content
+                        pass
                 # Cap each artifact to avoid blowing up context
-                if len(content) > 120000:
-                    content = content[:120000] + "\n\n... (truncated)"
+                if len(content) > max_chars:
+                    content = content[:max_chars] + "\n\n... (truncated)"
                 parts.append(f"### Artifact: {artifact_path}\n\n{content}")
             except Exception as e:
                 parts.append(f"### Artifact: {artifact_path}\n\n(Error reading: {e})")
@@ -162,18 +211,77 @@ def _load_artifacts(state: PipelineState, stage_number: int) -> str:
     return "\n\n---\n\n".join(parts) if parts else "(No input artifacts for this stage)"
 
 
+def _last_attempt_notes(notes: str, keep: int = 3) -> str:
+    """Render only the last `keep` per-attempt feedback blocks. Full history
+    stays in pipeline/state.json; the prompt tail stays bounded."""
+    if not notes.strip():
+        return ""
+    marker = "### Attempt "
+    blocks = notes.split(marker)
+    head, attempts = blocks[0], blocks[1:]
+    if len(attempts) <= keep:
+        return notes
+    kept = attempts[-keep:]
+    omitted = len(attempts) - keep
+    return (f"({omitted} earlier attempt note(s) omitted)\n\n"
+            + marker + marker.join(kept))
+
+
 def _build_prompt(state: PipelineState, stage, instructions: str, artifact_contents: str) -> str:
-    """Build the complete user message for a stage execution."""
+    """Build the complete user message for a stage execution.
+
+    ORDERING IS LOAD-BEARING for the vLLM prefix cache: everything stable
+    across part-completion runs of the same stage comes FIRST (header,
+    instructions, prior-stage artifacts, output requirements); everything
+    volatile (attempt counter, time budget, loop state, notes) comes LAST.
+    With the system message unchanged, consecutive runs then share a
+    many-thousand-token KV prefix instead of diverging ~200 tokens in at the
+    attempt counter."""
     stage_defn = get_stages(state.pipeline_type)[stage.stage_number]
 
+    # --- stable prefix ------------------------------------------------------
     parts = [
         f"# Pipeline Stage {stage.stage_number}: {stage_defn['name'].replace('_', ' ').title()}",
         f"",
         f"## Project: {state.project_name}",
         f"## Description: {state.description}",
-        f"## Attempt: {stage.run_count + 1} of {stage.max_attempts}",
+        f"",
+        f"## Instructions",
+        f"",
+        instructions,
         f"",
     ]
+
+    if artifact_contents and artifact_contents != "(No input artifacts for this stage)":
+        parts.extend([
+            f"## Previous Stage Artifacts",
+            f"",
+            artifact_contents,
+            f"",
+        ])
+
+    parts.extend([
+        f"## Output Requirements",
+        f"",
+        f"Save your output to these files using project_write_file(project='{state.project_name}', path='...', content='...'):",
+    ])
+    for artifact in stage.artifacts:
+        parts.append(f"- `{artifact}`")
+
+    if stage_defn["required_sections"]:
+        parts.append(f"")
+        parts.append(f"Required sections in the output:")
+        for section in stage_defn["required_sections"]:
+            parts.append(f"- ## {section}")
+    parts.append(f"")
+
+    # --- volatile tail ------------------------------------------------------
+    parts.extend([
+        f"## Current Run State",
+        f"",
+        f"Attempt: {stage.run_count + 1} of {stage.max_attempts}",
+        f"",
+    ])
 
     # Time budget (only emitted when the stage definition sets one)
     budget_block = _build_time_budget_block(stage)
@@ -194,45 +302,33 @@ def _build_prompt(state: PipelineState, stage, instructions: str, artifact_conte
     if mvp_audit_block:
         parts.extend([mvp_audit_block, f""])
 
-    parts.extend([
-        f"## Instructions",
-        f"",
-        instructions,
-        f"",
-    ])
-
-    # Add previous artifacts
-    if artifact_contents and artifact_contents != "(No input artifacts for this stage)":
+    # Metrics-hash pin (trading stage 4 only): the verdict must cite the exact
+    # metrics stage 3 validated — the evaluator rejects a verdict without this
+    # literal line or with a hash that no longer matches the file.
+    if state.pipeline_type == "trading" and stage.stage_number == 4 and \
+            getattr(state, "pinned_full_metrics_hash", None):
         parts.extend([
-            f"## Previous Stage Artifacts",
+            f"## Validated Metrics Pin",
+            f"Stage 3 validated backtest/full/metrics.json with content hash "
+            f"`{state.pinned_full_metrics_hash}`. Your verdict.md MUST include this "
+            f"exact line:",
             f"",
-            artifact_contents,
+            f"Metrics Hash: {state.pinned_full_metrics_hash}",
+            f"",
+            f"Do NOT modify backtest/full/metrics.json — if the numbers changed, "
+            f"stage 3 must re-validate first.",
             f"",
         ])
 
-    # Add notes from previous attempts
-    if stage.notes.strip():
+    # Notes from previous attempts (last 3 only — full history in state.json)
+    rendered_notes = _last_attempt_notes(stage.notes)
+    if rendered_notes:
         parts.extend([
             f"## Notes from Previous Attempts",
             f"",
-            stage.notes,
+            rendered_notes,
             f"",
         ])
-
-    # Add output requirements
-    parts.extend([
-        f"## Output Requirements",
-        f"",
-        f"Save your output to these files using project_write_file(project='{state.project_name}', path='...', content='...'):",
-    ])
-    for artifact in stage.artifacts:
-        parts.append(f"- `{artifact}`")
-
-    if stage_defn["required_sections"]:
-        parts.append(f"")
-        parts.append(f"Required sections in the output:")
-        for section in stage_defn["required_sections"]:
-            parts.append(f"- ## {section}")
 
     return "\n".join(parts)
 

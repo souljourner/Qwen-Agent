@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +36,26 @@ def _project_dir(project_name: str) -> str:
     if not safe_name:
         raise ValueError(f"Invalid project name: {project_name}")
     return os.path.join(PROJECTS_DIR, safe_name)
+
+
+# Files the pipeline orchestrator owns exclusively. Agents used to invent a
+# shadow "pipeline/pipeline_state.json" and hand-edit status files, producing
+# contradictory pipeline state ("phantom promote"). Writes are denied at the
+# tool layer; pipeline/state.json is the single source of truth.
+_ORCHESTRATOR_OWNED = ("pipeline/state.json", "pipeline/pipeline_state.json", "status.md",
+                       "pipeline/metrics.json")
+
+
+def _is_orchestrator_owned(rel_path: str) -> bool:
+    norm = os.path.normpath(rel_path).replace(os.sep, "/")
+    return norm in _ORCHESTRATOR_OWNED
+
+
+_ORCHESTRATOR_OWNED_MSG = (
+    "Error: '{path}' is pipeline-orchestrator-owned state — agents must not write it. "
+    "Pipeline status is tracked automatically in pipeline/state.json; write your outputs "
+    "to the stage's declared artifact files only."
+)
 
 
 def _project_meta_path(project_dir: str) -> str:
@@ -333,6 +354,9 @@ class ProjectWriteFile(BaseTool):
         if file_path.startswith("..") or file_path.startswith("/"):
             return "Invalid path: must be relative within the project."
 
+        if _is_orchestrator_owned(file_path):
+            return _ORCHESTRATOR_OWNED_MSG.format(path=file_path)
+
         full_path = os.path.join(pdir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
@@ -618,6 +642,12 @@ class ProjectApplyPatch(BaseTool):
             return f"Project '{params['project']}' not found."
 
         patch_text = params["patch"]
+        # Deny patches touching orchestrator-owned state files (same guard as
+        # project_write_file — see _ORCHESTRATOR_OWNED).
+        for line in patch_text.splitlines():
+            m = re.match(r"\*\*\* (?:Add|Update|Delete) File: (.+)$", line.strip())
+            if m and _is_orchestrator_owned(m.group(1).strip()):
+                return _ORCHESTRATOR_OWNED_MSG.format(path=m.group(1).strip())
         try:
             result = _apply_patch(pdir, patch_text)
         except Exception as e:

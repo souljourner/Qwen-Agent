@@ -113,7 +113,8 @@ TRADING_STAGES = {
         ],
         "outputs": [
             "pipeline/verdict.md",
-            "pipeline/metrics.json",
+            # pipeline/metrics.json is EVALUATOR-written after the verdict gate
+            # passes (see _write_pipeline_metrics_summary) — not an agent output.
         ],
         "required_sections": ["Final Recommendation", "Rationale", "Strategy Summary"],
     },
@@ -267,7 +268,23 @@ def advance_pipeline(project_name: str, stage_number: int, passed: bool, feedbac
         stage.run_count += 1
         stage.acceptance_result = feedback
 
-        if stage.run_count >= stage.max_attempts:
+        if "RESET_STAGE:3" in feedback and stage_number == 4:
+            # Metrics-hash skew: the metrics file changed after stage 3 passed,
+            # so the validation itself is stale. Re-run stage 3 on the current
+            # metrics; stage 4 waits (it is re-scheduled by stage 3's
+            # completion path) instead of retrying against unvalidated numbers.
+            logger.warning(
+                f"Pipeline {project_name}: metrics hash skew at stage 4 — "
+                f"resetting stage 3 for re-validation")
+            state.pinned_full_metrics_hash = None
+            stage.status = "scheduled"          # stage 4 waits, no task enqueued
+            stage.notes += f"\n\n### Attempt {stage.run_count} feedback:\n{feedback}"
+            stage3 = state.stages[3]
+            stage3.status = "scheduled"
+            stage3.task_id = None
+            stage3.notes += "\n\n### Re-validation:\nmetrics changed after stage-3 pass (hash skew at stage 4)"
+            _schedule_stage(state, 3)
+        elif stage.run_count >= stage.max_attempts:
             _finalize_exhausted_stage(
                 state, stage,
                 reason=f"max attempts ({stage.max_attempts}) reached",
@@ -351,12 +368,36 @@ def mark_stage_failed(project_name: str, stage_number: int, error: str) -> None:
     stage.run_count += 1
 
     if stage.run_count >= stage.max_attempts:
-        stage.status = "failed-no-more-attempts"
-    else:
-        stage.status = "scheduled"
+        # Exhausted: finalize (proceed best-effort or close the pipeline).
+        # Previously this set failed-no-more-attempts and STILL fell through
+        # to _schedule_stage — the stage re-enqueued forever (observed: one
+        # stage_2 accumulated 112 attempts).
+        _finalize_exhausted_stage(
+            state, stage,
+            reason=f"max attempts ({stage.max_attempts}) reached (exception path)",
+            last_feedback=error[:500],
+        )
+        save_state(state)
+        return
 
+    stage.status = "scheduled"
     save_state(state)
     _schedule_stage(state, stage_number)
+
+
+def finalize_stage_budget_exhausted(project_name: str, stage_number: int) -> None:
+    """Finalize a stage whose cumulative wall-clock budget (budget_seconds) is
+    spent — called by the stage runner BEFORE another agent run is started."""
+    state = load_state(project_name)
+    if not state:
+        return
+    stage = state.stages[stage_number]
+    _finalize_exhausted_stage(
+        state, stage,
+        reason=f"budget_seconds ({stage.budget_seconds}s) exhausted",
+        last_feedback=stage.notes[-500:] if stage.notes else "",
+    )
+    save_state(state)
 
 
 def _finalize_exhausted_stage(
