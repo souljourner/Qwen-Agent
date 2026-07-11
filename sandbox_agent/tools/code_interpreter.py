@@ -264,4 +264,9 @@ class LocalCodeInterpreter(BaseTool):
     def call(self, params: Union[str, dict], **kwargs) -> str:
         params = self._verify_json_format_args(params)
         code = params["code"]
+        # Email policy: no hand-rolled SMTP from interpreter code.
+        from sandbox_agent.email_policy import BLOCKED_EMAIL_MSG, contains_email_bypass, log_blocked
+        if contains_email_bypass(code):
+            log_blocked("code_interpreter", code)
+            return f"Error: {BLOCKED_EMAIL_MSG} Use the send_email tool instead."
         return _execute_code(code)

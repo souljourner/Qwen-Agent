@@ -19,10 +19,12 @@ Chat, cron, heartbeat, pipelines, and the LLM bridge share a single Python proce
 
 **Resolved looks like:** background lanes supervised/restartable independently of chat (separate processes or a supervisor); an emergency LLM fallback that doesn't share the GPU; memory limits on pipeline children.
 
-## 4. Capability has outgrown the security model — NOT RESOLVED
-The agent has `exec` with network, a browser **with a credential store**, `send_email`, and a readable `.env` with real credentials. The sanitizer covers fetched text, but browser screenshots feed the vision model unsanitized, and a prompt-injection → exec/send_email exfiltration chain genuinely exists. Real defense today is single-user-on-LAN.
+## 4. Capability has outgrown the security model — PARTIALLY RESOLVED (email channel locked 2026-07-11)
+The agent has `exec` with network, a browser **with a credential store**, and a readable `.env` with real credentials; browser screenshots feed the vision model unsanitized. Real defense remains single-user-on-LAN.
 
-**Resolved looks like:** tool-approval tiers for destructive/outbound ops (send_email to new recipients, credential reads, off-LAN egress); browser-page content treated as untrusted in prompts; secrets moved out of world-readable files.
+Done (email slice): the agent can email ONLY the owner, ONLY via send_email — the tool has no recipient parameter; `send_email_message` enforces an EMAIL_TO/ALERT_EMAIL allowlist; hand-rolled SMTP (smtplib/sendmail/smtp://) is blocked at every agent code entry point (exec commands, code_interpreter code, project file writes/patches) and any attempt logs a `blocked_email` event that health-alerts the owner immediately. Residual: pre-existing files on disk with smtplib (legacy soxs monitors) still run; SMTP creds in `.env` remain readable.
+
+**Remaining for full resolution:** tool-approval tiers for destructive ops and credential reads; browser-page content treated as untrusted; secrets moved out of world-readable files; egress control.
 
 ## 5. Failures don't teach it anything — RESOLVED 2026-07-11
 Was: every failure class repeated until a human read the logs (QueuePool errors ran for days; the agent's own SMTP request sat unread 3 weeks; stage-6 "instruction improvement suggestions" were structurally unappliable — the agent user can't write /app).

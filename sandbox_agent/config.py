@@ -138,6 +138,7 @@ def get_smtp_config() -> dict:
         "password": _get("SMTP_PASS"),
         "from": _get("SMTP_FROM") or user,
         "to": _get("EMAIL_TO") or _get("ALERT_EMAIL"),
+        "alert_to": _get("ALERT_EMAIL"),
     }
 
 TOOL_LIST = [

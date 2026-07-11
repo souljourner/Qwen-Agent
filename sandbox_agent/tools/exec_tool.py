@@ -168,6 +168,12 @@ class ExecTool(BaseTool):
         else:
             workdir = DATA_DIR
 
+        # Email policy: no hand-rolled SMTP from shell commands.
+        from sandbox_agent.email_policy import BLOCKED_EMAIL_MSG, contains_email_bypass, log_blocked
+        if contains_email_bypass(command):
+            log_blocked("exec", command)
+            return f"Error: {BLOCKED_EMAIL_MSG} Use the send_email tool instead."
+
         # Block dangerous commands
         if _is_blocked(command):
             logger.warning(f"Blocked exec command: {command}")

@@ -131,9 +131,11 @@ def test_sends_email_with_defaults(smtp_ready):
     assert "All good." in payload
 
 
-def test_explicit_to_overrides_default(smtp_ready):
+def test_explicit_to_is_ignored_by_policy(smtp_ready):
+    # Email policy (2026-07-11): recipient is fixed to the owner; a model-
+    # supplied `to` must NOT be honored (see test_email_policy.py).
     SendEmail().call({"subject": "s", "body": "b", "to": "other@example.com"})
-    assert smtp_ready.instances[-1].sent[0][1] == ["other@example.com"]
+    assert smtp_ready.instances[-1].sent[0][1] == ["owner@example.com"]
 
 
 def test_not_configured_error(clean_env, monkeypatch):

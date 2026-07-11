@@ -31,6 +31,7 @@ FAILURE_EVENT_THRESHOLDS = {
     "task_queue_corrupt": 1,
     "blocked_exec": 3,
     "selftest_failed": 1,   # a failing test suite is always alert-worthy
+    "blocked_email": 1,     # an email-bypass attempt is a bug or an injection
 }
 HEALTH_STALE_REQUEST_HOURS = int(os.environ.get("HEALTH_STALE_REQUEST_HOURS", 24))
 HEALTH_ALERT_MIN_INTERVAL_S = int(os.environ.get("HEALTH_ALERT_MIN_INTERVAL_S", 86_400))

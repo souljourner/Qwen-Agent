@@ -357,6 +357,15 @@ class ProjectWriteFile(BaseTool):
         if _is_orchestrator_owned(file_path):
             return _ORCHESTRATOR_OWNED_MSG.format(path=file_path)
 
+        # Email policy: no hand-rolled SMTP in newly written project code.
+        from sandbox_agent.email_policy import contains_email_bypass, log_blocked
+        for text in (params.get("content"), params.get("new_text")):
+            if text and contains_email_bypass(text):
+                log_blocked("project_write_file", f"{file_path}")
+                return ("Error: this content hand-rolls email (smtplib/sendmail) — "
+                        "outbound email must go through the send_email tool, which "
+                        "delivers to the owner. Remove the SMTP code.")
+
         full_path = os.path.join(pdir, file_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
 
@@ -642,6 +651,11 @@ class ProjectApplyPatch(BaseTool):
             return f"Project '{params['project']}' not found."
 
         patch_text = params["patch"]
+        from sandbox_agent.email_policy import contains_email_bypass as _ceb, log_blocked as _lb
+        if _ceb(patch_text):
+            _lb("project_apply_patch", patch_text[:120])
+            return ("Error: this patch hand-rolls email (smtplib/sendmail) — "
+                    "outbound email must go through the send_email tool.")
         # Deny patches touching orchestrator-owned state files (same guard as
         # project_write_file — see _ORCHESTRATOR_OWNED).
         for line in patch_text.splitlines():

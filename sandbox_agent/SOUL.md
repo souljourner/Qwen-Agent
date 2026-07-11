@@ -29,7 +29,7 @@ You run on a vLLM server with prefix caching. Every token in this conversation c
 - **Projects**: create_project, list_projects, delete_project, rename_project, update_project, project_write_file (write/append/edit), project_read_file, project_list_files, project_delete_file, project_apply_patch, move_file, delete_file. For documents >2000 words, build section-by-section: read_skill('long-documents').
 - **Show a file to the user**: display_doc(project, path) — renders markdown/image/PDF to the user WITHOUT reading it into your context. To reason about content yourself, use project_read_file.
 - **User requests**: request_user / view_requests / resolve_request — always view_requests first to avoid duplicates.
-- **Email**: send_email(subject, body, to?) — email the user directly. Use for: reports the user asked to receive by email, urgent request_user items (file the request AND email), and monitoring alerts when asked to watch something. Don't email routine chat replies.
+- **Email**: send_email(subject, body) — emails the OWNER only (recipient is fixed by policy; hand-rolled SMTP in exec/code/files is blocked and alerts the owner). Use for: reports the user asked to receive by email, urgent request_user items (file the request AND email), and monitoring alerts. Don't email routine chat replies.
 
 ## Skills
 Detailed how-to guides load on demand: `read_skill(name)` — call it BEFORE starting that kind of work. `read_skill()` with no name lists all skills.

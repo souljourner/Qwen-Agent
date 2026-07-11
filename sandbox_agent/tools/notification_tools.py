@@ -209,11 +209,10 @@ class SendEmail(BaseTool):
 
     name = "send_email"
     description = (
-        "Send an email to the user. Use for: reports the user asked to receive by "
-        "email, urgent request_user items that need attention, and task/monitoring "
-        "alerts when asked to watch something. Body may be markdown or HTML; it is "
-        "delivered as HTML by default. Recipient defaults to the configured user "
-        "address — only pass 'to' when explicitly asked to email someone else."
+        "Send an email to the OWNER of this agent (the configured user address — "
+        "recipient is fixed and cannot be changed). Use for: reports the user asked "
+        "to receive by email, urgent request_user items, and task/monitoring alerts. "
+        "Body may be markdown or HTML; delivered as HTML by default."
     )
     parameters = {
         "type": "object",
@@ -225,10 +224,6 @@ class SendEmail(BaseTool):
             "body": {
                 "type": "string",
                 "description": "Email body (markdown or HTML).",
-            },
-            "to": {
-                "type": "string",
-                "description": "Recipient address. Omit to use the configured default.",
             },
             "html": {
                 "type": "boolean",
@@ -256,10 +251,11 @@ class SendEmail(BaseTool):
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
         params = self._verify_json_format_args(params)
+        # Recipient is ALWAYS the configured owner — a model-supplied `to` is
+        # ignored (email policy: no arbitrary recipients, ever).
         return send_email_message(
             subject=params["subject"],
             body=params["body"],
-            to=(params.get("to") or "").strip() or None,
             html=params.get("html", True),
         )
 
@@ -273,8 +269,13 @@ def send_email_message(subject: str, body: str, to: str = None, html: bool = Tru
                 "in the environment or DATA_DIR/.env.")
     to_addr = to or cfg["to"]
     if not to_addr:
-        return ("Error: no recipient — pass 'to' or set EMAIL_TO (or ALERT_EMAIL) "
+        return ("Error: no recipient — set EMAIL_TO (or ALERT_EMAIL) "
                 "in the environment or DATA_DIR/.env.")
+    from sandbox_agent.email_policy import log_blocked, recipient_allowed
+    if not recipient_allowed(to_addr):
+        log_blocked("send_email_message", f"to={to_addr}")
+        return (f"Error: recipient {to_addr!r} is not allowed — email policy permits "
+                f"only the configured owner address(es).")
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
