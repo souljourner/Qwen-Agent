@@ -17,6 +17,7 @@ from sandbox_agent.config import (
     MEMORIES_COMPACT_TRIGGER_CHARS,
     MEMORIES_INJECT_MAX_CHARS,
 )
+from sandbox_agent.health import run_health_check
 from sandbox_agent.scheduler.task_queue import TaskQueue
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,14 @@ class HeartbeatRunner:
         # Memory over-cap maintenance (deterministic pre-check)
         memory_item = self._memory_maintenance_item()
 
+        # System-health scan (deterministic; also emails the user directly on
+        # NEW alerts — the heartbeat items are the investigate-and-fix side).
+        try:
+            health_items = run_health_check(data_dir=self.data_dir)
+        except Exception:  # noqa: BLE001
+            logger.exception("heartbeat: health check failed")
+            health_items = []
+
         # Build the heartbeat user message
         parts = ["## Heartbeat Check\n"]
         if pending_items:
@@ -167,7 +176,16 @@ class HeartbeatRunner:
             parts.append(f"- {memory_item}")
             parts.append("")
 
-        if not pending_items and not due_tasks and not memory_item:
+        if health_items:
+            parts.append("### System Health (auto)")
+            for item in health_items:
+                parts.append(f"- {item}")
+            parts.append("- Investigate the above (list_tasks, view_requests, read the "
+                         "dashboard), fix what you can, and resolve/answer stale requests. "
+                         "The user has already been emailed a copy.")
+            parts.append("")
+
+        if not pending_items and not due_tasks and not memory_item and not health_items:
             # Nothing to check — skip the LLM call entirely
             logger.debug("HEARTBEAT_OK (no items to check)")
             return None

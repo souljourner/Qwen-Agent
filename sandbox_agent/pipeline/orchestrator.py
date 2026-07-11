@@ -264,6 +264,11 @@ def advance_pipeline(project_name: str, stage_number: int, passed: bool, feedbac
         else:
             state.status = "completed"
             logger.info(f"Pipeline {project_name} completed all stages")
+            # Close the self-improvement loop: the final review stage writes
+            # instruction-improvement suggestions; file a heartbeat item so
+            # the agent actually applies them (via DATA_DIR/pipeline_stages/
+            # overrides — see load_stage_instructions).
+            _file_review_followup(state)
     else:
         stage.run_count += 1
         stage.acceptance_result = feedback
@@ -673,10 +678,39 @@ def reschedule_orphaned_stages_on_startup() -> list:
     return rescheduled
 
 
+def _file_review_followup(state: PipelineState) -> None:
+    """Append a one-shot HEARTBEAT.md item pointing the agent at the completed
+    pipeline's review suggestions. Idempotent per project (marker check)."""
+    try:
+        from sandbox_agent.tools.self_edit_tools import _read_file, _write_file
+        review_rel = f"projects/{state.project_name}/pipeline/review.md"
+        current = _read_file("HEARTBEAT.md")
+        if review_rel in current:
+            return
+        item = (f"- [ ] Pipeline '{state.project_name}' finished — read {review_rel} "
+                f"('Learnings' / instruction suggestions) and apply worthwhile "
+                f"improvements as override files under "
+                f"pipeline_stages/{state.pipeline_type}/ (same filenames as the "
+                f"bundled stage instructions), then check this off.")
+        _write_file("HEARTBEAT.md", current.rstrip("\n") + "\n" + item + "\n")
+        logger.info(f"Filed review follow-up heartbeat item for {state.project_name}")
+    except Exception:  # noqa: BLE001 — follow-up filing must not fail the pipeline
+        logger.exception("Could not file review follow-up heartbeat item")
+
+
 def load_stage_instructions(stage_number: int, pipeline_type: str) -> str:
-    """Load the markdown instruction file for a stage."""
+    """Load the markdown instruction file for a stage.
+
+    DATA_DIR/pipeline_stages/<type>/ overrides win over the bundled files —
+    the agent user cannot write /app, so without this the stage-6 review's
+    "instruction improvement suggestions" were dead letters. Improvements are
+    applied by writing an override copy there."""
     stage_name = get_stages(pipeline_type)[stage_number]["name"]
-    md_path = get_instructions_dir(pipeline_type) / f"stage_{stage_number}_{stage_name}.md"
+    fname = f"stage_{stage_number}_{stage_name}.md"
+    override = Path(DATA_DIR) / "pipeline_stages" / pipeline_type / fname
+    if override.exists():
+        return override.read_text()
+    md_path = get_instructions_dir(pipeline_type) / fname
     if md_path.exists():
         return md_path.read_text()
     return f"Execute stage {stage_number}: {stage_name}. Save output to the expected artifact files."

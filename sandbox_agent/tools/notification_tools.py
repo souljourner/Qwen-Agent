@@ -256,39 +256,49 @@ class SendEmail(BaseTool):
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
         params = self._verify_json_format_args(params)
-        cfg = get_smtp_config()
-        if not (cfg["host"] and cfg["user"] and cfg["password"]):
-            return ("Error: email is not configured — set SMTP_HOST/SMTP_USER/SMTP_PASS "
-                    "in the environment or DATA_DIR/.env.")
-        to_addr = (params.get("to") or "").strip() or cfg["to"]
-        if not to_addr:
-            return ("Error: no recipient — pass 'to' or set EMAIL_TO (or ALERT_EMAIL) "
-                    "in the environment or DATA_DIR/.env.")
+        return send_email_message(
+            subject=params["subject"],
+            body=params["body"],
+            to=(params.get("to") or "").strip() or None,
+            html=params.get("html", True),
+        )
 
-        subject = params["subject"]
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = cfg["from"]
-        msg["To"] = to_addr
-        msg.attach(self._to_mime_body(params["body"], params.get("html", True)))
 
-        last_err: Exception | None = None
-        for attempt in (1, 2):  # one retry on transient failure
+def send_email_message(subject: str, body: str, to: str = None, html: bool = True) -> str:
+    """Module-level sender shared by the send_email tool and code-driven
+    alerts (health checks). Never raises; returns a status string."""
+    cfg = get_smtp_config()
+    if not (cfg["host"] and cfg["user"] and cfg["password"]):
+        return ("Error: email is not configured — set SMTP_HOST/SMTP_USER/SMTP_PASS "
+                "in the environment or DATA_DIR/.env.")
+    to_addr = to or cfg["to"]
+    if not to_addr:
+        return ("Error: no recipient — pass 'to' or set EMAIL_TO (or ALERT_EMAIL) "
+                "in the environment or DATA_DIR/.env.")
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = cfg["from"]
+    msg["To"] = to_addr
+    msg.attach(SendEmail._to_mime_body(body, html))
+
+    last_err = None
+    for attempt in (1, 2):  # one retry on transient failure
+        try:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(cfg["host"], cfg["port"], timeout=30) as server:
+                server.ehlo()
+                server.starttls(context=context)
+                server.ehlo()
+                server.login(cfg["user"], cfg["password"])
+                server.sendmail(cfg["from"], [to_addr], msg.as_string())
             try:
-                context = ssl.create_default_context()
-                with smtplib.SMTP(cfg["host"], cfg["port"], timeout=30) as server:
-                    server.ehlo()
-                    server.starttls(context=context)
-                    server.ehlo()
-                    server.login(cfg["user"], cfg["password"])
-                    server.sendmail(cfg["from"], [to_addr], msg.as_string())
-                try:
-                    log_event("email_sent", subject=subject[:200], to=to_addr)
-                except Exception:  # noqa: BLE001 — logging must not fail the send
-                    pass
-                return f"Email sent to {to_addr}: {subject}"
-            except Exception as e:  # noqa: BLE001 — tool must never raise
-                last_err = e
-                if attempt == 1:
-                    time.sleep(1)
-        return f"Error: email failed after retry — {type(last_err).__name__}: {last_err}"
+                log_event("email_sent", subject=subject[:200], to=to_addr)
+            except Exception:  # noqa: BLE001 — logging must not fail the send
+                pass
+            return f"Email sent to {to_addr}: {subject}"
+        except Exception as e:  # noqa: BLE001 — must never raise
+            last_err = e
+            if attempt == 1:
+                time.sleep(1)
+    return f"Error: email failed after retry — {type(last_err).__name__}: {last_err}"
