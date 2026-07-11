@@ -275,6 +275,24 @@ def _build_prompt(state: PipelineState, stage, instructions: str, artifact_conte
             parts.append(f"- ## {section}")
     parts.append(f"")
 
+    # Prior pipeline learnings (stage 1 only): seed a fresh pipeline with what
+    # earlier pipelines concluded (auto-extracted from their stage-6 reviews).
+    if stage.stage_number == 1:
+        learnings_path = os.path.join(DATA_DIR, "learnings", "pipeline-learnings.md")
+        if os.path.exists(learnings_path):
+            try:
+                learnings = open(learnings_path).read()[-8000:]
+                parts.extend([
+                    f"## Prior Pipeline Learnings",
+                    f"Lessons from previously completed pipelines — factor them into "
+                    f"your approach (avoid repeating known dead ends):",
+                    f"",
+                    learnings,
+                    f"",
+                ])
+            except OSError:
+                pass
+
     # --- volatile tail ------------------------------------------------------
     parts.extend([
         f"## Current Run State",

@@ -147,7 +147,7 @@ TOOL_LIST = [
     "read_memories", "add_memory", "compact_memories",
     "read_skill",
     "code_interpreter", "exec",
-    "list_chat_logs", "read_chat_log",
+    "list_chat_logs", "read_chat_log", "session_search",
     "create_project", "list_projects", "delete_project", "rename_project", "update_project", "project_write_file",
     "project_read_file", "project_list_files", "project_delete_file", "project_apply_patch",
     "display_doc", "download_file",

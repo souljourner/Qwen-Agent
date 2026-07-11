@@ -46,8 +46,8 @@ Docker container (no-new-privileges, cap_drop: ALL, tmpfs /tmp:10G)
 ├── Chainlit (PID 1, asyncio event loop, port 7860)
 │   ├── on_message       → _execute_agent_turn (drains worker→queue, streams to UI)
 │   ├── on_chat_start    → fresh history
-│   └── on_chat_resume   → rebuild history from chat.db (assistant text + user only;
-│                          tools/reasoning intentionally NOT replayed — see shortcomings)
+│   └── on_chat_resume   → load per-thread history sidecar (exact agent context incl.
+│                          tool results); chat.db tool-pair reconstruction as fallback
 │
 ├── Worker threads (one per chat turn)
 │   └── _run_agent_in_thread runs agent.run(messages), pushes cumulative
@@ -356,7 +356,7 @@ Background sessions (cron, heartbeat) use the metadata-free base to preserve the
 **The prioritized weakness assessment lives in [`weaknesses_to_resolve.md`](weaknesses_to_resolve.md)** — seven structural weaknesses with status and what "resolved" looks like. Summary (as of 2026-07-11):
 
 1. **The agent grades its own homework** — only the trading pipeline has ground-truth gates; all other work products (reports, updates, digests) are unverified LLM output. *Not resolved.*
-2. **It can't remember its own conclusions** — resume drops tool context (~44k ceiling), no session search, no cross-project knowledge flow. *Direction chosen (OpenClaw-style resume restoration, then Hermes-style session search); not implemented.*
+2. **It can't remember its own conclusions** — *RESOLVED 2026-07-11*: per-thread history sidecar (exact agent context restored on reload, chat.db tool-pair reconstruction as fallback), `session_search` FTS tool over all sessions + task results, stage-6 learnings auto-flow into new pipelines' stage-1 prompts.
 3. **One process, one GPU, one point of failure** — all lanes in one Python process; both models share one GPU; no cloud failover. *Not resolved.*
 4. **Capability has outgrown the security model** — exec + browser credential store + send_email + readable `.env` = a real prompt-injection exfiltration chain; defense is single-user-LAN. *Not resolved.*
 5. **Failures don't teach it anything** — *RESOLVED 2026-07-11*: deterministic health monitoring (`health.py`) emails failure bursts + stale requests directly and feeds heartbeat investigate-items; stage instructions now DATA_DIR-overridable so stage-6 review suggestions are actually appliable.

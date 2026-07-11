@@ -51,6 +51,7 @@ import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 import sandbox_agent.tools.browser_tools  # noqa: F401
 import sandbox_agent.tools.skill_tools  # noqa: F401
+import sandbox_agent.tools.session_search_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

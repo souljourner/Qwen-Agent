@@ -7,11 +7,12 @@ The trading pipeline now has programmatic gates (metrics sanity, hash-pinned ver
 
 **Resolved looks like:** every recurring work product has at least one deterministic ground-truth check (source citations that resolve, numbers recomputed from data, claims spot-checked against fetched sources); LLM-judged acceptance uses adversarial framing ("try to refute") rather than confirmation.
 
-## 2. It can't remember its own conclusions — NOT RESOLVED (researched, direction chosen)
+## 2. It can't remember its own conclusions — RESOLVED 2026-07-11
 Memory is a capped flat file plus daily chat logs. `on_chat_resume` drops all tool-gathered context (the ~44k ceiling; agent re-reads everything after any reload). No session search — "what did we decide about X three weeks ago?" means grepping markdown by hand. Knowledge doesn't flow between projects; lessons die with the project unless `add_memory` happened to fire.
 
-**Direction (researched 2026-05):** OpenClaw-style resume restoration (replay tool-call/result pairs from chat.db, let the 170k compactor manage size) first; Hermes-style `session_search` tool (FTS over chat history) as the follow-up.
-**Resolved looks like:** page reload doesn't lose gathered context; the agent can search past sessions by content.
+Done: (a) per-thread **history sidecar** (`chat_history.py`) persists the agent's exact Message list — incl. tool results and multimodal content — after every turn; resume loads it verbatim. Threads predating the sidecar fall back to chat.db reconstruction with tool-pair replay (newest-first, ~100k-token cap). (b) **`session_search` tool**: FTS5 index over all chat steps + completed-task results, incrementally refreshed, with SOUL guidance to search before asking the user to repeat. (c) **Cross-project learnings**: stage-6 review `## Learnings` auto-extracted to `learnings/pipeline-learnings.md` and injected into every new pipeline's stage-1 prompt. 21 tests.
+
+**Remaining niggle:** the search index covers chat + tasks, not project files; reasoning steps are (deliberately) not indexed.
 
 ## 3. One process, one GPU, one point of failure — NOT RESOLVED
 Chat, cron, heartbeat, pipelines, and the LLM bridge share a single Python process in one container (8 GB Docker VM, backtests as child processes). One OOM or wedged thread degrades everything at once. Both models share one GPU, so the 397B "fallback" is slowest exactly when the primary is saturated. Everything hangs off one vLLM box; no cloud failover.
@@ -42,4 +43,4 @@ SOUL, six skills, 40+ tool descriptions, and acceptance criteria must agree with
 
 ---
 
-Recommended order of attack: **#2 next** (memory compounds everything else), then #6 (locks in the last six months of fixes), then #4, #3, #1, #7.
+Recommended order of attack: **#6 next** (locks in the last six months of fixes), then #4, #3, #1, #7.

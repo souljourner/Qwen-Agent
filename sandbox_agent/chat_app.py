@@ -50,9 +50,10 @@ import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 import sandbox_agent.tools.display_tools  # noqa: F401
 import sandbox_agent.tools.skill_tools  # noqa: F401
+import sandbox_agent.tools.session_search_tools  # noqa: F401
 import sandbox_agent.tools.browser_tools  # noqa: F401
 
-from qwen_agent.llm.schema import ContentItem, Message
+from qwen_agent.llm.schema import ContentItem, FunctionCall, Message
 
 from sandbox_agent.chat_data_layer import make_data_layer
 from sandbox_agent.chat_logger import log_turn
@@ -504,18 +505,60 @@ async def on_feedback(feedback):
     logger.info("Feedback recorded: %s%s", sentiment, f" — {comment!r}" if comment else "")
 
 
+# Char budget for replayed tool-call/result pairs during chat.db
+# reconstruction (~100k tokens). Newest tools are kept; older history stays
+# text-only and the per-turn compactor manages the rest.
+RESUME_TOOL_CONTEXT_MAX_CHARS = 400_000
+
+
 @cl.on_chat_resume
 async def on_chat_resume(thread):
-    """Resumed chat — rebuild history from the persisted thread so the agent
-    has full conversation context on the next turn.
+    """Resumed chat — restore the agent's context for the next turn.
+
+    Preferred path: load the per-thread history sidecar (exact agent-side
+    Message list incl. tool results — see sandbox_agent.chat_history).
+    Fallback for threads predating the sidecar: reconstruct from chat.db
+    steps, replaying tool-call/result pairs newest-first up to
+    RESUME_TOOL_CONTEXT_MAX_CHARS."""
+    thread_id = thread.get("id") if isinstance(thread, dict) else None
+    from sandbox_agent.chat_history import load_history
+    history = load_history(thread_id)
+    if history is not None:
+        cl.user_session.set(HISTORY_KEY, history)
+        logger.info("Resumed thread %s from sidecar (%d messages)", thread_id, len(history))
+        _ensure_notifier()
+        return
+
+    history = _rebuild_history_from_thread(thread)
+    cl.user_session.set(HISTORY_KEY, history)
+    logger.info("Resumed thread %s via chat.db reconstruction (%d messages)",
+                thread_id, len(history))
+    _ensure_notifier()
+
+
+def _rebuild_history_from_thread(thread, tool_budget_chars: int = RESUME_TOOL_CONTEXT_MAX_CHARS) -> List[Message]:
+    """Rebuild agent history from a persisted Chainlit thread dict.
 
     Chainlit's thread dict has a `steps` list. User messages and assistant
     messages live there with `type` discriminators that vary by Chainlit
-    version. We accept either `user_message`/`assistant_message` or the more
-    generic `run`/`text` pattern, and inspect the role-relevant fields.
+    version. Tool steps are replayed as function_call/result Message pairs,
+    NEWEST-first within `tool_budget_chars` (older tools drop; text always
+    stays) — restoring the evidence the agent gathered, not just its prose.
     """
     history: List[Message] = []
     steps = thread.get("steps", []) if isinstance(thread, dict) else []
+
+    # Decide which tool steps fit the replay budget (newest-first selection,
+    # rendered in original order).
+    tool_indices = [i for i, s in enumerate(steps) if (s.get("type") or "").lower() == "tool"]
+    included_tools = set()
+    budget = tool_budget_chars
+    for i in reversed(tool_indices):
+        s = steps[i]
+        size = len(s.get("output") or "") + len(s.get("input") or "")
+        if size <= budget:
+            included_tools.add(i)
+            budget -= size
     # Index thread elements by the step they belong to, so a user_message
     # rebuild can re-attach any persisted images (Chainlit saved them to
     # disk; we re-encode as data URLs the same way on_message does).
@@ -524,9 +567,17 @@ async def on_chat_resume(thread):
         fid = el.get("forId") or el.get("for_id")
         if fid:
             elements_by_step.setdefault(fid, []).append(el)
-    for step in steps:
+    for i, step in enumerate(steps):
         step_type = (step.get("type") or "").lower()
         output = step.get("output") or ""
+        if step_type == "tool":
+            if i not in included_tools:
+                continue
+            tool_name = step.get("name") or "tool"
+            history.append(Message(role="assistant", content="", function_call=FunctionCall(
+                name=tool_name, arguments=step.get("input") or "{}")))
+            history.append(Message(role="function", name=tool_name, content=output))
+            continue
         if not output and not elements_by_step.get(step.get("id")):
             continue
         if step_type in ("user_message", "user"):
@@ -590,12 +641,8 @@ async def on_chat_resume(thread):
                 # Strip the UI-only token-usage footer and timestamp prefix so
                 # the agent context stays clean on resume.
                 history.append(Message(role="assistant", content=_strip_stats_footer(output)))
-        # Tool steps and reasoning are intentionally NOT replayed into the
-        # agent's input — the agent re-derives those when it processes the
-        # next user turn.
-    cl.user_session.set(HISTORY_KEY, history)
-    logger.info("Resumed thread with %d messages of history", len(history))
-    _ensure_notifier()
+        # `thought` / `run` steps are never replayed (reasoning is re-derived).
+    return history
 
 
 class _StreamBridge:
@@ -1132,6 +1179,10 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
         ):
             history.append(msg)
     cl.user_session.set(HISTORY_KEY, history)
+    # Persist the agent-side history sidecar so a reload/restart restores this
+    # exact context (incl. tool results) instead of the text-only rebuild.
+    from sandbox_agent.chat_history import save_history
+    save_history(thread_id, history)
 
     if log_user_msg is not None:
         # Daily markdown log — only for user-initiated turns (synthetic

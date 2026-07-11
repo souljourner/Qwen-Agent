@@ -269,6 +269,9 @@ def advance_pipeline(project_name: str, stage_number: int, passed: bool, feedbac
             # the agent actually applies them (via DATA_DIR/pipeline_stages/
             # overrides — see load_stage_instructions).
             _file_review_followup(state)
+            # Cross-project knowledge flow: extract the review's Learnings
+            # into the global learnings file that seeds future stage-1 runs.
+            _extract_review_learnings(state)
     else:
         stage.run_count += 1
         stage.acceptance_result = feedback
@@ -676,6 +679,48 @@ def reschedule_orphaned_stages_on_startup() -> list:
         rescheduled.append((project_name, stage.stage_number))
 
     return rescheduled
+
+
+def _extract_review_learnings(state: PipelineState) -> None:
+    """Append the completed pipeline's `## Learnings` section to the global
+    DATA_DIR/learnings/pipeline-learnings.md (deterministic; deduped by a
+    content-hash marker so re-running the same review doesn't duplicate).
+    Stage-1 prompts inject this file so new pipelines start informed instead
+    of blind — previously learnings died inside the project folder."""
+    import hashlib
+    try:
+        review_path = os.path.join(
+            _projects_dir(), state.project_name, "pipeline", "review.md")
+        if not os.path.exists(review_path):
+            return
+        text = open(review_path).read()
+        marker_hdr = "## Learnings"
+        idx = text.find(marker_hdr)
+        if idx < 0:
+            return
+        body_start = idx + len(marker_hdr)
+        nxt = text.find("\n## ", body_start)
+        section = text[body_start:nxt if nxt >= 0 else len(text)].strip()
+        if not section:
+            return
+
+        out_dir = os.path.join(DATA_DIR, "learnings")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(out_dir, "pipeline-learnings.md")
+        fingerprint = hashlib.sha256(
+            f"{state.project_name}:{section}".encode()).hexdigest()[:16]
+        existing = open(out_path).read() if os.path.exists(out_path) else ""
+        if fingerprint in existing:
+            return  # same learnings already recorded
+        entry = (f"\n## {state.project_name} ({datetime.now().strftime('%Y-%m-%d')}, "
+                 f"{state.pipeline_type}) <!-- {fingerprint} -->\n{section}\n")
+        with open(out_path, "a") as f:
+            if not existing:
+                f.write("# Pipeline Learnings (auto-extracted from stage-6 reviews)\n")
+            f.write(entry)
+        logger.info(f"Extracted review learnings for {state.project_name}")
+    except Exception:  # noqa: BLE001 — knowledge flow must not fail the pipeline
+        logger.exception("Could not extract review learnings")
 
 
 def _file_review_followup(state: PipelineState) -> None:
