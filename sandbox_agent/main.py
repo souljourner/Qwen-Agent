@@ -75,6 +75,9 @@ _background_work_lock = Lock()
 # the abandoned thread, but at least the queue no longer freezes behind it.
 STUCK_CHECK_INTERVAL_SECONDS = 30
 STUCK_NO_PROGRESS_SECONDS = int(os.environ.get("STUCK_NO_PROGRESS_SECONDS", 10 * 60))
+# Hard ceiling on the "model busy" grace: a wedged task that keeps a model slot
+# marked busy would otherwise never be abandoned and stalls the queue forever.
+STUCK_HARD_ABANDON_SECONDS = int(os.environ.get("STUCK_HARD_ABANDON_SECONDS", 2 * 60 * 60))
 
 
 def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent") -> Assistant:
@@ -530,6 +533,10 @@ def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_befo
     enforce a wall-clock timeout on it; wrapped in a cancellation run so
     `cancel_task` (or the stuck-detector) can interrupt it mid-flight."""
     from sandbox_agent import cancellation, chat_origin
+    # Capture the generation before any work: if the stuck-detector abandons
+    # this worker it bumps the task's generation and our failure update below
+    # becomes a no-op (see task_queue.update_task expected_generation).
+    generation = getattr(task, "run_generation", 0)
     # Carry the originating chat (if any) forward so sub-tasks scheduled
     # during this cron run inherit the same origin and route back to the
     # original chat too. Cleared on finally so it doesn't leak to the next
@@ -554,7 +561,8 @@ def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_befo
                 summary=f"FAILED: {str(e)[:400]}",
                 source="cron",
             )
-            task_queue.update_task(task.id, status="failed", last_error=str(e)[:500])
+            task_queue.update_task(task.id, status="failed", last_error=str(e)[:500],
+                                   expected_generation=generation)
             try:
                 from sandbox_agent import task_notify
                 task_notify.notify_task_done(
@@ -568,12 +576,27 @@ def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_befo
         chat_origin.set_current_origin(None)
 
 
+def _is_empty_result(text: str) -> bool:
+    """True when a task run produced no usable output (empty/whitespace) —
+    such runs are marked failed so the backoff/retry path re-attempts them
+    instead of recording a silent no-op as success. Deliberately NO length
+    floor: short results like 'DONE' are legitimate."""
+    return not (text or "").strip()
+
+
 def _execute_cron_task(task, system_message: str, task_queue: TaskQueue, events_before: int) -> None:
+    # Captured at worker start: if the stuck-detector abandons this worker it
+    # bumps the task's generation, and our status updates below become no-ops
+    # (update_task ignores stale generations) — prevents a zombie worker from
+    # double-completing a re-queued task.
+    generation = task.run_generation
+
     # Pipeline tasks get special handling
     if task.name.startswith("pipeline:"):
         from sandbox_agent.pipeline.stage_runner import run_pipeline_stage
         result_text = run_pipeline_stage(task, system_message)
-        task_queue.update_task(task.id, status="completed", result=result_text[:1000])
+        task_queue.update_task(task.id, status="completed", result=result_text[:1000],
+                               expected_generation=generation)
         log_background_task(task.name, task.id, result_text[:1000])
         log_event("cron_complete", task_id=task.id, task_name=task.name)
         add_digest_entry(
@@ -615,7 +638,19 @@ def _execute_cron_task(task, system_message: str, task_queue: TaskQueue, events_
         if msg.role == "assistant" and isinstance(msg.content, str):
             result_text += msg.content
     logger.info(f"Cron: task [{task.id}] result ({len(result_text)} chars): {result_text[:200]}...")
-    task_queue.update_task(task.id, status="completed", result=result_text[:1000])
+    if _is_empty_result(result_text):
+        # No usable output — count it as a failure so the backoff path retries,
+        # instead of recording a silent no-op as success (and, for recurring
+        # tasks, skipping straight to the next window).
+        logger.warning(f"Cron: task [{task.id}] produced empty output — marking failed for retry")
+        task_queue.update_task(task.id, status="failed",
+                               last_error="Task run produced empty output",
+                               expected_generation=generation)
+        log_event("cron_empty_result", task_id=task.id, task_name=task.name)
+        clear_state()
+        return
+    task_queue.update_task(task.id, status="completed", result=result_text[:1000],
+                           expected_generation=generation)
     log_background_task(task.name, task.id, result_text[:1000])
     log_event("cron_complete", task_id=task.id, task_name=task.name)
     all_events = get_recent_events(500)
@@ -749,8 +784,11 @@ def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 6
                         # Only declare stuck if the model is also idle — a
                         # long legitimate generation keeps a model busy with
                         # no intermediate activity events, and we don't want
-                        # to kill it just because it's quiet.
-                        if not _model_is_actually_idle():
+                        # to kill it just because it's quiet. BUT: a wedged
+                        # task can hold a model slot "busy" forever, which
+                        # would stall the queue indefinitely — so past the
+                        # hard ceiling we abandon regardless of model state.
+                        if not _model_is_actually_idle() and idle_seconds < STUCK_HARD_ABANDON_SECONDS:
                             # Busy model but no activity — could still be a
                             # streaming generation. Extend the grace window
                             # by not abandoning yet; keep polling.
@@ -773,10 +811,15 @@ def cron_loop(system_message: str, task_queue: TaskQueue, poll_interval: int = 6
                             cancellation.cancel(task.id)
                         except Exception:  # noqa: BLE001
                             logger.debug("stuck-detector: cancellation.cancel raised", exc_info=True)
+                        # Invalidate the abandoned worker FIRST so that if it
+                        # is a zombie that later finishes, its completed/failed
+                        # update is ignored (stale generation) and can't
+                        # double-run or flip the re-queued task's state.
+                        task_queue.bump_generation(task.id)
                         task_queue.update_task(
                             task.id, status="failed",
                             last_error=(
-                                f"Stuck: no activity for {int(idle_seconds)}s and models idle; "
+                                f"Stuck: no activity for {int(idle_seconds)}s; "
                                 f"worker abandoned"
                             ),
                         )
@@ -859,6 +902,7 @@ def bootstrap_background(status_server_port: int = 7861) -> TaskQueue:
     orphaned = task_queue.reset_orphaned_running_tasks(reason="process startup")
     if orphaned:
         logger.warning(f"Recovered {len(orphaned)} orphaned task(s): {orphaned}")
+    task_queue.annotate_missed_windows()  # stamp cron tasks that missed fires while down
 
     from sandbox_agent.scheduler.scheduler_tools import set_task_queue
     set_task_queue(task_queue)
@@ -933,6 +977,7 @@ def main() -> None:
     orphaned = task_queue.reset_orphaned_running_tasks(reason="process startup")
     if orphaned:
         logger.warning(f"Recovered {len(orphaned)} orphaned task(s): {orphaned}")
+    task_queue.annotate_missed_windows()  # stamp cron tasks that missed fires while down
 
     # Inject task queue into scheduler tools
     from sandbox_agent.scheduler.scheduler_tools import set_task_queue

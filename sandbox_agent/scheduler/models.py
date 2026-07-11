@@ -41,6 +41,12 @@ class Task(BaseModel):
     max_retries: int = 3
     last_error: Optional[str] = None
 
+    # Bumped by the stuck-detector when it abandons a worker it cannot kill.
+    # Workers capture this at start and pass it to
+    # update_task(expected_generation=...); a stale generation is ignored, so
+    # an abandoned-but-alive worker can't double-complete the task later.
+    run_generation: int = 0
+
     # Chat origin that scheduled this task — `{session_id, thread_id}` of the
     # Chainlit session whose agent run created it. None for tasks created
     # outside a chat (cron-spawned subtasks without parent origin, heartbeat,

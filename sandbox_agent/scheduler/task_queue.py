@@ -40,7 +40,22 @@ class TaskQueue:
                     raw = json.load(f)
                 self._tasks = [Task(**t) for t in raw]
             except Exception as e:
-                logger.warning(f"Corrupt tasks file {self._file_path}, starting fresh: {e}")
+                # NEVER silently discard the queue: quarantine the corrupt file
+                # so the tasks are recoverable, then start fresh.
+                quarantine = f"{self._file_path}.corrupt-{datetime.now().strftime('%Y%m%dT%H%M%S')}"
+                try:
+                    os.replace(self._file_path, quarantine)
+                    logger.error(
+                        f"Corrupt tasks file quarantined to {quarantine}; starting with an "
+                        f"empty queue. Recover tasks manually from the quarantined file. ({e})"
+                    )
+                except OSError:
+                    logger.error(f"Corrupt tasks file {self._file_path} could not be quarantined: {e}")
+                try:
+                    from sandbox_agent.activity_log import log_event
+                    log_event("task_queue_corrupt", detail=f"quarantined to {quarantine}")
+                except Exception:  # noqa: BLE001
+                    pass
                 self._tasks = []
         else:
             self._tasks = []
@@ -65,6 +80,15 @@ class TaskQueue:
                 self._append_to_archive(self._cancelled_path, archived_cancelled)
             self._save_active()
 
+    @staticmethod
+    def _atomic_write_json(path: str, obj) -> None:
+        """Write JSON via temp-file + os.replace so a crash mid-write can never
+        truncate the target file (the previous version stays intact)."""
+        tmp = f"{path}.tmp"
+        with open(tmp, "w") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2, default=str)
+        os.replace(tmp, path)
+
     def _append_to_archive(self, path: str, tasks: List[Task]) -> None:
         """Append tasks to an archive file."""
         existing = []
@@ -72,8 +96,7 @@ class TaskQueue:
             with open(path, "r") as f:
                 existing = json.load(f)
         existing.extend([t.model_dump(mode="json") for t in tasks])
-        with open(path, "w") as f:
-            json.dump(existing, f, ensure_ascii=False, indent=2, default=str)
+        self._atomic_write_json(path, existing)
 
     def _load_archive(self, path: str) -> List[Task]:
         """Load tasks from an archive file."""
@@ -83,9 +106,9 @@ class TaskQueue:
         return []
 
     def _save_active(self) -> None:
-        """Save only active tasks (not completed/cancelled)."""
-        with open(self._file_path, "w") as f:
-            json.dump([t.model_dump(mode="json") for t in self._tasks], f, ensure_ascii=False, indent=2, default=str)
+        """Save only active tasks (not completed/cancelled). Atomic — a crash
+        mid-write leaves the previous tasks.json intact."""
+        self._atomic_write_json(self._file_path, [t.model_dump(mode="json") for t in self._tasks])
 
     def _save(self) -> None:
         # Separate completed/cancelled from active
@@ -179,12 +202,13 @@ class TaskQueue:
     def get_due_tasks(self) -> List[Task]:
         """Return tasks that are due to run now, respecting dependencies."""
         now = datetime.now()
-        # Check both active and archived completed tasks for dependency resolution
-        completed_ids = {t.id for t in self._tasks if t.status == "completed"}
-        completed_ids.update(t.id for t in self._load_archive(self._completed_path))
-
         due = []
         with self._lock:
+            # Check both active and archived completed tasks for dependency
+            # resolution — read inside the lock so a concurrent update can't
+            # race the snapshot.
+            completed_ids = {t.id for t in self._tasks if t.status == "completed"}
+            completed_ids.update(t.id for t in self._load_archive(self._completed_path))
             for task in self._tasks:
                 if task.status not in ("pending", "failed"):
                     continue
@@ -212,11 +236,23 @@ class TaskQueue:
         last_error: Optional[str] = None,
         current_step: Optional[int] = None,
         checkpoint: Optional[dict] = None,
+        expected_generation: Optional[int] = None,
     ) -> Optional[Task]:
-        """Update a task's status and/or result."""
+        """Update a task's status and/or result.
+
+        `expected_generation`: pass the run_generation captured at worker start
+        to make the update conditional — if the stuck-detector has since bumped
+        the generation (abandoning that worker), the stale update is ignored.
+        Callers that don't pass it keep unconditional behavior."""
         with self._lock:
             task = self._find_task(task_id)
             if not task:
+                return None
+            if expected_generation is not None and task.run_generation != expected_generation:
+                logger.warning(
+                    f"Ignoring stale update for task [{task_id}] from an abandoned worker "
+                    f"(generation {expected_generation} != current {task.run_generation})"
+                )
                 return None
 
             now = datetime.now()
@@ -340,7 +376,61 @@ class TaskQueue:
         if task.schedule_type == "at":
             return None  # One-shot: done
         elif task.schedule_type == "every":
-            return now + timedelta(seconds=task.interval_seconds or 60)
+            # Anchor to the PREVIOUS SCHEDULED time (task.next_run is still the
+            # slot that just ran at this point), not the completion time —
+            # otherwise execution duration accumulates as drift. Clamp to now
+            # so a long-overdue task doesn't burst-fire to catch up.
+            interval = timedelta(seconds=task.interval_seconds or 60)
+            prev = TaskQueue._make_naive(task.next_run)
+            candidate = (prev + interval) if prev else (now + interval)
+            return max(now, candidate)
         elif task.schedule_type == "cron":
             return croniter(task.cron, now).get_next(datetime)
         return None
+
+    def bump_generation(self, task_id: str) -> Optional[int]:
+        """Invalidate any in-flight worker for this task (see update_task's
+        expected_generation). Called by the stuck-detector before it abandons
+        a worker it cannot kill. Returns the new generation."""
+        with self._lock:
+            task = self._find_task(task_id)
+            if not task:
+                return None
+            task.run_generation += 1
+            task.updated_at = datetime.now()
+            self._save()
+            return task.run_generation
+
+    def annotate_missed_windows(self) -> dict:
+        """At startup: for cron tasks whose next_run is in the past, count how
+        many scheduled fires were missed while the process was down and stamp
+        it into last_error (the task still runs ONCE — no burst backfill; a
+        daily report firing 10× on restart is worse than once). Returns
+        {task_id: missed_count} for tasks with at least one missed window."""
+        now = datetime.now()
+        counts: dict = {}
+        with self._lock:
+            for task in self._tasks:
+                if task.schedule_type != "cron" or not task.cron or task.status != "pending":
+                    continue
+                next_run = self._make_naive(task.next_run)
+                if not next_run or next_run > now:
+                    continue
+                # Fires strictly after the due slot, up to now = missed windows
+                # (the due slot itself will still run).
+                missed = 0
+                it = croniter(task.cron, next_run)
+                while it.get_next(datetime) <= now:
+                    missed += 1
+                if missed > 0:
+                    counts[task.id] = missed
+                    task.last_error = (
+                        f"Missed {missed} scheduled window(s) while the agent was down; "
+                        f"running once now (no backfill)."
+                    )
+                    task.updated_at = now
+            if counts:
+                self._save()
+        if counts:
+            logger.warning(f"Cron tasks with missed windows while down: {counts}")
+        return counts

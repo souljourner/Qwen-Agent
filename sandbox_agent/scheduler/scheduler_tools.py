@@ -92,13 +92,26 @@ class ScheduleTask(BaseTool):
         params = self._verify_json_format_args(params)
         tq = get_task_queue()
 
+        # Pre-validate cron so a bad expression is a clean tool error at
+        # schedule time, not a crash later in the cron loop.
+        if params.get("schedule_type") == "cron":
+            from croniter import croniter
+            cron_expr = params.get("cron") or ""
+            if not croniter.is_valid(cron_expr):
+                return (f"Error: invalid cron expression '{cron_expr}'. Use standard 5-field "
+                        f"cron syntax, e.g. '30 9 * * 1-5' for 9:30am weekdays.")
+
         run_at = None
         if params.get("run_at"):
             raw = params["run_at"]
             if raw.lower() in ("now", "immediately"):
                 run_at = datetime.now()
             else:
-                run_at = datetime.fromisoformat(raw)
+                try:
+                    run_at = datetime.fromisoformat(raw)
+                except ValueError:
+                    return (f"Error: could not parse run_at '{raw}'. Use ISO format "
+                            f"(e.g. '2026-07-10T09:30') or 'now'.")
 
         from sandbox_agent.chat_origin import current_origin
         task = tq.add_task(
