@@ -31,10 +31,12 @@ Done: `sandbox_agent/health.py` — deterministic hourly scan (failure-event bur
 
 **Remaining niggle:** thresholds are static; no trend detection (slow degradation below threshold stays invisible).
 
-## 6. Tests validate parts, not the machine — NOT RESOLVED
-574 tests, nearly all unit-level. The worst bugs found this year (phantom promote, runaway retries, state-file divergence, resume context loss) emerged from *interactions* unit tests structurally can't catch. No end-to-end pipeline run with a stubbed LLM; no CI — the suite runs when someone remembers.
+## 6. Tests validate parts, not the machine — RESOLVED 2026-07-11
+Was: ~595 unit tests; the worst bugs (phantom promote, runaway retries, state divergence) lived in the seams between components; the suite ran only when someone remembered.
 
-**Resolved looks like:** one integration test driving a full trading pipeline with a scripted fake LLM through promote AND reject paths; tests wired to a pre-commit hook or scheduled task.
+Done: (a) **end-to-end pipeline integration test** (`test_e2e_pipeline.py`) — a scripted fake LLM "player" drives the REAL machine (task queue → stage runner → guards → evaluator gates → orchestrator) through the full trading pipeline: promote path (hash pin → verdict citation → evaluator-written summary → learnings extraction), reject path (gate failure → best-effort exhaustion → reject verdict → stages 5-6 skipped → completed_rejected), and a phantom-promote regression case (stale duplicate task cannot re-run a finished stage). Only the LLM and its quality judgment are stubbed. (b) **pre-commit hook** (`.githooks/pre-commit`, `core.hooksPath` set) runs the full suite on every commit. (c) **`scripts/selftest.sh`** runs the suite in-container and logs `selftest_failed` on failure — which the health loop treats as always-alert-worthy (emails you). Schedule it nightly with the timezone-aware scheduler.
+
+**Remaining niggle:** the chat surface (Chainlit handlers) still lacks an equivalent end-to-end test — bridge/sidecar units cover most seams there.
 
 ## 7. Consistency by hand — PARTIALLY MITIGATED
 SOUL, six skills, 40+ tool descriptions, and acceptance criteria must agree with each other and the code, maintained manually; drift has repeatedly shipped (SOUL described behavior that didn't exist; `update_soul` silently never took effect for months). Some locks exist (skills index ↔ files test, SOUL size cap test), most don't.
@@ -43,4 +45,4 @@ SOUL, six skills, 40+ tool descriptions, and acceptance criteria must agree with
 
 ---
 
-Recommended order of attack: **#6 next** (locks in the last six months of fixes), then #4, #3, #1, #7.
+Recommended order of attack: **#4 next** (security tiers), then #3, #1, #7.

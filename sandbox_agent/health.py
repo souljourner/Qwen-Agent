@@ -30,6 +30,7 @@ FAILURE_EVENT_THRESHOLDS = {
     "cron_empty_result": 3,
     "task_queue_corrupt": 1,
     "blocked_exec": 3,
+    "selftest_failed": 1,   # a failing test suite is always alert-worthy
 }
 HEALTH_STALE_REQUEST_HOURS = int(os.environ.get("HEALTH_STALE_REQUEST_HOURS", 24))
 HEALTH_ALERT_MIN_INTERVAL_S = int(os.environ.get("HEALTH_ALERT_MIN_INTERVAL_S", 86_400))

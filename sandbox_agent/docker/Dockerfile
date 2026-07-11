@@ -36,6 +36,12 @@ RUN pip install --no-cache-dir "/app/Qwen-Agent[gui,rag]" croniter numpy soundfi
 # rebuilds fast.
 RUN pip install --no-cache-dir uv
 
+# pytest + the test suite ship in the image so the agent can run
+# scripts/selftest.sh (nightly self-test feeding the health-alert loop).
+RUN pip install --no-cache-dir pytest
+COPY tests/ /app/tests/
+COPY scripts/ /app/scripts/
+
 # Copy sandbox_agent
 COPY sandbox_agent/ /app/sandbox_agent/
 

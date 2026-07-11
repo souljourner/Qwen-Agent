@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Run the sandbox_agent suite before every commit (weakness #6: the suite
+# previously ran only when someone remembered). ~17s. Bypass in a genuine
+# emergency with: git commit --no-verify
+set -e
+cd "$(git rev-parse --show-toplevel)"
+PY=".venv/bin/python"
+[ -x "$PY" ] || PY="python3"
+echo "pre-commit: running sandbox_agent test suite…"
+$PY -m pytest tests/sandbox_agent/ -q --tb=line

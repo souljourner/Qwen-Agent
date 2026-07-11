@@ -360,7 +360,7 @@ Background sessions (cron, heartbeat) use the metadata-free base to preserve the
 3. **One process, one GPU, one point of failure** — all lanes in one Python process; both models share one GPU; no cloud failover. *Not resolved.*
 4. **Capability has outgrown the security model** — exec + browser credential store + send_email + readable `.env` = a real prompt-injection exfiltration chain; defense is single-user-LAN. *Not resolved.*
 5. **Failures don't teach it anything** — *RESOLVED 2026-07-11*: deterministic health monitoring (`health.py`) emails failure bursts + stale requests directly and feeds heartbeat investigate-items; stage instructions now DATA_DIR-overridable so stage-6 review suggestions are actually appliable.
-6. **Tests validate parts, not the machine** — 574 unit tests, no end-to-end pipeline test with a stubbed LLM, no CI. *Not resolved.*
+6. **Tests validate parts, not the machine** — *RESOLVED 2026-07-11*: E2E pipeline integration test (fake-LLM player through promote/reject/regression paths), pre-commit hook running the suite, in-container `scripts/selftest.sh` feeding the health-alert loop.
 7. **Consistency by hand** — SOUL/skills/tool-descriptions/acceptance-criteria drift is manual to catch. *Partially mitigated (a few lock-in tests).*
 
 Smaller known issues: `code_interpreter` uses the global env (not project venvs); `_background_work_lock` has no timeout; `LockingAgent.run()` releases its semaphore only on generator exhaustion; pipelines serialize globally (Phase B pending); occasional malformed-JSON tool args; vLLM thinking-token leakage (server-side flag); single-user only — don't expose beyond LAN.

@@ -119,3 +119,10 @@ def test_heartbeat_includes_health_items(tmp_path, monkeypatch):
     text = str(calls[0][0].content)
     assert "System Health" in text
     assert "cron_failed" in text
+
+
+def test_selftest_failure_alerts_immediately(env):
+    d, _ = env
+    _write_events(d, [_evt("selftest_failed", detail="2 failed")])
+    alerts = health.collect_health_alerts(window_hours=24)
+    assert any("selftest_failed" in a for a in alerts)
