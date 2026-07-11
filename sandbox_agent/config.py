@@ -95,6 +95,51 @@ TOOLS_API_BASE = os.getenv("TOOLS_API_BASE", "http://localhost:8080")
 HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "3600"))  # 1 hour
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 
+
+def _parse_dotenv(path: str) -> dict:
+    """Minimal KEY=VALUE parser for DATA_DIR/.env (no python-dotenv dependency).
+    Ignores comments/blank lines; strips optional surrounding quotes."""
+    out: dict = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                out[key.strip()] = value.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+def get_smtp_config() -> dict:
+    """Resolve SMTP settings at call time: os.environ first, then DATA_DIR/.env.
+
+    The live credentials sit in `~/sandbox_agent_data/.env`, which is the
+    bind-mounted DATA_DIR inside the container — so email works without any
+    docker-compose passthrough. Recipient default: EMAIL_TO, falling back to
+    ALERT_EMAIL (the var the soxs project scripts already use).
+    """
+    dotenv = _parse_dotenv(os.path.join(DATA_DIR, ".env"))
+
+    def _get(key: str, default: str = "") -> str:
+        return os.environ.get(key) or dotenv.get(key) or default
+
+    user = _get("SMTP_USER")
+    try:
+        port = int(_get("SMTP_PORT", "587") or "587")
+    except ValueError:
+        port = 587
+    return {
+        "host": _get("SMTP_HOST"),
+        "port": port,
+        "user": user,
+        "password": _get("SMTP_PASS"),
+        "from": _get("SMTP_FROM") or user,
+        "to": _get("EMAIL_TO") or _get("ALERT_EMAIL"),
+    }
+
 TOOL_LIST = [
     "web_search", "web_url_fetch", "stock_price",
     "schedule_task", "list_tasks", "complete_task", "cancel_task", "pause_task", "resume_task", "update_task_checkpoint",
@@ -108,7 +153,7 @@ TOOL_LIST = [
     "browser_navigate", "browser_screenshot", "browser_click", "browser_type", "browser_scroll",
     "browser_save_credentials", "browser_get_credentials",
     "move_file", "delete_file",
-    "request_user", "view_requests", "resolve_request",
+    "request_user", "view_requests", "resolve_request", "send_email",
     "start_pipeline", "start_trading_pipeline", "pipeline_status", "list_pipelines",
 ]
 
