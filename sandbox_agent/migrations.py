@@ -14,6 +14,40 @@ from sandbox_agent.tools.git_autocommit import autocommit
 logger = logging.getLogger(__name__)
 
 
+def quarantine_unparseable_pipeline_state() -> None:
+    """Rename pipeline state.json files that cannot parse as PipelineState
+    (agent-fabricated shadow content from the phantom-promote era — missing
+    project_name/description) to state.json.unparseable-<ts>. Content is
+    preserved for forensics; load_state stops logging 'Corrupt pipeline
+    state' on every boot. Legacy-but-real files load fine (StageState
+    normalizes old status values) and are left alone. Idempotent."""
+    from sandbox_agent.pipeline.models import PipelineState
+    projects_dir = os.path.join(DATA_DIR, "projects")
+    if not os.path.isdir(projects_dir):
+        return
+    import json as _json
+    for proj in os.listdir(projects_dir):
+        path = os.path.join(projects_dir, proj, "pipeline", "state.json")
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                PipelineState(**_json.load(f))
+            continue  # parses (possibly via legacy normalization) — keep
+        except Exception:
+            pass
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        quarantine = f"{path}.unparseable-{stamp}"
+        try:
+            os.replace(path, quarantine)
+            logger.warning(
+                "Quarantined unparseable pipeline state for %s -> %s "
+                "(agent-fabricated or pre-schema content; preserved for forensics)",
+                proj, os.path.basename(quarantine))
+        except OSError:
+            logger.exception("Could not quarantine state for %s", proj)
+
+
 def migrate_pre_skills() -> None:
     """Archive a pre-skills DATA_DIR/SOUL.md so the slimmed bundled SOUL applies.
 

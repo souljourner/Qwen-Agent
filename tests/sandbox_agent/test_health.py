@@ -126,3 +126,22 @@ def test_selftest_failure_alerts_immediately(env):
     _write_events(d, [_evt("selftest_failed", detail="2 failed")])
     alerts = health.collect_health_alerts(window_hours=24)
     assert any("selftest_failed" in a for a in alerts)
+
+
+def test_failed_send_not_stamped_retries_next_check(env, monkeypatch):
+    """Latent bug found 2026-07-11: alerts were stamped BEFORE the email send,
+    so a failed send (e.g. EMAIL_TO not yet configured) suppressed the alert
+    for 24h even after the user fixed the config."""
+    d, sent = env
+    _write_events(d, [_evt("cron_stuck") for _ in range(5)])
+    monkeypatch.setattr(health, "send_email_message",
+                        lambda *a, **k: "Error: email is not configured")
+    first = health.run_health_check(window_hours=24)
+    assert first                                       # heartbeat still gets items
+
+    # User fixes config; next check must SEND (not be dedup-suppressed).
+    monkeypatch.setattr(health, "send_email_message",
+                        lambda subject, body, to=None: sent.append((subject, body)) or "Email sent")
+    second = health.run_health_check(window_hours=24)
+    assert second
+    assert len(sent) == 1

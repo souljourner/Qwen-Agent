@@ -902,8 +902,9 @@ def bootstrap_background(status_server_port: int = 7861) -> TaskQueue:
     )
     clear_lock_on_startup()
 
-    from sandbox_agent.migrations import migrate_pre_skills
+    from sandbox_agent.migrations import migrate_pre_skills, quarantine_unparseable_pipeline_state
     migrate_pre_skills()  # archive a stale pre-skills DATA_DIR SOUL before assembling the prompt
+    quarantine_unparseable_pipeline_state()  # stop per-boot warnings from agent-corrupted state files
     system_message = load_system_message()
     logger.info("System message loaded")
 
@@ -973,8 +974,9 @@ def main() -> None:
 
     # Load system messages
     # Base system message (static, used for background sessions — no metadata for KV cache stability)
-    from sandbox_agent.migrations import migrate_pre_skills
+    from sandbox_agent.migrations import migrate_pre_skills, quarantine_unparseable_pipeline_state
     migrate_pre_skills()  # archive a stale pre-skills DATA_DIR SOUL before assembling the prompt
+    quarantine_unparseable_pipeline_state()  # stop per-boot warnings from agent-corrupted state files
     system_message = load_system_message()
     # Main agent gets one-time metadata (date, time, location) appended
     main_system_message = system_message + session_metadata()

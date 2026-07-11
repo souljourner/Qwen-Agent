@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 StageStatus = Literal[
     "scheduled",
@@ -24,8 +24,24 @@ PipelineStatus = Literal[
 ]
 
 
+# Statuses written by older code versions, normalized on load so historical
+# state files keep loading (observed live: 'complete', 'skipped',
+# 'skipped-rejected' — current code writes 'completed' with an
+# acceptance_result note for verdict-skipped stages).
+_LEGACY_STATUS_MAP = {
+    "complete": "completed",
+    "skipped": "completed",
+    "skipped-rejected": "completed",
+}
+
+
 class StageState(BaseModel):
     """State of a single pipeline stage."""
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _normalize_legacy_status(cls, v):
+        return _LEGACY_STATUS_MAP.get(v, v)
 
     stage_number: int
     stage_name: str

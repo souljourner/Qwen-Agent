@@ -145,18 +145,24 @@ def run_health_check(window_hours: float = 24, data_dir: str = None) -> List[str
              if now - stamps.get(_fingerprint(a), 0) > HEALTH_ALERT_MIN_INTERVAL_S]
     if not fresh:
         return []
-    for a in fresh:
-        stamps[_fingerprint(a)] = now
-    _save_stamps(stamps, data_dir)
 
     body = ("The sandbox agent's health check found:\n\n"
             + "\n".join(f"- {a}" for a in fresh)
             + "\n\nThe hourly heartbeat has been asked to investigate; check the "
               "dashboard (`/status`) and `list_tasks` / `view_requests` for detail.")
+    sent_ok = False
     try:
         result = send_email_message(
             subject=f"[sandbox-agent] health alert: {len(fresh)} issue(s)", body=body)
+        sent_ok = result.startswith("Email sent")
         logger.warning("health: %d alert(s) — email: %s", len(fresh), result)
     except Exception:  # noqa: BLE001 — alerting must never break the caller
         logger.exception("health: alert email failed")
+
+    # Stamp ONLY after a successful send: a failed/unconfigured send must not
+    # suppress the alert for 24h (it retries on the next heartbeat instead).
+    if sent_ok:
+        for a in fresh:
+            stamps[_fingerprint(a)] = now
+        _save_stamps(stamps, data_dir)
     return fresh
