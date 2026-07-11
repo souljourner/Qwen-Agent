@@ -10,7 +10,13 @@ from typing import Callable, List, Optional
 
 from qwen_agent.llm.schema import Message
 
-from sandbox_agent.config import DATA_DIR, HEARTBEAT_INTERVAL_SECONDS
+from sandbox_agent.config import (
+    DATA_DIR,
+    HEARTBEAT_INTERVAL_SECONDS,
+    MEMORIES_COMPACT_MIN_INTERVAL_S,
+    MEMORIES_COMPACT_TRIGGER_CHARS,
+    MEMORIES_INJECT_MAX_CHARS,
+)
 from sandbox_agent.scheduler.task_queue import TaskQueue
 
 logger = logging.getLogger(__name__)
@@ -102,6 +108,32 @@ class HeartbeatRunner:
         self.on_alert = on_alert or (lambda msg: logger.info(f"HEARTBEAT ALERT: {msg}"))
         self.work_lock = work_lock
 
+    def _memory_maintenance_item(self) -> Optional[str]:
+        """Deterministic over-cap check: when MEMORIES.md exceeds the compact
+        trigger (and no recent compaction), return a maintenance instruction
+        for this heartbeat. Pure code — zero LLM cost while under trigger."""
+        mem_path = Path(self.data_dir) / "MEMORIES.md"
+        try:
+            size = mem_path.stat().st_size
+        except OSError:
+            return None
+        if size <= MEMORIES_COMPACT_TRIGGER_CHARS:
+            return None
+        stamp = Path(self.data_dir) / "memories_archive" / ".last_compaction"
+        try:
+            import json as _json
+            last_ts = _json.loads(stamp.read_text()).get("ts", 0)
+            if (time.time() - last_ts) < MEMORIES_COMPACT_MIN_INTERVAL_S:
+                return None  # compacted recently — don't nag
+        except (OSError, ValueError):
+            pass  # no stamp / unreadable → proceed with the nudge
+        return (
+            f"MEMORIES.md is {size} chars; only the newest ~{MEMORIES_INJECT_MAX_CHARS} "
+            f"are injected into your prompt. Consolidate now: read_skill('memory-maintenance'), "
+            f"then read_memories, then call compact_memories with the merged content. "
+            f"Removed entries are archived automatically — nothing is lost."
+        )
+
     def run_once(self) -> Optional[str]:
         """Run a single heartbeat check. Returns alert text or None if OK."""
         # Load checklist
@@ -110,6 +142,9 @@ class HeartbeatRunner:
 
         # Check for due tasks
         due_tasks = self.task_queue.get_due_tasks()
+
+        # Memory over-cap maintenance (deterministic pre-check)
+        memory_item = self._memory_maintenance_item()
 
         # Build the heartbeat user message
         parts = ["## Heartbeat Check\n"]
@@ -127,7 +162,12 @@ class HeartbeatRunner:
                     parts.append(f"  (checkpoint at step {task.current_step})")
             parts.append("")
 
-        if not pending_items and not due_tasks:
+        if memory_item:
+            parts.append("### Memory Maintenance (auto)")
+            parts.append(f"- {memory_item}")
+            parts.append("")
+
+        if not pending_items and not due_tasks and not memory_item:
             # Nothing to check — skip the LLM call entirely
             logger.debug("HEARTBEAT_OK (no items to check)")
             return None

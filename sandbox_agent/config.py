@@ -144,7 +144,8 @@ TOOL_LIST = [
     "web_search", "web_url_fetch", "stock_price",
     "schedule_task", "list_tasks", "complete_task", "cancel_task", "pause_task", "resume_task", "update_task_checkpoint",
     "update_soul", "update_heartbeat",
-    "read_memories", "add_memory",
+    "read_memories", "add_memory", "compact_memories",
+    "read_skill",
     "code_interpreter", "exec",
     "list_chat_logs", "read_chat_log",
     "create_project", "list_projects", "delete_project", "rename_project", "update_project", "project_write_file",
@@ -164,18 +165,31 @@ SYSTEM_PROMPT_SUFFIX = (
 )
 
 
+# --- Skills + memories cap ---
+# Auto-inject map: tool-name prefix → skill injected into that tool's result
+# the first time it's used in a conversation (see skill_tools.maybe_inject_skill).
+SKILL_AUTOINJECT = {"browser_": "browser-automation"}
+SKILL_MAX_CHARS = 10_000                 # read_skill truncation guard
+MEMORIES_INJECT_MAX_CHARS = 6_000        # newest-first cap on system-prompt injection
+MEMORIES_COMPACT_TRIGGER_CHARS = 8_000   # heartbeat asks the agent to compact above this
+MEMORIES_COMPACT_MIN_INTERVAL_S = 86_400  # at most one compaction nudge per day
+
+
 def load_system_message() -> str:
     """Load SOUL.md + MEMORIES.md and combine with system prompt suffix.
 
     This is the base system message used for all sessions (main, heartbeat, cron).
-    MEMORIES.md is included so the agent always has its learnings without needing
-    to call read_memories as a tool.
+    SOUL.md: the DATA_DIR copy (agent-edited via update_soul) wins over the
+    bundled default — previously only the bundled file was read, so agent soul
+    edits silently never took effect. MEMORIES.md is included so the agent
+    always has its learnings, capped newest-first (render_memories_capped) so
+    an ever-growing memories file can't bloat every LLM call.
     """
-    soul_path = Path(__file__).parent / "SOUL.md"
-    if soul_path.exists():
-        soul = soul_path.read_text().strip()
-    else:
-        soul = "You are a capable research and task management assistant."
+    soul = "You are a capable research and task management assistant."
+    for sp in [Path(DATA_DIR) / "SOUL.md", Path(__file__).parent / "SOUL.md"]:
+        if sp.exists():
+            soul = sp.read_text().strip()
+            break
 
     # Load memories from DATA_DIR (agent-edited) or bundled default
     memories = ""
@@ -185,6 +199,8 @@ def load_system_message() -> str:
         if mp.exists():
             content = mp.read_text().strip()
             if content:
+                from sandbox_agent.memories import render_memories_capped
+                content = render_memories_capped(content, MEMORIES_INJECT_MAX_CHARS)
                 memories = f"\n\n## Your Memories (auto-loaded from MEMORIES.md)\n\n{content}"
             break
 

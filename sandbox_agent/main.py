@@ -50,6 +50,7 @@ import sandbox_agent.tools.display_tools  # noqa: F401
 import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 import sandbox_agent.tools.browser_tools  # noqa: F401
+import sandbox_agent.tools.skill_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,11 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
         set_current_tool(tool_name)
         log_event("tool_call", tool_name=tool_name, tool_args=args_preview)
         result = original_call_tool(tool_name, tool_args, **kwargs)
+        # Skills auto-inject: first use of a trigger tool (browser_*) in a
+        # conversation prepends the matching guide to the result. Dedup via
+        # the [skill:NAME] marker in history; never touches the system prompt.
+        from sandbox_agent.tools.skill_tools import maybe_inject_skill
+        result = maybe_inject_skill(tool_name, result, kwargs.get("messages") or [])
         result_preview = str(result)[:200]
         logger.info(f"Tool result: {tool_name} -> {result_preview}")
         log_event("tool_result", tool_name=tool_name, tool_result=result_preview)
@@ -895,6 +901,8 @@ def bootstrap_background(status_server_port: int = 7861) -> TaskQueue:
     )
     clear_lock_on_startup()
 
+    from sandbox_agent.migrations import migrate_pre_skills
+    migrate_pre_skills()  # archive a stale pre-skills DATA_DIR SOUL before assembling the prompt
     system_message = load_system_message()
     logger.info("System message loaded")
 
@@ -964,6 +972,8 @@ def main() -> None:
 
     # Load system messages
     # Base system message (static, used for background sessions — no metadata for KV cache stability)
+    from sandbox_agent.migrations import migrate_pre_skills
+    migrate_pre_skills()  # archive a stale pre-skills DATA_DIR SOUL before assembling the prompt
     system_message = load_system_message()
     # Main agent gets one-time metadata (date, time, location) appended
     main_system_message = system_message + session_metadata()

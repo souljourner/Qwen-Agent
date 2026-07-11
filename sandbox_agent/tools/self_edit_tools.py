@@ -196,16 +196,38 @@ class ReadMemories(BaseTool):
 
     name = "read_memories"
     description = (
-        "Read the latest MEMORIES.md. Your memories are already in the system prompt, "
-        "so only use this to check if a mid-session add_memory was saved correctly."
+        "Read the FULL MEMORIES.md (the copy in your system prompt is capped to the "
+        "newest entries). Also reads compaction archives: archive='list' shows the "
+        "archive files, archive='YYYY-MM' reads one."
     )
     parameters = {
         "type": "object",
-        "properties": {},
+        "properties": {
+            "archive": {
+                "type": "string",
+                "description": "Omit for the current file. 'list' to list archives; 'YYYY-MM' to read that archive.",
+            },
+        },
         "required": [],
     }
 
     def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        archive = (params.get("archive") or "").strip()
+        if archive:
+            archive_dir = Path(DATA_DIR) / "memories_archive"
+            if archive == "list":
+                files = sorted(archive_dir.glob("*.md")) if archive_dir.is_dir() else []
+                if not files:
+                    return "(no memory archives yet)"
+                return "Memory archives:\n" + "\n".join(
+                    f"- {p.name} ({p.stat().st_size} bytes)" for p in files)
+            if not re.match(r"^\d{4}-\d{2}$", archive):
+                return "Error: archive must be 'list' or 'YYYY-MM'."
+            path = archive_dir / f"{archive}.md"
+            if not path.exists():
+                return f"No archive for {archive}."
+            return path.read_text()
         content = _read_file("MEMORIES.md")
         if not content:
             return "(MEMORIES.md is empty or does not exist)"
@@ -274,3 +296,73 @@ class AddMemory(BaseTool):
         path = _write_file("MEMORIES.md", content)
         autocommit("MEMORIES.md", f"Add memory: {memory[:50]}")
         return f"Memory saved to {section}: {memory[:80]}"
+
+
+_CANONICAL_MEMORY_SECTIONS = ("## User Preferences", "## Facts & Knowledge",
+                              "## Technical Notes", "## Task Learnings")
+
+
+@register_tool("compact_memories")
+class CompactMemories(BaseTool):
+    """Replace MEMORIES.md with a consolidated version; old content is archived."""
+
+    name = "compact_memories"
+    description = (
+        "Replace MEMORIES.md with a consolidated (merged/pruned) version. The current "
+        "file is archived VERBATIM to memories_archive/YYYY-MM.md first — nothing is "
+        "lost, so prune aggressively. Read read_skill('memory-maintenance') for the "
+        "protocol. The new content must be SHORTER than the current file and keep the "
+        "canonical section headers."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "new_content": {
+                "type": "string",
+                "description": "The full consolidated MEMORIES.md content.",
+            },
+        },
+        "required": ["new_content"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        new_content = params["new_content"]
+        old = _read_file("MEMORIES.md")
+
+        if len(new_content) >= len(old):
+            return (f"Error: new content ({len(new_content)} chars) is not shorter than the "
+                    f"current file ({len(old)} chars) — compaction must reduce size.")
+        missing = [h for h in _CANONICAL_MEMORY_SECTIONS if h not in new_content]
+        if missing:
+            return f"Error: new content is missing canonical section(s): {', '.join(missing)}."
+
+        # Archive the old content VERBATIM (deterministic — not agent-trusted).
+        archive_dir = Path(DATA_DIR) / "memories_archive"
+        os.makedirs(archive_dir, exist_ok=True)
+        now = datetime.now()
+        archive_path = archive_dir / f"{now.strftime('%Y-%m')}.md"
+        with open(archive_path, "a") as f:
+            f.write(f"\n\n# Snapshot {now.strftime('%Y-%m-%d %H:%M')} (pre-compaction, verbatim)\n\n")
+            f.write(old)
+
+        # Ensure the new content references the archives so future compactions
+        # (and the agent) know where pruned memories live.
+        if "## Archives" not in new_content:
+            lines = new_content.split("\n")
+            insert_at = 1 if lines and lines[0].startswith("#") else 0
+            archives_ref = (
+                "\n## Archives\n"
+                "- Compacted memories preserved verbatim in memories_archive/ "
+                "(monthly files, newest snapshot last). Load with read_memories(archive='YYYY-MM').\n"
+            )
+            lines.insert(insert_at, archives_ref)
+            new_content = "\n".join(lines)
+
+        _write_file("MEMORIES.md", new_content)
+        import json as _json
+        with open(archive_dir / ".last_compaction", "w") as f:
+            _json.dump({"ts": now.timestamp(), "old_len": len(old), "new_len": len(new_content)}, f)
+        autocommit("MEMORIES.md", f"Compact memories ({len(old)} -> {len(new_content)} chars)")
+        return (f"Memories compacted: {len(old)} -> {len(new_content)} chars. "
+                f"Previous content archived to memories_archive/{archive_path.name}.")

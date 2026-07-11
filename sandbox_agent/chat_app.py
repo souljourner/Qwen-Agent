@@ -49,6 +49,7 @@ import sandbox_agent.tools.notification_tools  # noqa: F401
 import sandbox_agent.pipeline.pipeline_tools  # noqa: F401
 import sandbox_agent.scheduler.scheduler_tools  # noqa: F401
 import sandbox_agent.tools.display_tools  # noqa: F401
+import sandbox_agent.tools.skill_tools  # noqa: F401
 import sandbox_agent.tools.browser_tools  # noqa: F401
 
 from qwen_agent.llm.schema import ContentItem, Message
