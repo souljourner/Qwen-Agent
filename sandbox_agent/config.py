@@ -142,7 +142,7 @@ def get_smtp_config() -> dict:
 
 TOOL_LIST = [
     "web_search", "web_url_fetch", "stock_price",
-    "schedule_task", "list_tasks", "complete_task", "cancel_task", "pause_task", "resume_task", "update_task_checkpoint",
+    "schedule_task", "reschedule_task", "list_tasks", "complete_task", "cancel_task", "pause_task", "resume_task", "update_task_checkpoint",
     "update_soul", "update_heartbeat",
     "read_memories", "add_memory", "compact_memories",
     "read_skill",

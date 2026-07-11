@@ -7,6 +7,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Optional
+from zoneinfo import ZoneInfo
 
 from croniter import croniter
 
@@ -14,6 +15,26 @@ from sandbox_agent.config import DATA_DIR
 from sandbox_agent.scheduler.models import Task
 
 logger = logging.getLogger(__name__)
+
+
+def _local_tz():
+    """The container-local zone (TZ=America/Los_Angeles in docker-compose).
+    A function so tests can pin it regardless of host timezone."""
+    return datetime.now().astimezone().tzinfo
+
+
+def _cron_next_in_tz(cron: str, timezone: str, now_local_naive: datetime) -> datetime:
+    """Next fire of `cron` interpreted as WALL-CLOCK time in `timezone`,
+    returned as naive container-local (the queue's storage convention).
+
+    This is the DST fix: evaluating the cron in its own zone means
+    '30 12 * * 5' + America/Los_Angeles is 12:30pm Pacific in January (PST)
+    and July (PDT) alike — no ±1h drift, no UTC pre-conversion."""
+    tz = ZoneInfo(timezone or "America/Los_Angeles")
+    now_aware = now_local_naive.replace(tzinfo=_local_tz()) \
+        if now_local_naive.tzinfo is None else now_local_naive
+    nxt = croniter(cron, now_aware.astimezone(tz)).get_next(datetime)
+    return nxt.astimezone(_local_tz()).replace(tzinfo=None)
 
 # Exponential backoff delays for failed tasks (OpenClaw pattern)
 BACKOFF_DELAYS = [30, 60, 300, 900, 3600]  # 30s, 1m, 5m, 15m, 60m
@@ -149,6 +170,7 @@ class TaskQueue:
         priority: int = 0,
         project: Optional[str] = None,
         origin: Optional[dict] = None,
+        timezone: str = "America/Los_Angeles",
     ) -> Task:
         """Create and enqueue a new task.
 
@@ -167,7 +189,7 @@ class TaskQueue:
         elif schedule_type == "cron":
             if not cron:
                 raise ValueError("cron expression required for schedule_type='cron'")
-            next_run = croniter(cron, now).get_next(datetime)
+            next_run = _cron_next_in_tz(cron, timezone, now)
         else:
             raise ValueError(f"Unknown schedule_type: {schedule_type}")
 
@@ -184,6 +206,7 @@ class TaskQueue:
             priority=priority,
             project=project,
             origin=origin,
+            timezone=timezone,
             created_at=now,
         )
 
@@ -194,9 +217,12 @@ class TaskQueue:
 
     @staticmethod
     def _make_naive(dt: datetime) -> datetime:
-        """Strip timezone info for consistent comparison."""
+        """Normalize to naive CONTAINER-LOCAL time for comparison. Aware
+        datetimes are converted to the local zone first — the old
+        strip-without-converting produced the wrong wall time for any
+        non-local aware value."""
         if dt and dt.tzinfo is not None:
-            return dt.replace(tzinfo=None)
+            return dt.astimezone(_local_tz()).replace(tzinfo=None)
         return dt
 
     def get_due_tasks(self) -> List[Task]:
@@ -385,8 +411,47 @@ class TaskQueue:
             candidate = (prev + interval) if prev else (now + interval)
             return max(now, candidate)
         elif task.schedule_type == "cron":
-            return croniter(task.cron, now).get_next(datetime)
+            return _cron_next_in_tz(task.cron, getattr(task, "timezone", None), now)
         return None
+
+    def reschedule(
+        self,
+        task_id: str,
+        cron: Optional[str] = None,
+        run_at: Optional[datetime] = None,
+        interval_seconds: Optional[int] = None,
+        timezone: Optional[str] = None,
+    ) -> Optional[Task]:
+        """Change a task's schedule IN PLACE — id, history, checkpoint, origin
+        and retry state are preserved; only the schedule fields given are
+        updated and next_run is recomputed. This is the fix for the model
+        cancel+recreating tasks just to move their time."""
+        with self._lock:
+            task = self._find_task(task_id)
+            if not task:
+                return None
+            now = datetime.now()
+            if timezone is not None:
+                task.timezone = timezone
+            if cron is not None:
+                task.cron = cron
+                task.schedule_type = "cron"
+            elif interval_seconds is not None:
+                task.interval_seconds = interval_seconds
+                task.schedule_type = "every"
+            elif run_at is not None:
+                task.run_at = run_at
+                task.schedule_type = "at"
+
+            if task.schedule_type == "cron":
+                task.next_run = _cron_next_in_tz(task.cron, task.timezone, now)
+            elif task.schedule_type == "every":
+                task.next_run = now + timedelta(seconds=task.interval_seconds or 60)
+            else:
+                task.next_run = task.run_at or now
+            task.updated_at = now
+            self._save()
+            return task
 
     def bump_generation(self, task_id: str) -> Optional[int]:
         """Invalidate any in-flight worker for this task (see update_task's
@@ -419,8 +484,9 @@ class TaskQueue:
                 # Fires strictly after the due slot, up to now = missed windows
                 # (the due slot itself will still run).
                 missed = 0
-                it = croniter(task.cron, next_run)
-                while it.get_next(datetime) <= now:
+                tz = ZoneInfo(getattr(task, "timezone", None) or "America/Los_Angeles")
+                it = croniter(task.cron, next_run.replace(tzinfo=_local_tz()).astimezone(tz))
+                while it.get_next(datetime).astimezone(_local_tz()).replace(tzinfo=None) <= now:
                     missed += 1
                 if missed > 0:
                     counts[task.id] = missed

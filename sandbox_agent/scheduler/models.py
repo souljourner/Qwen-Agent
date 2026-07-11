@@ -16,6 +16,10 @@ class Task(BaseModel):
     # Schedule type (OpenClaw-style)
     schedule_type: Literal["at", "every", "cron"] = "at"
     cron: Optional[str] = None             # cron expression (e.g., "*/30 * * * *")
+    # IANA zone the cron is written in — cron fields are WALL-CLOCK time in
+    # this zone, so "30 12 * * 5" + America/Los_Angeles is 12:30pm Pacific
+    # year-round (DST handled automatically; no UTC conversion, no drift).
+    timezone: str = "America/Los_Angeles"
     interval_seconds: Optional[int] = None  # for "every" type
     run_at: Optional[datetime] = None       # for "at" type (one-shot)
     next_run: Optional[datetime] = None     # computed next execution time

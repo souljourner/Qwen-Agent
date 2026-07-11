@@ -26,6 +26,97 @@ def set_task_queue(tq: TaskQueue) -> None:
     _task_queue = tq
 
 
+def _validate_timezone(tz: str) -> str:
+    """Return an error string for an unknown IANA zone, or '' when valid."""
+    from zoneinfo import ZoneInfo
+    try:
+        ZoneInfo(tz)
+        return ""
+    except Exception:
+        return (f"Error: unknown timezone '{tz}'. Use an IANA name like "
+                f"'America/Los_Angeles' (Pacific) or 'US/Eastern'.")
+
+
+@register_tool("reschedule_task")
+class RescheduleTask(BaseTool):
+    """Change an existing task's schedule in place."""
+
+    name = "reschedule_task"
+    description = (
+        "Change WHEN an existing task runs — in place, keeping its id, history, "
+        "and checkpoint. Use this instead of cancelling and re-creating a task. "
+        "Pass only the fields to change: cron (wall-clock in `timezone`, default "
+        "Pacific — never convert to UTC), run_at, interval_seconds, and/or timezone."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "The task to reschedule.",
+            },
+            "cron": {
+                "type": "string",
+                "description": "New cron expression, wall-clock in `timezone` (e.g. '30 12 * * 5' = Fridays 12:30pm).",
+            },
+            "run_at": {
+                "type": "string",
+                "description": "New one-shot time: 'now' or ISO 8601 (e.g. '2026-07-17T12:30').",
+            },
+            "interval_seconds": {
+                "type": "integer",
+                "description": "New interval for 'every' tasks.",
+            },
+            "timezone": {
+                "type": "string",
+                "description": "IANA timezone for the schedule (e.g. 'America/Los_Angeles', 'US/Eastern').",
+            },
+        },
+        "required": ["task_id"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        tq = get_task_queue()
+
+        tz = params.get("timezone")
+        if tz:
+            tz_err = _validate_timezone(tz)
+            if tz_err:
+                return tz_err
+        cron = params.get("cron")
+        if cron is not None:
+            from croniter import croniter
+            if not croniter.is_valid(cron):
+                return (f"Error: invalid cron expression '{cron}'. Use standard 5-field "
+                        f"cron syntax, e.g. '30 12 * * 5' for Fridays 12:30pm.")
+        run_at = None
+        if params.get("run_at"):
+            raw = params["run_at"]
+            if raw.lower() in ("now", "immediately"):
+                run_at = datetime.now()
+            else:
+                try:
+                    run_at = datetime.fromisoformat(raw)
+                except ValueError:
+                    return f"Error: could not parse run_at '{raw}'. Use ISO format or 'now'."
+        if cron is None and run_at is None and params.get("interval_seconds") is None and not tz:
+            return "Error: nothing to change — pass cron, run_at, interval_seconds, and/or timezone."
+
+        task = tq.reschedule(
+            params["task_id"],
+            cron=cron,
+            run_at=run_at,
+            interval_seconds=params.get("interval_seconds"),
+            timezone=tz,
+        )
+        if not task:
+            return f"Task {params['task_id']} not found."
+        return (f"Rescheduled [{task.id}] {task.name}: {task.schedule_type} "
+                f"{task.cron or task.interval_seconds or task.run_at} "
+                f"({task.timezone}), next run {task.next_run}.")
+
+
 @register_tool("schedule_task")
 class ScheduleTask(BaseTool):
     """Schedule a new task for future execution."""
@@ -61,7 +152,20 @@ class ScheduleTask(BaseTool):
             },
             "cron": {
                 "type": "string",
-                "description": "Cron expression (e.g., '0 */1 * * *' for every hour). Required if schedule_type is 'cron'.",
+                "description": (
+                    "Cron expression in WALL-CLOCK time of `timezone` (default Pacific). "
+                    "Write the local time the user asked for directly — e.g. '30 12 * * 5' "
+                    "for Fridays 12:30pm Pacific. NEVER convert to UTC yourself; DST is "
+                    "handled automatically. Required if schedule_type is 'cron'."
+                ),
+            },
+            "timezone": {
+                "type": "string",
+                "description": (
+                    "IANA timezone the cron/run_at is written in. Default "
+                    "'America/Los_Angeles' (Pacific). Use 'US/Eastern' for market-hours "
+                    "schedules (e.g. '30 9 * * 1-5' = 9:30am ET open, DST-proof)."
+                ),
             },
             "interval_seconds": {
                 "type": "integer",
@@ -91,6 +195,11 @@ class ScheduleTask(BaseTool):
     def call(self, params: Union[str, dict], **kwargs) -> str:
         params = self._verify_json_format_args(params)
         tq = get_task_queue()
+
+        tz = params.get("timezone") or "America/Los_Angeles"
+        tz_err = _validate_timezone(tz)
+        if tz_err:
+            return tz_err
 
         # Pre-validate cron so a bad expression is a clean tool error at
         # schedule time, not a crash later in the cron loop.
@@ -125,6 +234,7 @@ class ScheduleTask(BaseTool):
             priority=params.get("priority", 0),
             project=params.get("project"),
             origin=current_origin(),  # stamp the originating chat (None if outside chat)
+            timezone=tz,
         )
         return json.dumps({
             "status": "scheduled",
