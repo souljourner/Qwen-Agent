@@ -89,3 +89,85 @@ def test_missing_adjusted_close_falls_back_to_raw(monkeypatch):
     monkeypatch.setattr(tdc.requests, "get", lambda *a, **k: _Resp(_bars(rows)))
     df = get_daily("AAPL")                              # adjusted=True default
     assert df.iloc[0]["close"] == pytest.approx(101)    # graceful fallback
+
+
+# --- request_backfill --------------------------------------------------------
+
+def test_request_backfill_posts_and_returns_summary(monkeypatch):
+    from sandbox_agent.trading_data.client import request_backfill
+    captured = {}
+    summary = {"symbol": "NVDA", "status": "backfilled",
+               "counts": {"daily": 100, "dividends": 4, "splits": 1},
+               "background": ["intraday", "fundamentals", "news"]}
+
+    def fake_post(url, timeout=None, **kw):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        return _Resp(summary)
+
+    monkeypatch.setattr(tdc.requests, "post", fake_post)
+    monkeypatch.setattr(tdc.requests, "get", lambda url, **kw: _Resp(_bars(BARS)))
+    out = request_backfill("nvda")
+    assert out == summary
+    assert captured["url"].endswith("/api/ingest/NVDA")  # uppercased
+    assert captured["timeout"] == 300  # generous: sync path fetches full history
+
+
+def test_request_backfill_waits_until_bars_visible(monkeypatch):
+    # QuestDB commits big out-of-order merges asynchronously: the POST can
+    # succeed before GET /api/daily sees rows. request_backfill must poll
+    # until the data is queryable so callers can get_daily immediately.
+    from sandbox_agent.trading_data.client import request_backfill
+    summary = {"symbol": "NVDA", "status": "backfilled",
+               "counts": {"daily": 100}, "background": []}
+    polls = []
+
+    def fake_get(url, params=None, timeout=None, **kw):
+        polls.append(url)
+        return _Resp(_bars([] if len(polls) < 3 else BARS))
+
+    monkeypatch.setattr(tdc.requests, "post", lambda url, **kw: _Resp(summary))
+    monkeypatch.setattr(tdc.requests, "get", fake_get)
+    monkeypatch.setattr(tdc.time, "sleep", lambda s: None)
+    out = request_backfill("NVDA")
+    assert out == summary
+    assert len(polls) == 3  # kept polling until bars appeared
+    assert all("/api/daily/NVDA" in u for u in polls)
+
+
+def test_request_backfill_exists_skips_visibility_poll(monkeypatch):
+    from sandbox_agent.trading_data.client import request_backfill
+
+    def no_get(url, **kw):
+        raise AssertionError("no poll expected for status=exists")
+
+    monkeypatch.setattr(tdc.requests, "post",
+                        lambda url, **kw: _Resp({"symbol": "AAPL", "status": "exists",
+                                                 "counts": {}, "background": []}))
+    monkeypatch.setattr(tdc.requests, "get", no_get)
+    assert request_backfill("AAPL")["status"] == "exists"
+
+
+def test_request_backfill_failure_raises_data_unavailable(monkeypatch):
+    from sandbox_agent.trading_data.client import request_backfill
+
+    def fake_post(url, timeout=None, **kw):
+        raise ConnectionError("service down")
+
+    monkeypatch.setattr(tdc.requests, "post", fake_post)
+    with pytest.raises(DataUnavailable):
+        request_backfill("NVDA")
+
+
+def test_request_backfill_404_raises_data_unavailable(monkeypatch):
+    from sandbox_agent.trading_data.client import request_backfill
+    monkeypatch.setattr(tdc.requests, "post",
+                        lambda url, timeout=None, **kw: _Resp({"detail": "no data"}, status=404))
+    with pytest.raises(DataUnavailable):
+        request_backfill("ZZZZZZ")
+
+
+def test_request_backfill_exported():
+    import sandbox_agent.trading_data as td
+    assert "request_backfill" in td.__all__
+    assert callable(td.request_backfill)

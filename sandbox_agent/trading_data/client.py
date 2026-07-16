@@ -14,6 +14,7 @@ Deps: requests + pandas (install in the project venv: `uv pip install pandas req
 """
 
 import os
+import time
 from typing import Optional
 
 import pandas as pd
@@ -113,3 +114,42 @@ def health() -> bool:
         return _get_json("/health").get("status") == "ok"
     except DataUnavailable:
         return False
+
+
+_BACKFILL_TIMEOUT = 300  # sync path fetches a symbol's full daily history
+
+
+def request_backfill(symbol: str, timeout: int = _BACKFILL_TIMEOUT,
+                     wait_visible: float = 20.0) -> dict:
+    """Ask the auram_data service to backfill a symbol from EODHD on demand.
+
+    Synchronously ingests daily OHLCV + dividends/splits; intraday,
+    fundamentals, and news follow in the background. The symbol permanently
+    joins the daily-refresh universe. Blocks (up to `wait_visible` seconds)
+    until the new daily bars are actually queryable — QuestDB commits large
+    out-of-order merges asynchronously — so `get_daily` works immediately
+    after this returns. Returns the service summary, e.g.
+    {"symbol", "status": "backfilled"|"extended"|"exists", "counts", "background"}.
+    Raises DataUnavailable if EODHD has no such symbol or the service is down.
+    """
+    sym = symbol.strip().upper()
+    url = f"{_base_url()}/api/ingest/{sym}"
+    try:
+        resp = requests.post(url, timeout=timeout)
+        resp.raise_for_status()
+        summary = resp.json()
+    except Exception as e:  # noqa: BLE001 — collapse transport errors into one type
+        raise DataUnavailable(f"backfill failed: {url} — {e}") from e
+
+    if summary.get("status") in ("backfilled", "extended") and wait_visible > 0:
+        deadline = time.monotonic() + wait_visible
+        while True:
+            try:
+                if _get_json(f"/api/daily/{sym}", {"limit": 1}).get("data"):
+                    break
+            except DataUnavailable:
+                pass
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(1.0)
+    return summary

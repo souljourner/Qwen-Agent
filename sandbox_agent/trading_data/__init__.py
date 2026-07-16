@@ -14,7 +14,8 @@ from sandbox_agent.trading_data.client import (
     get_splits,
     get_universe,
     health,
+    request_backfill,
 )
 
 __all__ = ["DataUnavailable", "get_daily", "get_dividends", "get_intraday_5m",
-           "get_splits", "get_universe", "health"]
+           "get_splits", "get_universe", "health", "request_backfill"]
