@@ -553,6 +553,7 @@ class TestCancelPipeline:
         assert "already" in o.cancel_pipeline("done")
 
     def test_tool_registered(self):
+        import sandbox_agent.pipeline.pipeline_tools  # noqa: F401 — registration on import
         from qwen_agent.tools.base import TOOL_REGISTRY
         from sandbox_agent.config import TOOL_LIST
         assert "cancel_pipeline" in TOOL_REGISTRY
