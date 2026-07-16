@@ -1051,12 +1051,20 @@ def _check_hypothesis_data_feasibility(
 
     missing = [r for r in required if not _matches_landscape(r, landscape)]
     if missing:
+        # Steer the agent to fix ONLY the declaration — v4 abandoned a good
+        # hypothesis over this. List the names that ARE available so the fix
+        # is mechanical, and only suggest changing the hypothesis when the
+        # data genuinely isn't in the landscape.
+        available = re.findall(r"DATA_TYPE:\s*(\S+)", landscape, re.IGNORECASE)
+        avail_hint = (f" Available DATA_TYPE names in the landscape: {sorted(set(available))}."
+                      if available else "")
         return False, (
             f"Hypothesis requires data types {missing} but research/data-landscape.md "
-            f"does not mention them. Pick hypotheses that can be realized with "
-            f"available sources, or broaden the landscape first. Declare types as "
-            f"plain names matching the landscape, e.g. "
-            f"`required_data_types: [yfinance_ohlcv, SEC 8-K]`."
+            f"does not mention them. Keep the hypothesis — fix ONLY the "
+            f"`required_data_types` declaration to use exact names from the "
+            f"landscape (plain names, e.g. `required_data_types: [yfinance_ohlcv, "
+            f"SEC 8-K]`).{avail_hint} Only revise the hypothesis itself if the data "
+            f"it needs truly isn't available from any landscape source."
         )
     return True, ""
 

@@ -430,6 +430,11 @@ class TestHypothesisDataFeasibility:
         assert not passed
         assert "satellite parking-lot imagery" in msg
         assert "required_data_types" in msg  # format hint present
+        # Feedback must steer the agent to fix the DECLARATION, not abandon
+        # the hypothesis (v4 abandoned a good hypothesis over this), and
+        # must list the names that ARE available.
+        assert "Keep the hypothesis" in msg
+        assert "yfinance_ohlcv" in msg  # available names listed from landscape
 
 
 class TestNormalizeDataType:
