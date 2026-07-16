@@ -499,3 +499,61 @@ class TestCompletionEmail:
         o.save_state(state)
         o.advance_pipeline("mail-mid", 1, True, "ok")
         assert sent == []
+
+
+class TestCancelPipeline:
+    """cancel_pipeline: the sanctioned way to stop a pipeline. Before this,
+    the agent could only cancel stage TASKS — the pipeline state stayed
+    'running' forever (zombie) and state.json is write-protected against
+    direct edits, so there was NO way to stop a pipeline (2026-07-16)."""
+
+    def _queue(self, monkeypatch, tmp_data_dir):
+        from sandbox_agent.scheduler.task_queue import TaskQueue
+        import sandbox_agent.scheduler.scheduler_tools as st
+        tq = TaskQueue(data_dir=tmp_data_dir)
+        monkeypatch.setattr(st, "get_task_queue", lambda: tq)
+        return tq
+
+    def test_cancels_state_tasks_and_lock(self, tmp_data_dir, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        tq = self._queue(monkeypatch, tmp_data_dir)
+        state = o.init_pipeline("zombie", "d", pipeline_type="trading")
+        o.save_state(state)
+        stage_task = tq.add_task(name="pipeline:zombie:stage_2", description="d")
+        tq.add_task(name="unrelated", description="d")
+        # simulate the running stage holding the pipeline lock
+        assert o.acquire_lock(stage_task.id)
+
+        out = o.cancel_pipeline("zombie")
+        assert "cancelled" in out.lower()
+        st2 = o.load_state("zombie")
+        assert st2.status == "cancelled"
+        assert st2.lock_holder is None
+        names = [t.name for t in tq.list_tasks()]
+        assert "pipeline:zombie:stage_2" not in names
+        assert "unrelated" in names  # untouched
+        assert not os.path.exists(o.LOCK_FILE)  # lock released
+
+    def test_cancelled_pipeline_can_be_rerun(self, tmp_data_dir, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        self._queue(monkeypatch, tmp_data_dir)
+        state = o.init_pipeline("zombie2", "d", pipeline_type="startup")
+        o.save_state(state)
+        o.cancel_pipeline("zombie2")
+        fresh = o.init_pipeline("zombie2", "d2", pipeline_type="startup")
+        assert fresh.status == "running"  # reset, not the stale cancelled state
+
+    def test_unknown_or_finished_pipeline(self, tmp_data_dir, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        self._queue(monkeypatch, tmp_data_dir)
+        assert "No pipeline" in o.cancel_pipeline("nope")
+        state = o.init_pipeline("done", "d", pipeline_type="startup")
+        state.status = "completed"
+        o.save_state(state)
+        assert "already" in o.cancel_pipeline("done")
+
+    def test_tool_registered(self):
+        from qwen_agent.tools.base import TOOL_REGISTRY
+        from sandbox_agent.config import TOOL_LIST
+        assert "cancel_pipeline" in TOOL_REGISTRY
+        assert "cancel_pipeline" in TOOL_LIST

@@ -18,7 +18,7 @@ When a `pipeline:<project>:stage_N` background task fails and you follow up, fir
 3. Its working artifacts under the project dir (`strategy/loop_state.json`, `research/`, `backtest/`).
 4. Trading pipelines use the local data store — read_skill('trading-data') for the client API and policies the sub-agent was bound by.
 Only then decide: fix the blocker and let the orchestrator reschedule, or report to the user.
-**Never cancel a pipeline stage task**: cancellation burns one of the stage's 5 attempts and the orchestrator reschedules it anyway — it does NOT stop the pipeline. There is no pipeline-stop tool; if the user wants a pipeline halted, say so and let them decide (attempts exhaust on their own).
+**Never cancel a pipeline stage task** (via cancel_task): it burns one of the stage's 5 attempts and the orchestrator reschedules it anyway — it does NOT stop the pipeline. To stop a pipeline the user explicitly asked to kill, use `cancel_pipeline(project)` — it cancels the stage tasks, marks the pipeline cancelled, and releases the lock. Never cancel a pipeline on your own initiative.
 
 ## Task routing
 - **Simple tasks** (research a topic, write a report): use project tools directly — no pipeline needed

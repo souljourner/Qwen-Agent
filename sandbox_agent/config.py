@@ -164,7 +164,7 @@ TOOL_LIST = [
     "browser_save_credentials", "browser_get_credentials",
     "move_file", "delete_file",
     "request_user", "view_requests", "resolve_request", "send_email",
-    "start_pipeline", "start_trading_pipeline", "pipeline_status", "list_pipelines",
+    "start_pipeline", "start_trading_pipeline", "pipeline_status", "list_pipelines", "cancel_pipeline",
 ]
 
 SYSTEM_PROMPT_SUFFIX = (

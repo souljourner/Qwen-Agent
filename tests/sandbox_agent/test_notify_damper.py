@@ -75,3 +75,17 @@ class TestCancelTaskSerialization:
         assert parsed["status"] == "cancelled"
         assert parsed["task_id"] == task_id
         assert "damper-test" in parsed["name"]
+
+
+def test_cancelled_task_archive_is_listable(tmp_path, monkeypatch):
+    # remove_task stamps status='cancelled', but the Task model's Literal
+    # didn't allow it — list_tasks(category='cancelled') crashed on pydantic
+    # validation when reloading the archive (2026-07-16).
+    import sandbox_agent.scheduler.scheduler_tools as st
+    from sandbox_agent.scheduler.task_queue import TaskQueue
+    tq = TaskQueue(data_dir=str(tmp_path))
+    t = tq.add_task(name="to-cancel", description="d")
+    tq.remove_task(t.id)
+    cancelled = tq.list_tasks(category="cancelled")
+    assert [c.id for c in cancelled] == [t.id]
+    assert cancelled[0].status == "cancelled"

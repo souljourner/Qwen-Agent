@@ -31,7 +31,7 @@ class Task(BaseModel):
     depends_on: List[str] = Field(default_factory=list)
 
     # Status
-    status: Literal["pending", "running", "completed", "failed", "paused"] = "pending"
+    status: Literal["pending", "running", "completed", "failed", "paused", "cancelled"] = "pending"
     result: Optional[str] = None
     priority: int = 0  # higher = more urgent
 

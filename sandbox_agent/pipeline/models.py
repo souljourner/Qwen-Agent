@@ -21,6 +21,7 @@ PipelineStatus = Literal[
     "completed_rejected",
     "failed",
     "paused",
+    "cancelled",
 ]
 
 

@@ -214,7 +214,7 @@ def init_pipeline(project_name: str, description: str, pipeline_type: str = "sta
 
     existing = load_state(project_name)
 
-    if existing and existing.status not in ("completed", "failed"):
+    if existing and existing.status not in ("completed", "failed", "cancelled"):
         # Pipeline is still active — don't reset
         return existing
 
@@ -456,6 +456,55 @@ def _finalize_exhausted_stage(
         state.status = "completed"
         _notify_pipeline_complete(
             state, f"completed — best effort (final stage exhausted: {reason})")
+
+
+def cancel_pipeline(project_name: str) -> str:
+    """Stop a pipeline for good: cancel its queued/running stage tasks, mark
+    the state 'cancelled' (re-runnable via init_pipeline), and release the
+    global lock if one of its stages holds it. The ONLY sanctioned way to
+    stop a pipeline — cancelling stage tasks alone leaves a zombie 'running'
+    state, and state.json is write-protected against direct agent edits."""
+    state = load_state(project_name)
+    if state is None:
+        return f"No pipeline found for project '{project_name}'."
+    if state.status in ("completed", "completed_rejected", "failed", "cancelled"):
+        return f"Pipeline '{project_name}' already terminal: {state.status}."
+
+    from sandbox_agent.scheduler.scheduler_tools import get_task_queue
+    tq = get_task_queue()
+    prefix = f"pipeline:{project_name}:"
+    removed = []
+    for task in list(tq.list_tasks()):
+        if task.name.startswith(prefix):
+            tq.remove_task(task.id)
+            try:
+                from sandbox_agent.cancellation import cancel as _cancel_run
+                _cancel_run(task.id)
+            except Exception:  # noqa: BLE001
+                pass
+            removed.append(task.id)
+
+    # Release the global lock if any of this pipeline's tasks holds it
+    # (lock file is JSON: {"task_id": ..., "acquired_at": ...}).
+    try:
+        if os.path.exists(LOCK_FILE):
+            with open(LOCK_FILE) as f:
+                holder = json.load(f).get("task_id", "")
+            if holder in removed or holder == state.lock_holder:
+                release_lock()
+    except Exception:  # noqa: BLE001
+        pass
+
+    for stage in state.stages.values():
+        if stage.status in ("scheduled", "running", "part-completion"):
+            stage.status = "failed"
+            stage.acceptance_result = "pipeline cancelled by user"
+    state.status = "cancelled"
+    state.lock_holder = None
+    save_state(state)
+    logger.info(f"Pipeline {project_name} cancelled ({len(removed)} tasks removed)")
+    return (f"Pipeline '{project_name}' cancelled: {len(removed)} stage task(s) removed, "
+            f"lock cleared. It can be restarted with start_pipeline if needed.")
 
 
 def _notify_pipeline_complete(state: PipelineState, outcome: str) -> None:

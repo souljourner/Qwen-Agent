@@ -7,6 +7,7 @@ from typing import Callable, Tuple, Union
 from qwen_agent.tools.base import BaseTool, register_tool
 
 from sandbox_agent.pipeline.orchestrator import (
+    cancel_pipeline,
     get_num_stages,
     init_pipeline,
     list_all_pipelines,
@@ -292,6 +293,36 @@ class ListPipelines(BaseTool):
                 stage_info = f" — Stage {state.current_stage} ({stage.stage_name}): {stage.status}" if stage else ""
             lines.append(f"- **{state.project_name}** ({state.pipeline_type}): {state.status}{stage_info}")
         return "\n".join(lines)
+
+
+@register_tool("cancel_pipeline")
+class CancelPipeline(BaseTool):
+    """Stop a pipeline permanently (only when the user explicitly asks)."""
+
+    name = "cancel_pipeline"
+    description = (
+        "Stop a running pipeline for good: cancels its queued/running stage tasks, "
+        "marks the pipeline 'cancelled', and releases the pipeline lock. Use ONLY "
+        "when the user explicitly asks to stop/kill a pipeline — never on your own "
+        "initiative. The project and its artifacts are untouched; the pipeline can "
+        "be restarted later with start_pipeline / start_trading_pipeline."
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "project": {
+                "type": "string",
+                "description": "Project name whose pipeline should be cancelled.",
+            },
+        },
+        "required": ["project"],
+    }
+
+    def call(self, params: Union[str, dict], **kwargs) -> str:
+        params = self._verify_json_format_args(params)
+        from sandbox_agent.activity_log import log_event
+        log_event("cancel_pipeline", detail=params["project"])
+        return cancel_pipeline(params["project"])
 
 
 def _format_pipeline_status(state) -> str:
