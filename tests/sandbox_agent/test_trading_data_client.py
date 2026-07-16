@@ -171,3 +171,21 @@ def test_request_backfill_exported():
     import sandbox_agent.trading_data as td
     assert "request_backfill" in td.__all__
     assert callable(td.request_backfill)
+
+
+def test_partially_missing_adjusted_raises(monkeypatch):
+    # A series where SOME bars lack adjusted_close is a silent basis break
+    # (e.g. an overflow-sentinel symbol whose garbage adjusted values were
+    # nulled at ingest): using raw prices for just those bars fabricates
+    # returns across splits. Must fail loudly, not degrade quietly.
+    rows = []
+    for i in range(1, 21):
+        rows.append({"ts": f"2020-01-{i:02d} 07:00:00", "symbol": "SOXS",
+                     "open": 10, "high": 11, "low": 9, "close": 10, "volume": 100,
+                     "adjusted_close": (100.0 if i > 10 else None)})
+    monkeypatch.setattr(tdc.requests, "get", lambda url, **kw: _Resp(_bars(rows)))
+    with pytest.raises(DataUnavailable, match="adjusted series incomplete"):
+        get_daily("SOXS")
+    # explicit raw request still works
+    df = get_daily("SOXS", adjusted=False)
+    assert len(df) == 20

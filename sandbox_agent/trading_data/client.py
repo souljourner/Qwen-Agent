@@ -52,6 +52,18 @@ def _bars_frame(payload: dict, symbol: str, adjusted: bool) -> pd.DataFrame:
     df["ts"] = pd.to_datetime(df["ts"])
     df = df.sort_values("ts").set_index("ts")
     if adjusted and "adjusted_close" in df.columns:
+        # A PARTIALLY missing adjusted series is a silent basis break (bars
+        # whose overflowed adjusted values were nulled at ingest would fall
+        # back to raw prices mid-series, fabricating returns across splits).
+        # All-missing stays a graceful raw fallback (intraday has no
+        # adjusted_close at all).
+        n_missing = int(df["adjusted_close"].isna().sum())
+        if 0 < n_missing < len(df) and n_missing > max(1, int(len(df) * 0.05)):
+            raise DataUnavailable(
+                f"{symbol!r}: adjusted series incomplete — {n_missing}/{len(df)} bars "
+                f"lack adjusted_close (symbol likely needs a local adjusted rebase; "
+                f"see auram_data scripts/repair_adjusted_close). Pass adjusted=False "
+                f"only if raw exchange prints are genuinely what you want.")
         ratio = (df["adjusted_close"] / df["close"]).fillna(1.0)
         for col in ("open", "high", "low", "close"):
             df[col] = df[col] * ratio
