@@ -486,12 +486,14 @@ def cancel_pipeline(project_name: str) -> str:
 
     # Release the global lock if any of this pipeline's tasks holds it
     # (lock file is JSON: {"task_id": ..., "acquired_at": ...}).
+    lock_released = False
     try:
         if os.path.exists(LOCK_FILE):
             with open(LOCK_FILE) as f:
                 holder = json.load(f).get("task_id", "")
             if holder in removed or holder == state.lock_holder:
                 release_lock()
+                lock_released = True
     except Exception:  # noqa: BLE001
         pass
 
@@ -503,8 +505,9 @@ def cancel_pipeline(project_name: str) -> str:
     state.lock_holder = None
     save_state(state)
     logger.info(f"Pipeline {project_name} cancelled ({len(removed)} tasks removed)")
-    return (f"Pipeline '{project_name}' cancelled: {len(removed)} stage task(s) removed, "
-            f"lock cleared. It can be restarted with start_pipeline if needed.")
+    return (f"Pipeline '{project_name}' cancelled: {len(removed)} stage task(s) removed"
+            f"{', lock released' if lock_released else ''}. "
+            f"It can be restarted with start_pipeline if needed.")
 
 
 def _notify_pipeline_complete(state: PipelineState, outcome: str) -> None:
