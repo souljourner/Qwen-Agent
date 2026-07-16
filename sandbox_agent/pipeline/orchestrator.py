@@ -264,6 +264,7 @@ def advance_pipeline(project_name: str, stage_number: int, passed: bool, feedbac
         else:
             state.status = "completed"
             logger.info(f"Pipeline {project_name} completed all stages")
+            _notify_pipeline_complete(state, "completed")
             # Close the self-improvement loop: the final review stage writes
             # instruction-improvement suggestions; file a heartbeat item so
             # the agent actually applies them (via DATA_DIR/pipeline_stages/
@@ -453,6 +454,40 @@ def _finalize_exhausted_stage(
         _schedule_next_stage(state, stage.stage_number + 1)
     else:
         state.status = "completed"
+        _notify_pipeline_complete(
+            state, f"completed — best effort (final stage exhausted: {reason})")
+
+
+def _notify_pipeline_complete(state: PipelineState, outcome: str) -> None:
+    """Email the owner the final result of ANY pipeline (startup or trading).
+
+    Deterministic code path on every terminal transition — never left to the
+    LLM to remember. Non-fatal: a failed send never breaks the pipeline."""
+    try:
+        lines = [
+            f"Pipeline: {state.project_name} ({state.pipeline_type})",
+            f"Outcome: {outcome}",
+            "",
+            "Stages:",
+        ]
+        for num in sorted(state.stages):
+            st = state.stages[num]
+            extra = f" — {st.acceptance_result[:200]}" if st.acceptance_result else ""
+            lines.append(f"- {num}. {st.stage_name}: {st.status}{extra}")
+        verdict_path = os.path.join(
+            DATA_DIR, "projects", state.project_name, "pipeline", "verdict.md")
+        if os.path.exists(verdict_path):
+            try:
+                with open(verdict_path) as f:
+                    lines += ["", "Verdict (excerpt):", "", f.read()[:2000]]
+            except Exception:  # noqa: BLE001
+                pass
+        from sandbox_agent.tools.notification_tools import send_email_message
+        subject = f"[pipeline] {state.project_name}: {outcome}"
+        result = send_email_message(subject, "\n".join(lines), html=False)
+        logger.info(f"Pipeline completion email for {state.project_name}: {result[:120]}")
+    except Exception:  # noqa: BLE001
+        logger.exception(f"Pipeline completion email failed for {state.project_name}")
 
 
 def _schedule_stage(state: PipelineState, stage_number: int) -> None:
@@ -496,6 +531,7 @@ def _schedule_next_stage(state: PipelineState, next_stage_number: int) -> None:
             f"{next_stage_number} (and beyond). Marking pipeline completed_rejected."
         )
         state.status = "completed_rejected"
+        _notify_pipeline_complete(state, "REJECTED by validation verdict")
         return
     state.current_stage = next_stage_number
     _schedule_stage(state, next_stage_number)

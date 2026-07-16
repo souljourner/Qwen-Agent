@@ -9,6 +9,8 @@
 
 A global lock serializes all pipelines — only one runs at a time.
 
+**Completion email**: every pipeline (both types) automatically emails the owner its final result — outcome, per-stage summary, and verdict excerpt — on completed / rejected / best-effort-exhausted. Don't send a duplicate email when a pipeline finishes; only email extra detail if the user asks.
+
 ## Taking over from a failed stage
 When a `pipeline:<project>:stage_N` background task fails and you follow up, first rebuild the sub-agent's context — it worked from materials you don't see in chat:
 1. `pipeline_status` + the project's `pipeline/state.json` — per-stage status, attempt counts, and `notes` (the evaluator's feedback for every failed attempt).

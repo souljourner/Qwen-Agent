@@ -420,3 +420,82 @@ class TestStageInstructionOverrides:
         text = load_stage_instructions(2, "trading")
         assert "required_data_types" in text
         assert "Learned overrides" not in text
+
+
+class TestCompletionEmail:
+    """Every terminal pipeline outcome (both pipeline types share these code
+    paths) must email the owner with the result — no relying on the LLM to
+    remember to notify."""
+
+    @pytest.fixture
+    def sent(self, monkeypatch):
+        captured = []
+        import sandbox_agent.tools.notification_tools as nt
+
+        def fake_send(subject, body, to=None, html=True):
+            captured.append((subject, body))
+            return "Email sent to owner"
+
+        monkeypatch.setattr(nt, "send_email_message", fake_send)
+        return captured
+
+    def _finish_all_but_last(self, project, ptype):
+        from sandbox_agent.pipeline.orchestrator import (
+            advance_pipeline, get_num_stages, init_pipeline, save_state)
+        state = init_pipeline(project, "test pipeline", pipeline_type=ptype)
+        n = get_num_stages(ptype)
+        for i in range(1, n):
+            state.stages[i].status = "completed"
+        state.current_stage = n
+        save_state(state)
+        return n
+
+    def test_startup_completion_sends_email(self, tmp_data_dir, sent, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        monkeypatch.setattr(o, "_schedule_stage", lambda *a, **k: None)
+        n = self._finish_all_but_last("mail-startup", "startup")
+        o.advance_pipeline("mail-startup", n, True, "review looks good")
+        assert len(sent) == 1
+        subject, body = sent[0]
+        assert "mail-startup" in subject
+        assert "completed" in subject.lower()
+        assert "review" in body  # per-stage summary present
+
+    def test_trading_reject_sends_email_with_verdict(self, tmp_data_dir, sent, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        monkeypatch.setattr(o, "_schedule_stage", lambda *a, **k: None)
+        state = o.init_pipeline("mail-reject", "d", pipeline_type="trading")
+        for i in range(1, 5):
+            state.stages[i].status = "completed"
+        state.current_stage = 4
+        o.save_state(state)
+        vdir = os.path.join(tmp_data_dir, "projects", "mail-reject", "pipeline")
+        os.makedirs(vdir, exist_ok=True)
+        with open(os.path.join(vdir, "verdict.md"), "w") as f:
+            f.write("# Verdict\n\n## Final Recommendation\n\nreject\n\n"
+                    "## Rationale\n\nOOS Sharpe collapsed to 0.1.\n")
+        o.advance_pipeline("mail-reject", 4, True, "verdict written")
+        assert o.load_state("mail-reject").status == "completed_rejected"
+        assert len(sent) == 1
+        subject, body = sent[0]
+        assert "rejected" in subject.lower()
+        assert "OOS Sharpe collapsed" in body  # verdict excerpt included
+
+    def test_exhausted_final_stage_sends_email(self, tmp_data_dir, sent, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        monkeypatch.setattr(o, "_schedule_stage", lambda *a, **k: None)
+        monkeypatch.setattr(o, "_check_artifacts_exist", lambda *a, **k: True)
+        n = self._finish_all_but_last("mail-exhausted", "startup")
+        state = o.load_state("mail-exhausted")
+        o._finalize_exhausted_stage(state, state.stages[n], "retry ceiling")
+        o.save_state(state)
+        assert len(sent) == 1
+        assert "best effort" in sent[0][0].lower() or "exhausted" in sent[0][1].lower()
+
+    def test_mid_pipeline_stage_does_not_email(self, tmp_data_dir, sent, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        monkeypatch.setattr(o, "_schedule_stage", lambda *a, **k: None)
+        state = o.init_pipeline("mail-mid", "d", pipeline_type="startup")
+        o.save_state(state)
+        o.advance_pipeline("mail-mid", 1, True, "ok")
+        assert sent == []
