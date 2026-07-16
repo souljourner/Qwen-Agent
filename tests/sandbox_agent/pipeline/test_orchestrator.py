@@ -396,3 +396,27 @@ class TestVerdictGateAndRejectedStatus:
 
         assert state.status != "completed_rejected"
         assert state.current_stage == 5
+
+
+class TestStageInstructionOverrides:
+    """DATA_DIR overrides must EXTEND the bundled instructions, not replace
+    them — the agent writes extension-style overrides ("all bundled rules
+    still apply") via the stage-6 review follow-up; returning only the
+    override would strip the entire bundled workflow from the next run."""
+
+    def test_override_composes_with_bundled(self, tmp_data_dir):
+        override_dir = os.path.join(tmp_data_dir, "pipeline_stages", "trading")
+        os.makedirs(override_dir)
+        with open(os.path.join(override_dir, "stage_2_research_loop.md"), "w") as f:
+            f.write("### Learned rule: validate metadata at init.")
+        from sandbox_agent.pipeline.orchestrator import load_stage_instructions
+        text = load_stage_instructions(2, "trading")
+        assert "Learned rule: validate metadata at init." in text  # override present
+        assert "required_data_types" in text  # bundled stage-2 text still present
+        assert text.index("required_data_types") < text.index("Learned rule")
+
+    def test_no_override_returns_bundled_unchanged(self, tmp_data_dir):
+        from sandbox_agent.pipeline.orchestrator import load_stage_instructions
+        text = load_stage_instructions(2, "trading")
+        assert "required_data_types" in text
+        assert "Learned overrides" not in text

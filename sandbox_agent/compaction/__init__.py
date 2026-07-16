@@ -18,13 +18,20 @@ from sandbox_agent.config import COMPACTION_ENABLED
 logger = logging.getLogger(__name__)
 
 
-def maybe_compact(messages: List[Message]) -> List[Message]:
+def maybe_compact(messages: List[Message], pinned_head: int = 0) -> List[Message]:
     """Compact messages if they exceed the token budget.
 
-    Returns the original list unchanged if compaction is disabled or unnecessary.
-    All failures are non-fatal — falls back to simple trim_to_budget on error.
+    `pinned_head` leading messages pass through VERBATIM (but still count
+    toward the budget) — mid-run callers pin the system prompt + task message
+    so summarization can never eat the agent's instructions.
+
+    Returns the original list unchanged if compaction is disabled or
+    unnecessary. All failures are non-fatal — falls back to trimming on error.
+    No minimum message count: a fresh background session with one giant
+    message plus one giant tool result must still be compactable (a pipeline
+    stage once hit the vLLM context ceiling exactly this way).
     """
-    if not COMPACTION_ENABLED or len(messages) < 4:
+    if not COMPACTION_ENABLED or not messages:
         return messages
 
     from sandbox_agent.compaction.estimator import select_tier
@@ -39,10 +46,16 @@ def maybe_compact(messages: List[Message]) -> List[Message]:
         if tier == "fits":
             return messages
 
+        pinned_head = max(0, min(pinned_head, len(messages)))
+        head = list(messages[:pinned_head])
+        tail = list(messages[pinned_head:])
+        if not tail:
+            return messages  # nothing compactable outside the pinned head
+
         msg_count = len(messages)
         est_tokens = estimate_messages_tokens(messages)
         logger.info(f"Compaction triggered: tier={tier}, overflow={overflow} tokens, "
-                     f"messages={msg_count}, est_tokens={est_tokens}")
+                     f"messages={msg_count}, est_tokens={est_tokens}, pinned_head={pinned_head}")
 
         # Save checkpoint before any modification
         save_checkpoint(messages, "pre-compaction")
@@ -50,31 +63,36 @@ def maybe_compact(messages: List[Message]) -> List[Message]:
         set_agent_status(status="compacting", current_tool="context_compaction")
 
         if tier == "truncate_tools":
-            result = truncate_tool_results(messages)
-            # Verify it worked
-            new_tier, _ = select_tier(result)
+            tail_result = truncate_tool_results(tail)
+            new_tier, _ = select_tier(head + tail_result)
             if new_tier == "fits":
-                logger.info(f"Tier 1 (tool truncation) sufficient: {msg_count} -> {len(result)} messages")
-                return result
+                logger.info(f"Tier 1 (tool truncation) sufficient: {msg_count} -> "
+                            f"{len(head) + len(tail_result)} messages")
+                return head + tail_result
             # Not enough — escalate to tier 2
             logger.info("Tier 1 insufficient, escalating to summarization")
-            result = summarize_history(result)
+            tail_result = summarize_history(tail_result)
 
         elif tier == "compact":
-            result = summarize_history(messages)
+            tail_result = summarize_history(tail)
 
         elif tier == "compact_and_truncate":
-            result = summarize_history(messages)
-            result = truncate_tool_results(result)
+            tail_result = summarize_history(tail)
+            tail_result = truncate_tool_results(tail_result)
 
         else:
-            result = messages
+            tail_result = tail
 
-        # Final safety net — if still over budget, use simple trimming
+        result = head + tail_result
+
+        # Final safety net — if still over budget, trim the tail (never the head)
         final_tier, _ = select_tier(result)
         if final_tier != "fits":
-            logger.warning(f"Compaction incomplete (tier={final_tier}), applying trim_to_budget fallback")
-            result = trim_to_budget(result)
+            logger.warning(f"Compaction incomplete (tier={final_tier}), applying trim fallback")
+            from sandbox_agent.config import COMPACTION_RESERVE_TOKENS, MAX_CONTEXT_TOKENS
+            head_tokens = estimate_messages_tokens(head) if head else 0
+            tail_budget = max(10_000, MAX_CONTEXT_TOKENS - COMPACTION_RESERVE_TOKENS - head_tokens)
+            result = head + trim_to_budget(tail_result, max_tokens=tail_budget)
 
         new_tokens = estimate_messages_tokens(result)
         logger.info(f"Compaction complete: {msg_count} msgs ({est_tokens} tok) -> "
@@ -90,3 +108,19 @@ def maybe_compact(messages: List[Message]) -> List[Message]:
             clear_agent_status()
         except Exception:
             pass
+
+
+def compact_midrun(messages: List[Message]) -> List[Message]:
+    """Compaction for INSIDE the fncall tool-call loop (runs before every LLM
+    call). Pins the leading system message(s) + first user message — for a
+    background/pipeline session that first user message IS the task; the
+    bloat lives in the accumulated tool results after it."""
+    head_end = 0
+    for m in messages:
+        if m.role == "system":
+            head_end += 1
+        else:
+            break
+    if head_end < len(messages) and messages[head_end].role == "user":
+        head_end += 1
+    return maybe_compact(messages, pinned_head=head_end)

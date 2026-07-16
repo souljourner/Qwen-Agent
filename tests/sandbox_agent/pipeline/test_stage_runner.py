@@ -358,3 +358,34 @@ class TestVerdictSkip:
         result = _check_verdict_skip(state, 6)
         assert result is not None
         assert state.status == "completed_rejected"
+
+
+class TestArtifactTotalBudget:
+
+    def test_total_cap_across_artifacts(self, tmp_data_dir):
+        # Startup stage 6 has 5 inputs; each per-artifact cap is 120k chars,
+        # so 5 near-cap artifacts used to produce an unbounded ~600k-char
+        # block (~150k tokens) — a base prompt no compaction tier can shrink.
+        # A TOTAL budget must bound the block regardless of artifact count.
+        proj = os.path.join(tmp_data_dir, "projects", "test-project")
+        for rel in ["research/market-research.md", "business/brd.md",
+                    "product/prd.md", "business/vc-pitch.md", "mvp/README.md"]:
+            full = os.path.join(proj, rel)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, "w") as f:
+                f.write("A" * 119_000)
+
+        result = _load_artifacts(_state(), 6)
+        assert len(result) <= 245_000  # 240k budget + headers/separators
+        # Every artifact still represented (later ones truncated, not dropped)
+        for rel in ["market-research", "brd", "prd", "vc-pitch", "README"]:
+            assert rel in result
+
+    def test_small_artifacts_unaffected(self, tmp_data_dir):
+        research_dir = os.path.join(tmp_data_dir, "projects", "test-project", "research")
+        os.makedirs(research_dir, exist_ok=True)
+        with open(os.path.join(research_dir, "market-research.md"), "w") as f:
+            f.write("# Market Research\n\nTAM is $5B")
+        result = _load_artifacts(_state(), 2)
+        assert "TAM is $5B" in result
+        assert "truncated" not in result

@@ -101,6 +101,13 @@ class FnCallAgent(Agent):
             extra_generate_cfg = {'lang': lang}
             if kwargs.get('seed') is not None:
                 extra_generate_cfg['seed'] = kwargs['seed']
+            # LOCAL MOD: mid-run context compaction — tool results accumulate
+            # across up to MAX_LLM_CALL_PER_RUN calls; without this hook the
+            # request eventually exceeds the model context (observed vLLM 400
+            # at 196k input). In-place so the compacted list persists.
+            _compact = getattr(self, '_precall_compact', None)
+            if _compact is not None:
+                messages[:] = _compact(messages)
             output_stream = self._call_llm(messages=messages,
                                            functions=[func.function for func in self.function_map.values()],
                                            extra_generate_cfg=extra_generate_cfg)

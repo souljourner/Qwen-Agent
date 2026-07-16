@@ -1049,14 +1049,47 @@ def _check_hypothesis_data_feasibility(
     except Exception as e:
         return False, f"Cannot read research/data-landscape.md: {e}"
 
-    missing = [r for r in required if r.lower() not in landscape]
+    missing = [r for r in required if not _matches_landscape(r, landscape)]
     if missing:
         return False, (
             f"Hypothesis requires data types {missing} but research/data-landscape.md "
             f"does not mention them. Pick hypotheses that can be realized with "
-            f"available sources, or broaden the landscape first."
+            f"available sources, or broaden the landscape first. Declare types as "
+            f"plain names matching the landscape, e.g. "
+            f"`required_data_types: [yfinance_ohlcv, SEC 8-K]`."
         )
     return True, ""
+
+
+def _normalize_data_type(item: str) -> str:
+    """Reduce a declared data-type item to its bare name.
+
+    Formatting must never fail a hypothesis (a Sharpe-2.221 strategy was once
+    abandoned because its bullets carried backticks + descriptions): take the
+    first backtick span if present, else strip markdown emphasis/quotes and cut
+    any trailing description. Description separators require surrounding
+    spaces (" — ", " - ", ": ") so hyphenated names like "SEC 8-K" survive.
+    """
+    tick = re.search(r"`([^`]+)`", item)
+    if tick:
+        return tick.group(1).strip()
+    s = item.strip().strip("*_").strip('"').strip("'")
+    s = re.split(r"\s+[—–-]\s+|:\s+", s, maxsplit=1)[0]
+    return re.sub(r"\s+", " ", s.strip().strip("*_").strip('"').strip("'"))
+
+
+def _matches_landscape(needle: str, landscape_lower: str) -> bool:
+    """Tolerant containment: normalized substring first, then a word-level
+    fallback (all significant words present) for punctuation/order variance."""
+    norm = re.sub(r"[`*\"']", "", needle.lower())
+    norm = re.sub(r"\s+", " ", norm).strip()
+    if not norm:
+        return False
+    clean_landscape = re.sub(r"[`*\"']", "", landscape_lower)
+    if norm in clean_landscape:
+        return True
+    words = [w for w in re.split(r"[^a-z0-9_-]+", norm) if len(w) > 2]
+    return bool(words) and all(w in clean_landscape for w in words)
 
 
 def _extract_required_data_types(hyp_text: str) -> List[str]:
@@ -1065,14 +1098,15 @@ def _extract_required_data_types(hyp_text: str) -> List[str]:
     Accepts either a YAML/JSON-style list:
         required_data_types: [SEC 8-K, IEX news feed]
     or a markdown list under a `## Required Data Types` / `## required_data_types`
-    heading.
+    heading. Items are normalized (backticks/emphasis/descriptions stripped) —
+    see _normalize_data_type.
     """
     inline = re.search(
         r"required_data_types\s*[:=]\s*\[([^\]]+)\]", hyp_text, re.IGNORECASE,
     )
     if inline:
         items = inline.group(1).split(",")
-        return [it.strip().strip('"').strip("'") for it in items if it.strip()]
+        return [_normalize_data_type(it) for it in items if it.strip()]
 
     section = re.search(
         r"#+\s*required[_ ]data[_ ]types[^\n]*\n(.+?)(?:\n#+|\Z)",
@@ -1084,8 +1118,8 @@ def _extract_required_data_types(hyp_text: str) -> List[str]:
         for line in lines:
             m = re.match(r"\s*[-*]\s*(.+?)\s*$", line)
             if m:
-                items.append(m.group(1).strip())
-        return items
+                items.append(_normalize_data_type(m.group(1)))
+        return [it for it in items if it]
     return []
 
 

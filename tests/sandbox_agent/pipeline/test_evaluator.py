@@ -19,6 +19,7 @@ from sandbox_agent.pipeline.evaluator import (
     _check_strategy_reads_llm_cache,
     _check_verdict_matches_metrics,
     _decide_from_pilot_history,
+    _normalize_data_type,
     _programmatic_checks,
     _stage_specific_checks,
 )
@@ -364,6 +365,90 @@ class TestHypothesisDataFeasibility:
             tmp_project_dir, {"hypothesis_count": 1}
         )
         assert passed, msg
+
+    def test_accepts_backticked_bullets_with_descriptions(self, tmp_project_dir):
+        # Incident replay (neumann-four-corners-v3): a Sharpe-2.221 hypothesis
+        # was abandoned because bullets carried backticks + descriptions and
+        # the whole line became the search needle. Formatting must not be able
+        # to fail a hypothesis whose data types ARE in the landscape.
+        _write(tmp_project_dir, "strategy/hypothesis_v1.md", (
+            "# Hypothesis\n\n"
+            "## required_data_types\n"
+            "- `yfinance_ohlcv` \u2014 daily OHLCV bars for the universe\n"
+            "- `eodhd_earnings`: EPS surprise history\n"
+            "- **SEC 8-K** - material contract filings\n"
+        ))
+        _write(tmp_project_dir, "research/data-landscape.md", (
+            "## Data Sources\n"
+            "DATA_TYPE: yfinance_ohlcv\nDATA_TYPE: eodhd_earnings\n"
+            "SEC 8-K filings from EDGAR.\n"
+        ))
+        passed, msg = _check_hypothesis_data_feasibility(
+            tmp_project_dir, {"hypothesis_count": 1}
+        )
+        assert passed, msg
+
+    def test_accepts_bold_and_quoted_inline_items(self, tmp_project_dir):
+        _write(tmp_project_dir, "strategy/hypothesis_v1.md",
+               "# Hypothesis\nrequired_data_types: [\"SEC 8-K\", **PRNewswire**]")
+        _write(tmp_project_dir, "research/data-landscape.md",
+               "## Data Sources\nSEC 8-K filings and PRNewswire press releases.")
+        passed, msg = _check_hypothesis_data_feasibility(
+            tmp_project_dir, {"hypothesis_count": 1}
+        )
+        assert passed, msg
+
+    def test_word_fallback_matches_punctuated_landscape(self, tmp_project_dir):
+        # Needle "IEX news feed" vs landscape "news feed (IEX)" — exact
+        # substring fails but every significant word is present.
+        _write(tmp_project_dir, "strategy/hypothesis_v1.md", (
+            "# Hypothesis\n\n"
+            "## Required Data Types\n"
+            "- IEX news feed\n"
+        ))
+        _write(tmp_project_dir, "research/data-landscape.md",
+               "## Data Sources\nWe have a news feed (IEX) with tick coverage.")
+        passed, msg = _check_hypothesis_data_feasibility(
+            tmp_project_dir, {"hypothesis_count": 1}
+        )
+        assert passed, msg
+
+    def test_still_rejects_genuinely_missing_type(self, tmp_project_dir):
+        # Leniency is about formatting, not substance: a data type that is
+        # truly absent from the landscape must still fail, and the feedback
+        # must show the CLEAN parsed name plus a format hint.
+        _write(tmp_project_dir, "strategy/hypothesis_v1.md", (
+            "# Hypothesis\n\n"
+            "## required_data_types\n"
+            "- `satellite parking-lot imagery` \u2014 weekly car counts\n"
+        ))
+        _write(tmp_project_dir, "research/data-landscape.md",
+               "## Data Sources\nDATA_TYPE: yfinance_ohlcv\n")
+        passed, msg = _check_hypothesis_data_feasibility(
+            tmp_project_dir, {"hypothesis_count": 1}
+        )
+        assert not passed
+        assert "satellite parking-lot imagery" in msg
+        assert "required_data_types" in msg  # format hint present
+
+
+class TestNormalizeDataType:
+
+    def test_backtick_span_wins(self):
+        assert _normalize_data_type("`SEC 8-K` \u2014 material contracts") == "SEC 8-K"
+
+    def test_strips_formatting_and_description(self):
+        assert _normalize_data_type("**IEX news feed**: realtime ticks") == "IEX news feed"
+        assert _normalize_data_type("'eodhd_earnings' - EPS surprises") == "eodhd_earnings"
+
+    def test_hyphenated_names_survive(self):
+        # No spaces around the hyphen — must NOT be treated as a description
+        # separator.
+        assert _normalize_data_type("SEC 8-K") == "SEC 8-K"
+        assert _normalize_data_type("point-in-time fundamentals") == "point-in-time fundamentals"
+
+    def test_plain_name_unchanged(self):
+        assert _normalize_data_type("yfinance_ohlcv") == "yfinance_ohlcv"
 
 
 class TestPilotAvoidsOOS:

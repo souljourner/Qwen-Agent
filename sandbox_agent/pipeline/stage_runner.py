@@ -180,6 +180,10 @@ def _load_artifacts(state: PipelineState, stage_number: int) -> str:
 
     stage_defn = get_stages(state.pipeline_type).get(stage_number, {})
     max_chars = int(stage_defn.get("input_max_chars", 120000))
+    # Per-artifact caps alone don't bound the block: 5 near-cap artifacts
+    # once produced a ~600k-char base prompt no compaction tier could shrink.
+    total_budget = int(stage_defn.get("input_total_max_chars", 240000))
+    remaining = total_budget
 
     for artifact_path in inputs:
         full_path = os.path.join(project_dir, artifact_path)
@@ -199,9 +203,13 @@ def _load_artifacts(state: PipelineState, stage_number: int) -> str:
                         content = json.dumps(ls, indent=2)
                     except Exception:  # noqa: BLE001 — fall back to raw content
                         pass
-                # Cap each artifact to avoid blowing up context
-                if len(content) > max_chars:
-                    content = content[:max_chars] + "\n\n... (truncated)"
+                # Cap each artifact AND the running total to avoid blowing up
+                # context; every artifact keeps at least a stub so none
+                # silently disappears from the prompt.
+                cap = max(min(max_chars, remaining), 2000)
+                if len(content) > cap:
+                    content = content[:cap] + "\n\n... (truncated)"
+                remaining = max(0, remaining - len(content))
                 parts.append(f"### Artifact: {artifact_path}\n\n{content}")
             except Exception as e:
                 parts.append(f"### Artifact: {artifact_path}\n\n(Error reading: {e})")

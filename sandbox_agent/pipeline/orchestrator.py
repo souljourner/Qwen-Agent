@@ -746,19 +746,21 @@ def _file_review_followup(state: PipelineState) -> None:
 def load_stage_instructions(stage_number: int, pipeline_type: str) -> str:
     """Load the markdown instruction file for a stage.
 
-    DATA_DIR/pipeline_stages/<type>/ overrides win over the bundled files —
+    DATA_DIR/pipeline_stages/<type>/ overrides EXTEND the bundled files —
     the agent user cannot write /app, so without this the stage-6 review's
-    "instruction improvement suggestions" were dead letters. Improvements are
-    applied by writing an override copy there."""
+    "instruction improvement suggestions" were dead letters. Overrides are
+    appended AFTER the bundled instructions (the agent writes them as
+    additional learned rules, "all bundled rules still apply"); returning
+    only the override would silently strip the entire bundled workflow."""
     stage_name = get_stages(pipeline_type)[stage_number]["name"]
     fname = f"stage_{stage_number}_{stage_name}.md"
+    md_path = get_instructions_dir(pipeline_type) / fname
+    bundled = md_path.read_text() if md_path.exists() else (
+        f"Execute stage {stage_number}: {stage_name}. Save output to the expected artifact files.")
     override = Path(DATA_DIR) / "pipeline_stages" / pipeline_type / fname
     if override.exists():
-        return override.read_text()
-    md_path = get_instructions_dir(pipeline_type) / fname
-    if md_path.exists():
-        return md_path.read_text()
-    return f"Execute stage {stage_number}: {stage_name}. Save output to the expected artifact files."
+        return bundled + "\n\n---\n# Learned overrides (applied from pipeline reviews)\n\n" + override.read_text()
+    return bundled
 
 
 def get_stage_inputs(stage_number: int, pipeline_type: str) -> list:

@@ -116,6 +116,12 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
 
     agent._call_tool = _logged_call_tool
 
+    # Mid-loop compaction: FnCallAgent._run re-compacts before EVERY LLM call
+    # (system + task message pinned verbatim). Complements the entry-time
+    # compaction below, which alone let tool results overflow the context.
+    from sandbox_agent.compaction import compact_midrun
+    agent._precall_compact = compact_midrun
+
     # Wrap _run to compact context before the FnCallAgent tool-call loop starts
     original_run = agent._run
 

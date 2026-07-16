@@ -10,7 +10,12 @@ PRIMARY_LLM_CFG = {
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {
-        "max_input_tokens": 0,        # Disable client-side truncation for KV cache stability
+        # Hard backstop, NOT the primary mechanism (compaction is): if the
+        # compactor misses, qwen-agent roughly truncates instead of vLLM
+        # 400-ing (real ceiling 262144-65536=196608; the char estimators
+        # undercounted by ~16% in the 2026-07-15 incident, hence the margin).
+        # KV-cache churn from truncation is acceptable in that failure mode.
+        "max_input_tokens": 160000,
         "request_timeout": 1800,       # 30min — covers full 200k context window worst case
         "temperature": 0.6,
         # use_raw_api=True: pass `tools=` to vLLM natively. Required because
@@ -41,7 +46,7 @@ BACKGROUND_LLM_CFG = {
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {
-        "max_input_tokens": 0,
+        "max_input_tokens": 160000,   # same backstop rationale as PRIMARY_LLM_CFG
         "request_timeout": 1800,
         "temperature": 0.6,
         # Same reason as PRIMARY_LLM_CFG: vLLM auto-tool-parsing means we
@@ -68,6 +73,9 @@ CHARS_PER_TOKEN = 4  # Rough estimate for English/code; conservative for CJK
 # --- Compaction (OpenClaw-style context management) ---
 COMPACTION_ENABLED = os.getenv("COMPACTION_ENABLED", "true").lower() == "true"
 COMPACTION_RESERVE_TOKENS = int(os.getenv("COMPACTION_RESERVE_TOKENS", "30000"))
+# Tokens the char-based estimator cannot see: tool JSON schemas (~40 tools)
+# sent with every request + system formatting overhead.
+ESTIMATOR_OVERHEAD_TOKENS = int(os.getenv("ESTIMATOR_OVERHEAD_TOKENS", "20000"))
 COMPACTION_MAX_HISTORY_SHARE = 0.5         # max fraction of context window for history
 COMPACTION_RECENT_TURNS_PRESERVE = 2       # keep last N user/assistant exchanges verbatim
 COMPACTION_SAFETY_MARGIN = 1.2             # 20% buffer on token estimates

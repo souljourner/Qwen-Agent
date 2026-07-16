@@ -14,6 +14,7 @@ from sandbox_agent.config import (
     COMPACTION_SAFETY_MARGIN,
     COMPACTION_TOOL_RESULT_HARD_CAP,
     COMPACTION_TOOL_RESULT_MIN_KEEP,
+    ESTIMATOR_OVERHEAD_TOKENS,
     MAX_CONTEXT_TOKENS,
     COMPACTION_RESERVE_TOKENS,
 )
@@ -30,7 +31,11 @@ def select_tier(messages: List[Message]) -> Tuple[Tier, int]:
     Returns (tier, overflow_tokens) where overflow_tokens is how many tokens
     over budget we are (0 if fits).
     """
-    estimated = int(estimate_messages_tokens(messages) * COMPACTION_SAFETY_MARGIN)
+    # ESTIMATOR_OVERHEAD_TOKENS covers what the char-count can't see: the
+    # ~40 tool JSON schemas sent with every request plus system formatting.
+    # Without it a request can measure "fits" here yet overflow on the wire.
+    estimated = int((estimate_messages_tokens(messages) + ESTIMATOR_OVERHEAD_TOKENS)
+                    * COMPACTION_SAFETY_MARGIN)
     budget = MAX_CONTEXT_TOKENS - COMPACTION_RESERVE_TOKENS
     overflow = max(0, estimated - budget)
 
