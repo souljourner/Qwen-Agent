@@ -18,8 +18,17 @@ def skills_env(tmp_path, monkeypatch):
 def test_list_mode_shows_all_bundled(skills_env):
     out = ReadSkill().call({})
     for name in ("token-efficiency", "browser-automation", "file-organization",
-                 "long-documents", "pipelines", "memory-maintenance"):
+                 "long-documents", "pipelines", "memory-maintenance", "trading-data"):
         assert name in out
+
+
+def test_trading_data_skill_content(skills_env):
+    # The chat agent's only systematic teaching about the local EODHD store —
+    # must cover the client API, the backfill etiquette, and the yfinance ban.
+    out = ReadSkill().call({"name": "trading-data"})
+    for needle in ("get_daily", "get_universe", "request_backfill",
+                   "adjusted", "yfinance", "25"):
+        assert needle in out, needle
 
 
 def test_read_by_name(skills_env):

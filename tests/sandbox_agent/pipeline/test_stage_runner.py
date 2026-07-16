@@ -389,3 +389,34 @@ class TestArtifactTotalBudget:
         result = _load_artifacts(_state(), 2)
         assert "TAM is $5B" in result
         assert "truncated" not in result
+
+
+class TestFailureMessageContext:
+
+    def test_failure_message_points_to_takeover_context(self, tmp_data_dir, monkeypatch):
+        # When a stage dies, the main chat agent receives this string as a
+        # system event and takes over — it must be told WHERE the sub-agent's
+        # context lives (state notes, stage instructions, skill), not just
+        # the bare exception.
+        import sandbox_agent.pipeline.stage_runner as sr
+        from sandbox_agent.pipeline.orchestrator import init_pipeline
+
+        # Hermetic: everything (state, lock, scheduled retry task) in tmp —
+        # stage_runner's fixture patches only its own DATA_DIR.
+        monkeypatch.setattr("sandbox_agent.pipeline.orchestrator.DATA_DIR", tmp_data_dir)
+        monkeypatch.setattr("sandbox_agent.pipeline.orchestrator.LOCK_FILE",
+                            os.path.join(tmp_data_dir, "pipeline.lock"))
+        monkeypatch.setattr("sandbox_agent.pipeline.orchestrator._schedule_stage",
+                            lambda *a, **k: None)
+        init_pipeline("test-project", "d", pipeline_type="trading")
+        monkeypatch.setattr(sr, "_execute_stage",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        class _Task:
+            name = "pipeline:test-project:stage_2"
+            id = "t1"
+
+        out = sr.run_pipeline_stage(_Task(), "sys")
+        assert "boom" in out
+        assert "pipeline/state.json" in out
+        assert "read_skill('pipelines')" in out

@@ -9,6 +9,14 @@
 
 A global lock serializes all pipelines — only one runs at a time.
 
+## Taking over from a failed stage
+When a `pipeline:<project>:stage_N` background task fails and you follow up, first rebuild the sub-agent's context — it worked from materials you don't see in chat:
+1. `pipeline_status` + the project's `pipeline/state.json` — per-stage status, attempt counts, and `notes` (the evaluator's feedback for every failed attempt).
+2. The stage's instructions: `exec cat /app/sandbox_agent/pipeline/stages_trading/stage_N_*.md` (or stages_startup/), plus any learned overrides in `/app/data/pipeline_stages/<type>/` — together these are exactly what the sub-agent was told to do.
+3. Its working artifacts under the project dir (`strategy/loop_state.json`, `research/`, `backtest/`).
+4. Trading pipelines use the local data store — read_skill('trading-data') for the client API and policies the sub-agent was bound by.
+Only then decide: fix the blocker and let the orchestrator reschedule, or report to the user.
+
 ## Task routing
 - **Simple tasks** (research a topic, write a report): use project tools directly — no pipeline needed
 - **Building a startup idea end-to-end**: use `start_pipeline`

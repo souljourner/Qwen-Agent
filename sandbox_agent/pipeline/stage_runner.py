@@ -70,7 +70,14 @@ def run_pipeline_stage(task, system_message: str) -> str:
     except Exception as e:
         logger.exception(f"Pipeline stage {stage_number} failed for {project_name}")
         mark_stage_failed(project_name, stage_number, str(e))
-        return f"Stage {stage_number} failed: {e}"
+        # This string becomes a system event in the MAIN agent's chat — point
+        # it at the sub-agent's context so a takeover starts informed, not blind.
+        return (
+            f"Stage {stage_number} failed: {e}\n"
+            f"[Takeover context: attempt feedback in projects/{project_name}/pipeline/state.json "
+            f"stage notes; the stage's full instructions + working artifacts per "
+            f"read_skill('pipelines') § 'Taking over from a failed stage'.]"
+        )
     finally:
         release_lock()
 
