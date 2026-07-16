@@ -419,13 +419,16 @@ class CancelTask(BaseTool):
             killed_running = _cancel_run(params["task_id"])
         except Exception:  # noqa: BLE001
             pass
+        # default=str: task_definition carries datetimes — serialization must
+        # never fail AFTER the cancel already happened (2026-07-16: the crash
+        # made the agent think the cancel failed and escalate).
         return json.dumps({
             "status": "cancelled",
             "task_id": params["task_id"],
             "name": task.name,
             "killed_running": killed_running,
             "task_definition": task_definition,
-        })
+        }, default=str)
 
 
 @register_tool("pause_task")

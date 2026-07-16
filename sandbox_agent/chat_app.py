@@ -382,6 +382,15 @@ async def _completion_notifier_loop() -> None:
                         # follow up (read a result file, schedule the next step,
                         # send a notification) without waiting for the user.
                         # Serialized with on_message via the per-session lock.
+                        # Damped: repeated notifications from the same task (a
+                        # failing stage rescheduling itself) and post-Stop
+                        # notifications deliver to UI + history but do NOT
+                        # spawn agent turns — see notify_damper.
+                        from sandbox_agent.notify_damper import should_trigger_synthetic_turn
+                        if not should_trigger_synthetic_turn(str(evt.get("name") or evt.get("task_id") or "?")):
+                            logger.info("notifier: synthetic turn suppressed (cooldown/mute) for %s",
+                                        evt.get("name"))
+                            continue
                         try:
                             async with _get_turn_lock():
                                 await _execute_agent_turn(_get_agent(), hist, log_user_msg=None)
@@ -433,6 +442,23 @@ _STATS_FOOTER_MARKER = "\n\n---\n📊 _last turn:"
 def _strip_stats_footer(text: str) -> str:
     i = text.find(_STATS_FOOTER_MARKER)
     return text[:i] if i != -1 else text
+
+
+_active_run_id: Optional[str] = None
+
+
+@cl.on_stop
+async def on_stop():
+    """Stop button: cancel the ACTIVE agent run (user turn or synthetic
+    notifier turn) and mute further synthetic turns briefly — without this a
+    notification storm was unstoppable from the UI (2026-07-16)."""
+    from sandbox_agent.notify_damper import mute_on_stop
+    mute_on_stop()
+    if _active_run_id:
+        cancelled = cancellation.cancel(_active_run_id)
+        logger.info("Stop pressed: cancel(%s) -> %s; synthetic turns muted", _active_run_id, cancelled)
+    else:
+        logger.info("Stop pressed: no active run; synthetic turns muted")
 
 
 @cl.on_chat_start
@@ -1036,6 +1062,10 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
     except Exception:  # noqa: BLE001
         run_id = None
     run_id = run_id or f"chat-{uuid.uuid4().hex}"
+    # Expose to @on_stop: Stop cancels whatever turn is active — including
+    # notifier-initiated synthetic turns the coroutine-cancel path never saw.
+    global _active_run_id
+    _active_run_id = run_id
 
     # Capture the originating session/thread on the asyncio side (cl.context is
     # per-asyncio-Task — invalid on the worker thread). Passed into the worker
