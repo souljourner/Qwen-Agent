@@ -27,7 +27,7 @@ RUN pip install --no-cache-dir websockify
 COPY setup.py README.md /app/Qwen-Agent/
 COPY qwen_agent/ /app/Qwen-Agent/qwen_agent/
 RUN pip install --no-cache-dir "/app/Qwen-Agent[gui,rag]" croniter numpy soundfile \
-    pandas requests Pillow beautifulsoup4 lxml \
+    pandas requests Pillow beautifulsoup4 lxml yfinance \
     chainlit aiosqlite "sqlalchemy>=2.0" \
     playwright "cryptography>=42.0"
 

@@ -89,3 +89,34 @@ def test_cancelled_task_archive_is_listable(tmp_path, monkeypatch):
     cancelled = tq.list_tasks(category="cancelled")
     assert [c.id for c in cancelled] == [t.id]
     assert cancelled[0].status == "cancelled"
+
+
+def test_git_autocommit_breaks_stale_index_lock(tmp_path, monkeypatch):
+    # A crashed git process left index.lock in DATA_DIR/.git for 2 DAYS
+    # (2026-07-15 → 17); every autocommit failed until manual cleanup. Stale
+    # locks (>10 min) must be broken automatically.
+    import time
+    import sandbox_agent.tools.git_autocommit as ga
+    monkeypatch.setattr(ga, "DATA_DIR", str(tmp_path))
+    ga.ensure_git_repo()
+    lock = tmp_path / ".git" / "index.lock"
+    lock.write_text("")
+    old = time.time() - 3600
+    import os as _os
+    _os.utime(lock, (old, old))
+    (tmp_path / "f.txt").write_text("hello")
+    ga.autocommit("f.txt", "test commit")
+    assert not lock.exists()
+    assert "test commit" in ga._run_git("log", "--oneline", cwd=str(tmp_path))
+
+
+def test_git_autocommit_respects_fresh_lock(tmp_path, monkeypatch):
+    # A FRESH lock means a live git process — never break it.
+    import sandbox_agent.tools.git_autocommit as ga
+    monkeypatch.setattr(ga, "DATA_DIR", str(tmp_path))
+    ga.ensure_git_repo()
+    lock = tmp_path / ".git" / "index.lock"
+    lock.write_text("")
+    (tmp_path / "f.txt").write_text("hello")
+    ga.autocommit("f.txt", "test commit")
+    assert lock.exists()  # untouched
