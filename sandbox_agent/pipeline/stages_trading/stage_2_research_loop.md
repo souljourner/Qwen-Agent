@@ -104,7 +104,7 @@ These notes are **injected into every future run's prompt** (bounded by the 3-hy
 - `backtest/pilot/results_v{N}.md`, `metrics_v{N}.json`, `metrics_latest.json`
 
 ## CRITICAL RULES
-- Execute exactly **one** `next_step` per invocation. End with `part-completion`.
+- Execute exactly **one** `next_step` per invocation, then END YOUR REPLY NORMALLY — the evaluator runs after each completed step and writes the next `next_step`. Never write a part-completion marker yourself (it SKIPS evaluation; the runner adds it automatically only when you run out of tool budget mid-step). If `next_step` shows `null` or `_advance`, do nothing — finish your reply so the evaluator can adjudicate.
 - Never rewrite `oos_cutoff_date`.
 - Strategy code MUST load from `data/processed/llm_cache/pilot/`. Fabricated signals (`hashlib.md5`, hardcoded randoms, "simulated/mock/synthetic/fake" anything) will be rejected — both by the lineage check and the phrase blacklist.
 - Every `exec` call has a hard 600s cap. Chunk.

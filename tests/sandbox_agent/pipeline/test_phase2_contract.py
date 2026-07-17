@@ -188,3 +188,49 @@ def test_legacy_pipeline_without_pin_skips_hash_gate(proj):
     _write_verdict(pdir, "promote", hash_line=None)
     passed, msg = ev._check_verdict_matches_metrics(pdir)
     assert passed, msg
+
+
+# --- next_step deadlock recovery (2026-07-16 SOXS: 28 part-completions) ----------
+
+
+def test_sanitizer_restores_evaluator_next_step(proj):
+    # The agent clobbered the evaluator's next_step with narrative; the
+    # sanitizer used to discard it to None — a DEADLOCK, because with the doc
+    # telling the agent to end every run in part-completion, no evaluation
+    # ever ran again to restore it. Now the evaluator's shadow copy wins.
+    d, pdir = proj
+    path = _write_loop_state(
+        pdir, next_step="verify_convergence_again",
+        _evaluator_next_step="revise_hypothesis")
+    changed = ev.sanitize_loop_state_file(path)
+    assert changed
+    ls = json.load(open(path))
+    assert ls["next_step"] == "revise_hypothesis"
+
+
+def test_sanitizer_nulls_when_no_shadow(proj):
+    d, pdir = proj
+    path = _write_loop_state(pdir, next_step="made_up_step")
+    ev.sanitize_loop_state_file(path)
+    ls = json.load(open(path))
+    assert ls["next_step"] is None
+
+
+def test_sanitizer_ignores_corrupt_shadow(proj):
+    d, pdir = proj
+    path = _write_loop_state(
+        pdir, next_step="made_up", _evaluator_next_step="also_made_up")
+    ev.sanitize_loop_state_file(path)
+    ls = json.load(open(path))
+    assert ls["next_step"] is None
+
+
+def test_write_decision_persists_shadow(proj):
+    d, pdir = proj
+    path = _write_loop_state(pdir)
+    ls = json.load(open(path))
+    ev._write_decision(path, ls, ev.StageDecision(
+        type="infeasible_data", passed=False, feedback="f",
+        next_step="revise_hypothesis", next_phase="revise_hypothesis"))
+    saved = json.load(open(path))
+    assert saved["_evaluator_next_step"] == "revise_hypothesis"

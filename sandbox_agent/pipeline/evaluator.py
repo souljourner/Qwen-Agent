@@ -584,8 +584,15 @@ def sanitize_loop_state_file(loop_state_path: str) -> bool:
     changed = False
     ns = loop_state.get("next_step")
     if ns and ns != ADVANCE_SENTINEL and ns not in CANONICAL_NEXT_STEPS:
-        logger.info(f"sanitize_loop_state: discarding non-canonical next_step={ns!r}")
-        loop_state["next_step"] = None
+        # Restore the evaluator's own last step instead of nulling: a null
+        # next_step is a DEADLOCK when runs keep part-completing (evaluation
+        # never re-runs to write a fresh one — 2026-07-16 SOXS burned 28
+        # part-completions this way).
+        shadow = loop_state.get("_evaluator_next_step")
+        restored = shadow if shadow in CANONICAL_NEXT_STEPS or shadow == ADVANCE_SENTINEL else None
+        logger.info(f"sanitize_loop_state: discarding non-canonical next_step={ns!r}"
+                    f"{f', restoring evaluator step {restored!r}' if restored else ''}")
+        loop_state["next_step"] = restored
         changed = True
     cp = loop_state.get("current_phase")
     if cp and cp not in CANONICAL_NEXT_PHASES:
@@ -987,6 +994,9 @@ def _write_decision(
         loop_state["next_step"] = decision.next_step
     else:
         loop_state["next_step"] = ADVANCE_SENTINEL
+    # Shadow copy the agent is told never to touch: if it clobbers next_step,
+    # the sanitizer restores from here instead of deadlocking on null.
+    loop_state["_evaluator_next_step"] = loop_state["next_step"]
     if decision.next_phase:
         if decision.next_phase not in CANONICAL_NEXT_PHASES:
             raise AssertionError(
