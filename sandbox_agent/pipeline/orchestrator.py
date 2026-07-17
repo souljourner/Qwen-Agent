@@ -754,6 +754,24 @@ def reschedule_orphaned_stages_on_startup() -> list:
         # "running" stages were already demoted to "scheduled" by
         # clear_lock_on_startup; "completed"/"failed-no-more-attempts" etc.
         # are terminal and should not be re-scheduled.
+        if stage.status in ("completed", "completed-no-more-attempts"):
+            # Advance was lost across a crash: current stage finished but the
+            # pipeline never moved on (2026-07-16 SOXS: stage 2 'completed',
+            # current_stage still 2, nothing queued). Push it forward.
+            num_stages = get_num_stages(state.pipeline_type)
+            if stage.stage_number < num_stages:
+                logger.warning(
+                    f"Advancing stalled pipeline: {project_name} stage "
+                    f"{stage.stage_number} completed but never advanced")
+                _schedule_next_stage(state, stage.stage_number + 1)
+                save_state(state)
+                if state.status == "running":
+                    rescheduled.append((project_name, stage.stage_number + 1))
+            else:
+                state.status = "completed"
+                save_state(state)
+                logger.warning(f"Closing stalled pipeline {project_name}: final stage done")
+            continue
         if stage.status not in ("scheduled", "part-completion"):
             continue
         if stage.task_id and stage.task_id in active_task_ids:

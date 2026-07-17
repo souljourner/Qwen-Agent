@@ -558,3 +558,44 @@ class TestCancelPipeline:
         from sandbox_agent.config import TOOL_LIST
         assert "cancel_pipeline" in TOOL_REGISTRY
         assert "cancel_pipeline" in TOOL_LIST
+
+
+class TestStartupAdvancesStalledPipelines:
+
+    def test_completed_current_stage_advances_on_startup(self, tmp_data_dir, monkeypatch):
+        # 2026-07-16 SOXS wedge: stage 2 'completed', pipeline 'running',
+        # current_stage still 2, no task queued — advance was lost. The
+        # startup sweep must push the pipeline forward, not skip it.
+        from sandbox_agent.pipeline import orchestrator as o
+        from sandbox_agent.scheduler.task_queue import TaskQueue
+        import sandbox_agent.scheduler.scheduler_tools as st
+        tq = TaskQueue(data_dir=tmp_data_dir)
+        monkeypatch.setattr(st, "get_task_queue", lambda: tq)
+
+        state = o.init_pipeline("stalled", "d", pipeline_type="trading")
+        state.stages[1].status = "completed"
+        state.stages[2].status = "completed"
+        state.current_stage = 2
+        o.save_state(state)
+
+        rescheduled = o.reschedule_orphaned_stages_on_startup()
+        assert ("stalled", 3) in rescheduled
+        st2 = o.load_state("stalled")
+        assert st2.current_stage == 3
+        names = [t.name for t in tq.list_tasks()]
+        assert "pipeline:stalled:stage_3" in names
+
+    def test_completed_final_stage_closes_pipeline(self, tmp_data_dir, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        from sandbox_agent.scheduler.task_queue import TaskQueue
+        import sandbox_agent.scheduler.scheduler_tools as st
+        tq = TaskQueue(data_dir=tmp_data_dir)
+        monkeypatch.setattr(st, "get_task_queue", lambda: tq)
+        state = o.init_pipeline("stalled-final", "d", pipeline_type="startup")
+        n = o.get_num_stages("startup")
+        for i in range(1, n + 1):
+            state.stages[i].status = "completed"
+        state.current_stage = n
+        o.save_state(state)
+        o.reschedule_orphaned_stages_on_startup()
+        assert o.load_state("stalled-final").status == "completed"
