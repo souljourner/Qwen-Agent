@@ -42,7 +42,7 @@ PRIMARY_MODEL_CONCURRENCY = int(os.getenv("PRIMARY_MODEL_CONCURRENCY", "15"))
 # background work. Background tasks NEVER use this directly — they always
 # acquire a primary-model slot.
 BACKGROUND_LLM_CFG = {
-    "model": os.getenv("BACKUP_MODEL", "qwen3.5-9b"),
+    "model": os.getenv("BACKUP_MODEL", "qwen3.5"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {

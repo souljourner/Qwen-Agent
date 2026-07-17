@@ -27,7 +27,7 @@ import requests
 
 _SESSION = requests.Session()
 
-_DEFAULT_MODELS = ("qwen3.6-27b-linux", "qwen3.5-9b")
+_DEFAULT_MODELS = ("qwen3.6-27b-linux", "qwen3.5")
 
 
 def _resolve_chain() -> List[Tuple[str, str]]:
