@@ -100,7 +100,7 @@ TRADING_STAGES = {
             "backtest/full/metrics.json",
         ],
         "required_sections": [
-            "OOS Sharpe", "Walk-Forward", "Benchmark Comparison",
+            "OOS Sharpe", "Sortino", "Annualized Return", "Walk-Forward", "Benchmark Comparison",
             "Trade Count", "t-Statistic", "Turnover",
         ],
     },
@@ -517,26 +517,51 @@ def _notify_pipeline_complete(state: PipelineState, outcome: str) -> None:
     LLM to remember. Non-fatal: a failed send never breaks the pipeline."""
     try:
         lines = [
-            f"Pipeline: {state.project_name} ({state.pipeline_type})",
-            f"Outcome: {outcome}",
+            f"# Pipeline: {state.project_name}",
             "",
-            "Stages:",
+            f"**Type**: {state.pipeline_type} | **Outcome**: {outcome}",
+            "",
         ]
+        # Headline metrics (trading): annualized Sortino + annualized return,
+        # pilot and OOS — the numbers the owner reads first.
+        metrics_path = os.path.join(
+            DATA_DIR, "projects", state.project_name, "backtest", "full", "metrics.json")
+        if os.path.exists(metrics_path):
+            try:
+                with open(metrics_path) as f:
+                    m = json.load(f)
+                def _fmt(key, suffix=""):
+                    v = m.get(key)
+                    return f"{v:.2f}{suffix}" if isinstance(v, (int, float)) else "n/a"
+                lines += [
+                    "## Headline metrics",
+                    "",
+                    "| Metric | Pilot | OOS |",
+                    "|---|---|---|",
+                    f"| Annualized Sortino (key) | {_fmt('pilot_sortino')} | {_fmt('oos_sortino')} |",
+                    f"| Annualized return | {_fmt('pilot_annualized_return_pct', '%')} | {_fmt('oos_annualized_return_pct', '%')} |",
+                    f"| Sharpe | {_fmt('pilot_sharpe')} | {_fmt('oos_sharpe')} |",
+                    "",
+                ]
+            except Exception:  # noqa: BLE001
+                pass
+        lines += ["## Stages", ""]
         for num in sorted(state.stages):
             st = state.stages[num]
             extra = f" — {st.acceptance_result[:200]}" if st.acceptance_result else ""
-            lines.append(f"- {num}. {st.stage_name}: {st.status}{extra}")
+            lines.append(f"- {num}. {st.stage_name}: **{st.status}**{extra}")
         verdict_path = os.path.join(
             DATA_DIR, "projects", state.project_name, "pipeline", "verdict.md")
         if os.path.exists(verdict_path):
             try:
                 with open(verdict_path) as f:
-                    lines += ["", "Verdict (excerpt):", "", f.read()[:2000]]
+                    lines += ["", "## Verdict (excerpt)", "", f.read()[:2500]]
             except Exception:  # noqa: BLE001
                 pass
+        from sandbox_agent.md_to_html import md_to_html
         from sandbox_agent.tools.notification_tools import send_email_message
         subject = f"[pipeline] {state.project_name}: {outcome}"
-        result = send_email_message(subject, "\n".join(lines), html=False)
+        result = send_email_message(subject, md_to_html("\n".join(lines)), html=True)
         logger.info(f"Pipeline completion email for {state.project_name}: {result[:120]}")
     except Exception:  # noqa: BLE001
         logger.exception(f"Pipeline completion email failed for {state.project_name}")

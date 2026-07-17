@@ -25,7 +25,7 @@ A verdict narrative that says "reject" while metrics pass all gates will be reje
 ## Required sections in verdict.md
 - `## Final Recommendation` — one word on its own line: `promote` or `reject`.
 - `Metrics Hash: <hash>` — the literal line from the Validated Metrics Pin block (required whenever the pin appears in your prompt).
-- `## Rationale` — the "why" in plain English, grounded in the specific gates that passed/failed. Cite numbers.
+- `## Rationale` — the "why" in plain English, grounded in the specific gates that passed/failed. Cite numbers. LEAD with the headline metrics the owner reads first: **annualized Sortino (pilot and OOS)** — the key comparison metric — and **annualized return (pilot and OOS)** from metrics.json.
 - `## Strategy Summary` — one-paragraph recap of the converged hypothesis, universe, and signal mechanics.
 - `## Research History` — one sentence per hypothesis attempted (from hypothesis_notes), plus final iteration count.
 - `## Caveats` — known limitations: universe scope, time period, data-source constraints, deflated-Sharpe note. **REQUIRED subsection: `### Survivorship bias`** — the research loop currently skips PREM14A / DEFM14A filings whose tickers have no available price history (delisted / acquired / not on yfinance). This means the pilot and OOS universes over-represent survivors; the pipeline **does not currently support neutralization of this bias**. Cite the count of skipped filings from `strategy/loop_state.json.skipped_filings`.

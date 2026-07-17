@@ -68,6 +68,8 @@ def test_sanitizer_keeps_legit_short_blowup_row(proj):
 
 GOOD_FULL_METRICS = {
     "pilot_sharpe": 1.2, "oos_sharpe": 1.0, "walk_forward_win_rate": 0.75,
+    "pilot_sortino": 1.6, "oos_sortino": 1.3,
+    "pilot_annualized_return_pct": 14.0, "oos_annualized_return_pct": 11.0,
     "total_trades": 250, "t_stat_daily_returns": 3.1, "deflated_sharpe": 0.4,
     "turnover": 10.0, "declared_turnover": 9.0,
     "return_pct": 40.0, "dd_pct": -18.0,

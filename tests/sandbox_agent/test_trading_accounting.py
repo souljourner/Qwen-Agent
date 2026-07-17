@@ -105,3 +105,48 @@ def test_flat_curve_zero_sharpe_not_nan():
     assert m["sharpe"] == 0.0
     assert m["total_return"] == 0.0
     assert validate_metrics(m) == []
+
+
+class TestSortinoAndAnnualized:
+    """The user's key comparison metric (annualized Sortino) + report-only
+    annualized returns — computed by the vetted accounting, not the agent."""
+
+    def _ledger_with_returns(self, daily_returns):
+        # mark() derives equity from cash + positions; drive it via cash.
+        from sandbox_agent.trading_accounting import Ledger
+        led = Ledger(cash=100_000.0)
+        led.mark("2024-01-01", {})
+        equity = 100_000.0
+        for i, r in enumerate(daily_returns, start=2):
+            equity *= (1 + r)
+            led.cash = equity
+            led.mark(f"2024-01-{i:02d}", {})
+        return led
+
+    def test_sortino_uses_downside_deviation(self):
+        from sandbox_agent.trading_accounting import compute_metrics
+        led = self._ledger_with_returns([0.01, -0.02, 0.015, -0.005, 0.02] * 6)
+        m = compute_metrics(led)
+        assert "sortino" in m
+        # downside deviation < total stdev → sortino > sharpe for same mean
+        assert m["sortino"] > m["sharpe"] > 0
+
+    def test_no_downside_days_capped_not_inf(self):
+        from sandbox_agent.trading_accounting import compute_metrics
+        led = self._ledger_with_returns([0.01] * 20)
+        m = compute_metrics(led)
+        assert m["sortino"] == 99.0  # capped sentinel, JSON-safe
+
+    def test_annualized_return(self):
+        from sandbox_agent.trading_accounting import compute_metrics
+        led = self._ledger_with_returns([0.001] * 20)
+        m = compute_metrics(led)
+        assert "annualized_return_pct" in m
+        # 20 bars of +0.1%/day ≈ (1.001^252 - 1) annualized ≈ 28.6%
+        assert 25.0 < m["annualized_return_pct"] < 32.0
+
+    def test_blown_up_annualized_is_none(self):
+        from sandbox_agent.trading_accounting import compute_metrics
+        led = self._ledger_with_returns([0.01, -1.5])  # equity through zero
+        m = compute_metrics(led)
+        assert m["annualized_return_pct"] is None

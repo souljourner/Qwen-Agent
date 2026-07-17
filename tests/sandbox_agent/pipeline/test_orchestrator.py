@@ -433,7 +433,7 @@ class TestCompletionEmail:
         import sandbox_agent.tools.notification_tools as nt
 
         def fake_send(subject, body, to=None, html=True):
-            captured.append((subject, body))
+            captured.append((subject, body, html))
             return "Email sent to owner"
 
         monkeypatch.setattr(nt, "send_email_message", fake_send)
@@ -456,10 +456,12 @@ class TestCompletionEmail:
         n = self._finish_all_but_last("mail-startup", "startup")
         o.advance_pipeline("mail-startup", n, True, "review looks good")
         assert len(sent) == 1
-        subject, body = sent[0]
+        subject, body, as_html = sent[0]
         assert "mail-startup" in subject
         assert "completed" in subject.lower()
         assert "review" in body  # per-stage summary present
+        # Raw markdown emails are unreadable — body must be rendered HTML.
+        assert as_html and "<!DOCTYPE html>" in body and "<li>" in body
 
     def test_trading_reject_sends_email_with_verdict(self, tmp_data_dir, sent, monkeypatch):
         from sandbox_agent.pipeline import orchestrator as o
@@ -477,9 +479,10 @@ class TestCompletionEmail:
         o.advance_pipeline("mail-reject", 4, True, "verdict written")
         assert o.load_state("mail-reject").status == "completed_rejected"
         assert len(sent) == 1
-        subject, body = sent[0]
+        subject, body, as_html = sent[0]
         assert "rejected" in subject.lower()
         assert "OOS Sharpe collapsed" in body  # verdict excerpt included
+        assert as_html and "<h2" in body  # verdict headings rendered
 
     def test_exhausted_final_stage_sends_email(self, tmp_data_dir, sent, monkeypatch):
         from sandbox_agent.pipeline import orchestrator as o
@@ -491,6 +494,24 @@ class TestCompletionEmail:
         o.save_state(state)
         assert len(sent) == 1
         assert "best effort" in sent[0][0].lower() or "exhausted" in sent[0][1].lower()
+
+    def test_trading_email_leads_with_headline_metrics(self, tmp_data_dir, sent, monkeypatch):
+        from sandbox_agent.pipeline import orchestrator as o
+        monkeypatch.setattr(o, "_schedule_stage", lambda *a, **k: None)
+        n = self._finish_all_but_last("mail-metrics", "trading")
+        mdir = os.path.join(tmp_data_dir, "projects", "mail-metrics", "backtest", "full")
+        os.makedirs(mdir, exist_ok=True)
+        with open(os.path.join(mdir, "metrics.json"), "w") as f:
+            json.dump({"pilot_sortino": 1.61, "oos_sortino": 1.32,
+                       "pilot_annualized_return_pct": 14.2,
+                       "oos_annualized_return_pct": 9.8,
+                       "pilot_sharpe": 1.2, "oos_sharpe": 1.0}, f)
+        o.advance_pipeline("mail-metrics", n, True, "done")
+        _, body, as_html = sent[0]
+        assert as_html
+        for needle in ("Sortino", "1.61", "1.32", "Annualized return", "14.20%", "9.80%"):
+            assert needle in body, needle
+        assert "<table>" in body  # rendered as an HTML table, not raw pipes
 
     def test_mid_pipeline_stage_does_not_email(self, tmp_data_dir, sent, monkeypatch):
         from sandbox_agent.pipeline import orchestrator as o

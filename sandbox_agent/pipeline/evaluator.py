@@ -530,7 +530,17 @@ def _load_acceptance_prompt(pipeline_type: str) -> str:
 # Trading stage 2 (research loop): structured decision + gates.
 # ---------------------------------------------------------------------------
 
-_CONVERGE_SHARPE = 0.8
+_CONVERGE_SHARPE = 0.8    # legacy fallback bar (rows without sortino)
+_CONVERGE_SORTINO = 1.0   # bar for the KEY metric (annualized Sortino)
+
+
+def _row_key_metric(row: dict):
+    """(value, converge_bar, name) — annualized Sortino is the key comparison
+    metric; legacy pilot_history rows without it fall back to Sharpe."""
+    s = row.get("sortino")
+    if s is not None:
+        return float(s), _CONVERGE_SORTINO, "sortino"
+    return float(row.get("sharpe", 0.0)), _CONVERGE_SHARPE, "sharpe"
 _CONVERGE_TRADES = 30
 _PLATEAU_DELTA = 0.15
 _NEEDS_MORE_DATA_SHARPE = 1.2
@@ -863,6 +873,7 @@ def _decide_from_pilot_history(loop_state: dict) -> StageDecision:
         )
 
     last = history[-1]
+    last_key, key_bar, key_name = _row_key_metric(last)
     last_sharpe = float(last.get("sharpe", 0.0))
     last_trades = int(last.get("trades", 0))
     total_iters = int(loop_state.get("total_iterations", len(history)))
@@ -874,24 +885,24 @@ def _decide_from_pilot_history(loop_state: dict) -> StageDecision:
     plateau = False
     if len(within_hyp) >= 2:
         deltas = [
-            abs(float(within_hyp[-1].get("sharpe", 0.0)) - float(within_hyp[-2].get("sharpe", 0.0))),
+            abs(_row_key_metric(within_hyp[-1])[0] - _row_key_metric(within_hyp[-2])[0]),
         ]
         if len(within_hyp) >= 3:
             deltas.append(
-                abs(float(within_hyp[-2].get("sharpe", 0.0)) - float(within_hyp[-3].get("sharpe", 0.0)))
+                abs(_row_key_metric(within_hyp[-2])[0] - _row_key_metric(within_hyp[-3])[0])
             )
         plateau = all(d < _PLATEAU_DELTA for d in deltas[:2]) and len(deltas) >= 2
 
     # Terminate: exhausted budget in structural ways.
     if hypothesis_count >= _HYPOTHESIS_CEILING and (
-        last_sharpe < _CONVERGE_SHARPE or last_trades < _CONVERGE_TRADES
+        last_key < key_bar or last_trades < _CONVERGE_TRADES
     ):
         return StageDecision(
             type="terminate",
             passed=True,  # advance to verdict stage, which will write 'reject'
             feedback=(
                 f"Hypothesis ceiling ({_HYPOTHESIS_CEILING}) reached without convergence. "
-                f"Last: sharpe={last_sharpe:.2f}, trades={last_trades}. "
+                f"Last: {key_name}={last_key:.2f}, trades={last_trades}. "
                 f"Advancing to full validation / verdict for rejection."
             ),
             metrics={"last_sharpe": last_sharpe, "last_trades": last_trades},
@@ -910,7 +921,7 @@ def _decide_from_pilot_history(loop_state: dict) -> StageDecision:
     # Converge: plateaued at acceptable performance.
     if (
         plateau
-        and last_sharpe >= _CONVERGE_SHARPE
+        and last_key >= key_bar
         and last_trades >= _CONVERGE_TRADES
     ):
         return StageDecision(
@@ -923,13 +934,13 @@ def _decide_from_pilot_history(loop_state: dict) -> StageDecision:
             metrics={"last_sharpe": last_sharpe, "last_trades": last_trades},
         )
 
-    # Needs more data: promising sharpe but trade count/sample is thin.
-    if last_sharpe > _NEEDS_MORE_DATA_SHARPE and last_trades < _CONVERGE_TRADES:
+    # Needs more data: promising key metric but trade count/sample is thin.
+    if last_key > _NEEDS_MORE_DATA_SHARPE and last_trades < _CONVERGE_TRADES:
         return StageDecision(
             type="needs_more_data",
             passed=False,
             feedback=(
-                f"Promising sharpe ({last_sharpe:.2f}) but only {last_trades} trades — "
+                f"Promising {key_name} ({last_key:.2f}) but only {last_trades} trades — "
                 f"extend the pilot window before trusting the number."
             ),
             next_step="extend_pilot_window",
@@ -956,8 +967,8 @@ def _decide_from_pilot_history(loop_state: dict) -> StageDecision:
             type="dead_end",
             passed=False,
             feedback=(
-                f"Plateaued at sharpe={last_sharpe:.2f} below converge bar "
-                f"({_CONVERGE_SHARPE}). Rotating to a new hypothesis."
+                f"Plateaued at {key_name}={last_key:.2f} below converge bar "
+                f"({key_bar}). Rotating to a new hypothesis."
             ),
             next_step="revise_hypothesis",
             next_phase="revise_hypothesis",
@@ -1462,13 +1473,17 @@ def _check_pilot_uses_real_signals(
 # ---------------------------------------------------------------------------
 
 _FULL_VALIDATION_GATES = {
-    "oos_is_ratio_min": 0.5,
+    "oos_is_ratio_min": 0.5,       # on SORTINO — the key comparison metric
     "walk_forward_win_min": 0.6,
-    "min_trades": 100,
+    "min_trades": 20,              # bare statistical floor, NOT a frequency target
     "min_t_stat": 2.0,
     "min_deflated_sharpe": 0.0,
     "turnover_tolerance": 0.5,
 }
+
+# Report-only fields: must be PRESENT in metrics.json (the user reads them in
+# the verdict/email) but their values never gate. null allowed (blowups).
+_FULL_VALIDATION_REPORT_FIELDS = ("pilot_annualized_return_pct", "oos_annualized_return_pct")
 
 
 def _check_full_validation_metrics(project_dir: str) -> Tuple[bool, str]:
@@ -1504,21 +1519,32 @@ def _check_full_validation_metrics(project_dir: str) -> Tuple[bool, str]:
 
     errs: List[str] = []
 
-    pilot_sharpe = _num("pilot_sharpe")
-    oos_sharpe = _num("oos_sharpe")
-    if pilot_sharpe is None or oos_sharpe is None:
-        errs.append("metrics.json missing pilot_sharpe or oos_sharpe")
-    elif pilot_sharpe <= 0:
+    # OOS/pilot consistency on SORTINO — the key strategy-comparison metric.
+    pilot_sortino = _num("pilot_sortino")
+    oos_sortino = _num("oos_sortino")
+    if pilot_sortino is None or oos_sortino is None:
+        errs.append("metrics.json missing pilot_sortino or oos_sortino "
+                    "(annualized Sortino is the key comparison metric — "
+                    "compute both via trading_accounting.compute_metrics)")
+    elif pilot_sortino <= 0:
         errs.append(
-            f"pilot_sharpe={pilot_sharpe:.2f} must be positive for the OOS-ratio check"
+            f"pilot_sortino={pilot_sortino:.2f} must be positive for the OOS-ratio check"
         )
     else:
-        ratio = oos_sharpe / pilot_sharpe
+        ratio = oos_sortino / pilot_sortino
         if ratio < _FULL_VALIDATION_GATES["oos_is_ratio_min"]:
             errs.append(
-                f"oos_sharpe/pilot_sharpe = {ratio:.2f} < "
+                f"oos_sortino/pilot_sortino = {ratio:.2f} < "
                 f"{_FULL_VALIDATION_GATES['oos_is_ratio_min']:.2f} — OOS collapse"
             )
+    if _num("pilot_sharpe") is None or _num("oos_sharpe") is None:
+        errs.append("metrics.json missing pilot_sharpe or oos_sharpe")
+
+    # Report-only: annualized returns must be RETURNED (present), never gated.
+    for field in _FULL_VALIDATION_REPORT_FIELDS:
+        if field not in m:
+            errs.append(f"metrics.json missing {field} — annualized returns are "
+                        f"report-only but REQUIRED to be present")
 
     wf = _num("walk_forward_win_rate")
     if wf is None:

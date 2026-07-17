@@ -111,9 +111,10 @@ These notes are **injected into every future run's prompt** (bounded by the 3-hy
 - Never print raw data / dataframes beyond 5 rows. Write to files; report row counts + metrics only.
 
 ## Quality Bar for `converge`
-- Pilot Sharpe ≥ 0.8
+- Pilot **annualized Sortino ≥ 1.0** — Sortino is the KEY metric for comparing strategies (Sharpe is still recorded)
 - Trades ≥ 30
-- Plateau (|ΔSharpe| < 0.15 across last 2 iters within the same hypothesis)
+- Plateau (|ΔSortino| < 0.15 across last 2 iters within the same hypothesis)
+- Every `pilot_history` row MUST include `sortino` and `annualized_return_pct` (both come free from `compute_metrics(led)`)
 - All lineage / variance / coverage / OOS-avoidance gates pass
 
 Missing any of those = keep iterating. Hitting ceilings without converging = `terminate` (stage advances and the verdict stage will write "reject" with reasoning).

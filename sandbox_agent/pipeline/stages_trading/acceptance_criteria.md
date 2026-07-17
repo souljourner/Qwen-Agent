@@ -33,9 +33,10 @@ After gates pass, the evaluator computes a decision from `pilot_history`: `conve
 - `backtest/full/metrics.json` present with required numeric fields, passing the same numeric-sanity bar.
 - Every `backtest/**/*.py` imports `sandbox_agent.trading_accounting`.
 - On pass, the evaluator STAMPS metrics.json (schema_version, content_hash, strategy_version) and pins the hash in pipeline state.
-- `oos_sharpe / pilot_sharpe >= 0.5`.
+- `oos_sortino / pilot_sortino >= 0.5` (annualized Sortino is the KEY comparison metric; Sharpe is still reported).
 - `walk_forward_win_rate >= 0.6`.
-- `total_trades >= 100`.
+- `total_trades >= 20` (bare statistical floor — NOT a trade-frequency target).
+- `pilot_annualized_return_pct` and `oos_annualized_return_pct` must be present (report-only: shown in verdict + completion email, never gated on value).
 - `abs(t_stat_daily_returns) >= 2.0`.
 - `deflated_sharpe > 0`.
 - Turnover within ±50% of claimed holding period.

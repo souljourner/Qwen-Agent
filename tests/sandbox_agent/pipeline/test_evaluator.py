@@ -680,6 +680,10 @@ def _good_full_metrics():
     return {
         "pilot_sharpe": 1.0,
         "oos_sharpe": 0.7,
+        "pilot_sortino": 1.4,
+        "oos_sortino": 1.0,
+        "pilot_annualized_return_pct": 12.5,
+        "oos_annualized_return_pct": 9.1,
         "walk_forward_win_rate": 0.7,
         "total_trades": 150,
         "t_stat_daily_returns": 2.5,
@@ -704,11 +708,11 @@ class TestFullValidationMetrics:
 
     def test_oos_collapse_rejected(self, tmp_project_dir):
         m = _good_full_metrics()
-        m["oos_sharpe"] = 0.2  # ratio 0.2 < 0.5
+        m["oos_sortino"] = 0.2  # ratio 0.14 < 0.5 — sortino is the key metric
         _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
         passed, msg = _check_full_validation_metrics(tmp_project_dir)
         assert not passed
-        assert "OOS collapse" in msg or "oos_sharpe" in msg
+        assert "OOS collapse" in msg or "oos_sortino" in msg
 
     def test_low_walk_forward_rejected(self, tmp_project_dir):
         m = _good_full_metrics()
@@ -719,12 +723,56 @@ class TestFullValidationMetrics:
         assert "walk_forward_win_rate" in msg
 
     def test_trades_below_minimum_rejected(self, tmp_project_dir):
+        # Floor lowered 100 → 20 (user: don't force high-frequency behavior;
+        # trade count is a bare statistical-significance floor, not a target).
         m = _good_full_metrics()
-        m["total_trades"] = 40
+        m["total_trades"] = 12
         _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
         passed, msg = _check_full_validation_metrics(tmp_project_dir)
         assert not passed
         assert "total_trades" in msg
+
+    def test_forty_trades_pass(self, tmp_project_dir):
+        m = _good_full_metrics()
+        m["total_trades"] = 40
+        _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
+        passed, msg = _check_full_validation_metrics(tmp_project_dir)
+        assert passed, msg
+
+    def test_sortino_is_the_consistency_metric(self, tmp_project_dir):
+        # OOS/pilot consistency is keyed on SORTINO (the user's comparison
+        # metric), not Sharpe: sortino collapse fails even with healthy sharpe.
+        m = _good_full_metrics()
+        m["oos_sortino"] = 0.3  # ratio 0.21 < 0.5
+        _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
+        passed, msg = _check_full_validation_metrics(tmp_project_dir)
+        assert not passed
+        assert "sortino" in msg.lower()
+
+    def test_missing_sortino_rejected(self, tmp_project_dir):
+        m = _good_full_metrics()
+        del m["pilot_sortino"]
+        _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
+        passed, msg = _check_full_validation_metrics(tmp_project_dir)
+        assert not passed
+        assert "sortino" in msg.lower()
+
+    def test_missing_annualized_return_rejected(self, tmp_project_dir):
+        # Report-only but REQUIRED-present: the user asked for pilot + OOS
+        # annualized returns and neither was being returned.
+        m = _good_full_metrics()
+        del m["oos_annualized_return_pct"]
+        _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
+        passed, msg = _check_full_validation_metrics(tmp_project_dir)
+        assert not passed
+        assert "annualized" in msg.lower()
+
+    def test_negative_annualized_return_is_not_a_gate(self, tmp_project_dir):
+        m = _good_full_metrics()
+        m["oos_annualized_return_pct"] = -3.2  # reported, never gated
+        _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
+        passed, msg = _check_full_validation_metrics(tmp_project_dir)
+        assert passed, msg
 
     def test_low_tstat_rejected(self, tmp_project_dir):
         m = _good_full_metrics()
@@ -770,7 +818,7 @@ class TestVerdictMatchesMetrics:
 
     def test_reject_matches_fail(self, tmp_project_dir):
         m = _good_full_metrics()
-        m["oos_sharpe"] = 0.1
+        m["oos_sortino"] = 0.1
         _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
         _write(tmp_project_dir, "pipeline/verdict.md", (
             "## Final Recommendation\nreject\n\n## Rationale\nOOS collapse.\n"
@@ -780,7 +828,7 @@ class TestVerdictMatchesMetrics:
 
     def test_promote_when_metrics_fail_rejected(self, tmp_project_dir):
         m = _good_full_metrics()
-        m["oos_sharpe"] = 0.1
+        m["oos_sortino"] = 0.1
         _write_json(tmp_project_dir, "backtest/full/metrics.json", m)
         _write(tmp_project_dir, "pipeline/verdict.md", (
             "## Final Recommendation\npromote\n\n## Rationale\nLooks good.\n"
@@ -806,3 +854,39 @@ class TestVerdictMatchesMetrics:
         passed, msg = _check_verdict_matches_metrics(tmp_project_dir)
         assert not passed
         assert "Final Recommendation" in msg
+
+
+class TestSortinoKeyMetricInLoop:
+    """Stage-2 convergence keys on annualized Sortino (the user's comparison
+    metric); legacy pilot_history rows without sortino fall back to Sharpe."""
+
+    def _ls(self, rows):
+        return {"pilot_history": rows, "hypothesis_count": 1,
+                "total_iterations": len(rows)}
+
+    def test_converges_on_sortino_plateau(self):
+        rows = [
+            {"hyp": 1, "sortino": 1.19, "sharpe": 0.5, "trades": 40},
+            {"hyp": 1, "sortino": 1.20, "sharpe": 0.5, "trades": 40},
+            {"hyp": 1, "sortino": 1.20, "sharpe": 0.5, "trades": 40},
+        ]
+        d = _decide_from_pilot_history(self._ls(rows))
+        assert d.type == "converge", d.feedback  # sharpe 0.5 < 0.8 — sortino decides
+
+    def test_below_sortino_bar_plateau_is_dead_end(self):
+        rows = [
+            {"hyp": 1, "sortino": 0.6, "sharpe": 1.2, "trades": 40},
+            {"hyp": 1, "sortino": 0.6, "sharpe": 1.2, "trades": 40},
+            {"hyp": 1, "sortino": 0.6, "sharpe": 1.2, "trades": 40},
+        ]
+        d = _decide_from_pilot_history(self._ls(rows))
+        assert d.type == "dead_end", d.feedback  # good sharpe doesn't rescue it
+
+    def test_legacy_rows_fall_back_to_sharpe(self):
+        rows = [
+            {"hyp": 1, "sharpe": 0.9, "trades": 40},
+            {"hyp": 1, "sharpe": 0.9, "trades": 40},
+            {"hyp": 1, "sharpe": 0.9, "trades": 40},
+        ]
+        d = _decide_from_pilot_history(self._ls(rows))
+        assert d.type == "converge", d.feedback

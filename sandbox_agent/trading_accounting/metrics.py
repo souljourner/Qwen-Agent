@@ -89,12 +89,35 @@ def compute_metrics(ledger: Ledger, periods_per_year: int = TRADING_DAYS_PER_YEA
     # statistically distinguishable from zero (given n, skew, kurtosis).
     deflated = _probabilistic_sharpe(sr_period, returns) - 0.5
 
+    # Annualized Sortino (mean / downside deviation, MAR=0) — the KEY metric
+    # for comparing strategies. Capped at 99 (JSON-safe) when there are no
+    # losing periods.
+    if len(returns) >= 2:
+        dd_dev = math.sqrt(sum(min(r, 0.0) ** 2 for r in returns) / len(returns))
+        if dd_dev > 0:
+            sortino = min((mean(returns) / dd_dev) * math.sqrt(periods_per_year), 99.0)
+        else:
+            sortino = 99.0 if mean(returns) > 0 else 0.0
+    else:
+        sortino = 0.0
+
+    # Annualized return (CAGR). None when equity crossed zero — a compound
+    # rate is undefined across a sign change (short-strategy blowups).
+    years = max(len(returns), 1) / periods_per_year
+    if first > 0 and last > 0 and years > 0:
+        annualized = (last / first) ** (1.0 / years) - 1.0
+    else:
+        annualized = None
+
     return {
         "total_return": total_return,
         "return_pct": total_return * 100.0,
+        "annualized_return": annualized,
+        "annualized_return_pct": annualized * 100.0 if annualized is not None else None,
         "max_drawdown": max_dd,
         "dd_pct": max_dd * 100.0,
         "sharpe": sharpe,
+        "sortino": sortino,
         "t_stat_daily_returns": t_stat,
         "deflated_sharpe": deflated,
         "total_trades": len(ledger.trades),
