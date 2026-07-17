@@ -116,7 +116,13 @@ TRADING_STAGES = {
             # pipeline/metrics.json is EVALUATOR-written after the verdict gate
             # passes (see _write_pipeline_metrics_summary) — not an agent output.
         ],
-        "required_sections": ["Final Recommendation", "Rationale", "Strategy Summary"],
+        "required_sections": [
+            "Final Recommendation", "Rationale", "Strategy Summary",
+            # The owner's completion email carries this section IN FULL —
+            # detailed enough to implement the strategy from the email alone.
+            "Execution Strategy", "Entry Criteria", "Exit Criteria",
+            "Position Sizing", "Portfolio Strategy", "Risk Management",
+        ],
     },
     5: {
         "name": "paper_trading",
@@ -510,6 +516,23 @@ def cancel_pipeline(project_name: str) -> str:
             f"It can be restarted with start_pipeline if needed.")
 
 
+def _extract_md_section(text: str, heading: str) -> str:
+    """Return `heading` plus its body, up to the next heading of the same
+    level (e.g. '## Execution Strategy' runs until the next '## '). Empty
+    string when the heading is absent."""
+    lines = text.split("\n")
+    level = heading.split(" ")[0] + " "
+    out: list = []
+    for line in lines:
+        if out:
+            if line.startswith(level) and not line.startswith(level + "#"):
+                break
+            out.append(line)
+        elif line.strip().lower().startswith(heading.lower()):
+            out.append(line)
+    return "\n".join(out).strip()
+
+
 def _notify_pipeline_complete(state: PipelineState, outcome: str) -> None:
     """Email the owner the final result of ANY pipeline (startup or trading).
 
@@ -555,7 +578,14 @@ def _notify_pipeline_complete(state: PipelineState, outcome: str) -> None:
         if os.path.exists(verdict_path):
             try:
                 with open(verdict_path) as f:
-                    lines += ["", "## Verdict (excerpt)", "", f.read()[:2500]]
+                    verdict = f.read()
+                # The execution strategy goes in IN FULL — entry/exit criteria,
+                # position sizing, portfolio and risk strategy are the point of
+                # the email, never subject to the excerpt cap.
+                strategy = _extract_md_section(verdict, "## Execution Strategy")
+                if strategy:
+                    lines += ["", strategy]
+                lines += ["", "## Verdict (excerpt)", "", verdict[:2500]]
             except Exception:  # noqa: BLE001
                 pass
         from sandbox_agent.md_to_html import md_to_html

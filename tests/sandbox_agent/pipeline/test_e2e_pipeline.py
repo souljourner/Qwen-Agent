@@ -120,7 +120,10 @@ class Player:
         self._w("pipeline/verdict.md",
                 f"# Verdict\n\n## Final Recommendation\n{rec}\n{hash_line}\n"
                 f"## Rationale\ngates {'passed' if pin else 'failed'}; numbers cited.\n\n"
-                f"## Strategy Summary\nfilings-driven long/short.\n")
+                f"## Strategy Summary\nfilings-driven long/short.\n"
+                f"## Execution Strategy\n### Entry Criteria\nbreakout close.\n"
+                f"### Exit Criteria\n10d hold.\n### Position Sizing\n10% each.\n"
+                f"### Portfolio Strategy\nmax 5.\n### Risk Management\nstop 10%.\n")
 
     def stage_5(self):
         self._w("paper/deploy.py",

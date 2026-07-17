@@ -620,3 +620,63 @@ class TestStartupAdvancesStalledPipelines:
         o.save_state(state)
         o.reschedule_orphaned_stages_on_startup()
         assert o.load_state("stalled-final").status == "completed"
+
+
+class TestExecutionStrategyInEmail:
+    """The completion email must ALWAYS carry the full execution strategy —
+    entry/exit criteria, position sizing, portfolio and risk strategy — not a
+    truncated excerpt of it (owner request 2026-07-17)."""
+
+    STRATEGY_MD = (
+        "## Execution Strategy\n\n"
+        "### Entry Criteria\nClose above 20-day high AND volume >= 2x avg.\n\n"
+        "### Exit Criteria\n10-day hold OR trailing stop 10% after +5%.\n\n"
+        "### Position Sizing\n10% of equity per position.\n\n"
+        "### Portfolio Strategy\nMax 5 concurrent positions, small-cap universe.\n\n"
+        "### Risk Management\nHard stop 10%; SPY>MA200 regime filter.\n"
+    )
+
+    def test_email_contains_full_execution_strategy(self, tmp_data_dir, monkeypatch):
+        captured = []
+        import sandbox_agent.tools.notification_tools as nt
+        monkeypatch.setattr(nt, "send_email_message",
+                            lambda subject, body, to=None, html=True:
+                            captured.append(body) or "Email sent")
+        from sandbox_agent.pipeline import orchestrator as o
+        monkeypatch.setattr(o, "_schedule_stage", lambda *a, **k: None)
+        state = o.init_pipeline("mail-strategy", "d", pipeline_type="trading")
+        n = o.get_num_stages("trading")
+        for i in range(1, n):
+            state.stages[i].status = "completed"
+        state.current_stage = n
+        o.save_state(state)
+        vdir = os.path.join(tmp_data_dir, "projects", "mail-strategy", "pipeline")
+        os.makedirs(vdir, exist_ok=True)
+        # verdict long enough that the generic excerpt cap would cut the
+        # strategy if it weren't extracted separately
+        filler = "## Rationale\n" + ("gate detail. " * 400)
+        with open(os.path.join(vdir, "verdict.md"), "w") as f:
+            f.write("# Verdict\n\n## Final Recommendation\n\npromote\n\n"
+                    + filler + "\n" + self.STRATEGY_MD)
+        o.advance_pipeline("mail-strategy", n, True, "done")
+        body = captured[0]
+        for needle in ("Execution Strategy", "Entry Criteria", "20-day high",
+                       "Exit Criteria", "trailing stop 10%", "Position Sizing",
+                       "Portfolio Strategy", "Max 5 concurrent",
+                       "Risk Management", "SPY&gt;MA200"):
+            assert needle in body or needle.replace("&gt;", ">") in body, needle
+
+    def test_extract_md_section(self):
+        from sandbox_agent.pipeline.orchestrator import _extract_md_section
+        text = "# T\n\n## A\na-body\n\n## Execution Strategy\n\n### Entry\nx\n\n## Z\nz"
+        out = _extract_md_section(text, "## Execution Strategy")
+        assert "### Entry" in out and "x" in out
+        assert "a-body" not in out and "z" not in out
+        assert _extract_md_section(text, "## Missing") == ""
+
+    def test_stage4_requires_execution_strategy_sections(self):
+        from sandbox_agent.pipeline.orchestrator import TRADING_STAGES
+        req = TRADING_STAGES[4]["required_sections"]
+        for sec in ("Execution Strategy", "Entry Criteria", "Exit Criteria",
+                    "Position Sizing", "Portfolio Strategy", "Risk Management"):
+            assert sec in req, sec
