@@ -37,12 +37,12 @@ PRIMARY_LLM_CFG = {
 # fallback to the backup. Tune both sides together.
 PRIMARY_MODEL_CONCURRENCY = int(os.getenv("PRIMARY_MODEL_CONCURRENCY", "15"))
 
-# Backup LLM: qwen3.5 (the 397B MoE) on same vLLM server.
+# Backup LLM: laguna-s-2.1 (Poolside, MLX-served via the proxy).
 # Reserved for user chat fallback when all primary slots are occupied by
 # background work. Background tasks NEVER use this directly — they always
 # acquire a primary-model slot.
 BACKGROUND_LLM_CFG = {
-    "model": os.getenv("BACKUP_MODEL", "qwen3.5"),
+    "model": os.getenv("BACKUP_MODEL", "laguna-s-2.1"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {

@@ -104,7 +104,7 @@ class TestChainResolution:
         monkeypatch.delenv("LLM_CALL_CHAIN", raising=False)
         monkeypatch.setenv("VLLM_BASE", "http://vllm.local/v1")
         chain = llm_client._resolve_chain()
-        assert chain == [("qwen3.6-27b-linux", "http://vllm.local/v1"), ("qwen3.5", "http://vllm.local/v1")]
+        assert chain == [("qwen3.6-27b-linux", "http://vllm.local/v1"), ("laguna-s-2.1", "http://vllm.local/v1")]
 
     def test_legacy_single_pair(self, monkeypatch):
         monkeypatch.delenv("LLM_CALL_CHAIN", raising=False)
