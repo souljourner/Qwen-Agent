@@ -98,6 +98,13 @@ try:
         if not os.path.isfile(full):
             raise _HTTPException(status_code=404, detail="not found")
         return _FileResponse(full)
+
+    # The decorator APPENDS the route — after Chainlit's included router, whose
+    # SPA catch-all (`/{full_path:path}`, chainlit/server.py) matches first and
+    # returns index.html for /cl-elements/* (the browser then can't decode HTML
+    # as an image → display_doc images/PDFs render as an empty box). Starlette
+    # matches routes in list order, so hoist ours to the front.
+    _cl_app.router.routes.insert(0, _cl_app.router.routes.pop())
 except Exception:  # noqa: BLE001 — never let route setup break app import
     logger.exception("Failed to mount /cl-elements route; persisted element reload may not work")
 
