@@ -1,12 +1,14 @@
 import os
 from pathlib import Path
 
-# Primary LLM: qwen3.6-27b-linux on vLLM (192.168.4.66) — supports concurrency 15
-# Used for main interactive conversation AND background tasks; up to 15 in flight
-# at once. Saturating all slots routes user chat to the backup (see main.py
-# `_primary_model_lock`, sized as BoundedSemaphore(PRIMARY_MODEL_CONCURRENCY)).
+# PRIMARY tier: laguna-s-2.1 (Poolside, MLX-served via the proxy) — the
+# chat-priority model, max 3 concurrent turns (must match the server's real
+# concurrency). Chat turns prefer this tier and spill to the secondary
+# (qwen3.6-27b-linux) when its slots are full; background work prefers the
+# secondary and spills INTO this tier only when all 10 secondary slots are
+# busy. See main.py `_acquire_turn_slot`.
 PRIMARY_LLM_CFG = {
-    "model": "qwen3.6-27b-linux",
+    "model": os.getenv("PRIMARY_MODEL", "laguna-s-2.1"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {
@@ -31,18 +33,21 @@ PRIMARY_LLM_CFG = {
     },
 }
 
-# How many primary-model requests may be in flight at once. The 27b-linux model
-# is configured for concurrency 15 on the vLLM side; raising this above the
-# server's actual limit will cause queueing on the server instead of clean
-# fallback to the backup. Tune both sides together.
-PRIMARY_MODEL_CONCURRENCY = int(os.getenv("PRIMARY_MODEL_CONCURRENCY", "15"))
+# Turn-slot caps per tier. Raising either above the server's actual limit
+# causes server-side queueing instead of clean spill — tune both sides
+# together. laguna (MLX) sustains 3; qwen3.6-27b-linux (vLLM) sustains 10
+# gated turns (plus slot-unaware bridge/llm_call/compaction traffic on top;
+# the server was sized for 15).
+PRIMARY_MODEL_CONCURRENCY = int(os.getenv("PRIMARY_MODEL_CONCURRENCY", "3"))
+SECONDARY_MODEL_CONCURRENCY = int(os.getenv("SECONDARY_MODEL_CONCURRENCY", "10"))
 
-# Backup LLM: laguna-s-2.1 (Poolside, MLX-served via the proxy).
-# Reserved for user chat fallback when all primary slots are occupied by
-# background work. Background tasks NEVER use this directly — they always
-# acquire a primary-model slot.
+# SECONDARY/overflow tier: qwen3.6-27b-linux on vLLM — hosts background work
+# (cron/heartbeat/pipeline prefer it), chat spillover, and all bulk/unslotted
+# traffic (llm_bridge, llm_call/llm_batch, compaction, digests).
+# NOTE: the old BACKUP_MODEL env var is intentionally NOT honored anymore —
+# a stale BACKUP_MODEL=laguna-s-2.1 would make both tiers laguna.
 BACKGROUND_LLM_CFG = {
-    "model": os.getenv("BACKUP_MODEL", "laguna-s-2.1"),
+    "model": os.getenv("SECONDARY_MODEL", "qwen3.6-27b-linux"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
     "generate_cfg": {

@@ -24,6 +24,7 @@ from sandbox_agent.config import (
     HEARTBEAT_INTERVAL_SECONDS,
     PRIMARY_LLM_CFG,
     PRIMARY_MODEL_CONCURRENCY,
+    SECONDARY_MODEL_CONCURRENCY,
     TOOL_LIST,
     load_system_message,
     session_metadata,
@@ -64,6 +65,37 @@ logger = logging.getLogger(__name__)
 # acquire(blocking=True)). BoundedSemaphore is preferred over plain Semaphore
 # so an over-release (release without a matching acquire) raises immediately.
 _primary_model_lock = BoundedSemaphore(PRIMARY_MODEL_CONCURRENCY)
+_secondary_model_lock = BoundedSemaphore(SECONDARY_MODEL_CONCURRENCY)
+
+
+def _acquire_turn_slot(blocking: bool, prefer: str = "primary",
+                       poll_interval: float = 0.25):
+    """Acquire one model-turn slot across the two tiers.
+
+    Tries the `prefer` tier first, the other second (non-blocking each);
+    when `blocking`, polls until either tier frees. Returns
+    (tier_name, release) or None. `release` is idempotent — a double call
+    must never trip BoundedSemaphore's over-release check mid-stream."""
+    def _try_once():
+        order = [("primary", _primary_model_lock), ("secondary", _secondary_model_lock)]
+        if prefer == "secondary":
+            order.reverse()
+        for tier, sem in order:
+            if sem.acquire(blocking=False):
+                released = [False]
+
+                def _release(sem=sem, released=released):
+                    if not released[0]:
+                        released[0] = True
+                        sem.release()
+                return (tier, _release)
+        return None
+
+    grant = _try_once()
+    while grant is None and blocking:
+        time.sleep(poll_interval)
+        grant = _try_once()
+    return grant
 
 # Lock for background work — ensures heartbeat and cron tasks run one at a time, never colliding.
 _background_work_lock = Lock()
@@ -237,18 +269,19 @@ def _dump_response_for_debug(response, context: str) -> str:
 
 
 class LockingAgent(Assistant):
-    """Wraps an Assistant with smart model routing.
+    """Wraps two model-bound Assistants with tiered turn routing.
 
-    Tries the primary 27b-linux model first. The primary semaphore allows up to
-    `PRIMARY_MODEL_CONCURRENCY` callers in flight at once; when all slots are
-    occupied, user chat is routed to the 397B backup so the user still gets an
-    immediate response instead of queueing behind background work.
+    Chat turns prefer the primary tier (laguna-s-2.1, 3 slots) and spill to
+    the secondary (qwen3.6-27b-linux, 10 slots). When all 13 slots are busy
+    the turn WAITS with a visible notice — no more ungated pile-on. Slots are
+    acquired per TURN via `_acquire_turn_slot` and held for the whole stream.
     """
 
-    def __init__(self, inner: Assistant, backup: Assistant, lock: BoundedSemaphore):
-        self._inner = inner      # Primary agent (qwen3.6-27b-linux on vLLM)
-        self._backup = backup    # Backup agent (qwen3.5 397B on vLLM)
-        self._lock = lock
+    def __init__(self, inner: Assistant, backup: Assistant, lock=None):
+        # `lock` accepted-and-ignored for signature compat; slots come from
+        # the module-level tier semaphores via _acquire_turn_slot.
+        self._inner = inner      # PRIMARY tier agent (laguna-s-2.1)
+        self._backup = backup    # SECONDARY tier agent (qwen3.6-27b-linux)
 
     def run(self, *args, **kwargs) -> Iterator[List[Message]]:
         messages = args[0] if args else kwargs.get("messages", [])
@@ -264,19 +297,25 @@ class LockingAgent(Assistant):
                     user_msg = m
                     break
 
-        # Try to grab a primary-model slot (up to PRIMARY_MODEL_CONCURRENCY in
-        # flight). If all slots are taken, fall through to the 397B backup.
-        got_lock = self._lock.acquire(blocking=False)
-        if got_lock:
+        # Tiered slot: prefer primary (laguna, 3 turn slots), spill to
+        # secondary (qwen, 10). All 13 busy → WAIT with a visible notice.
+        grant = _acquire_turn_slot(blocking=False)
+        waited_note = ""
+        if grant is None:
+            wait_start = time.monotonic()
+            yield [Message(role="assistant",
+                           content="⚠️ All model slots busy — waiting for a free slot…")]
+            grant = _acquire_turn_slot(blocking=True)
+            waited_note = f" [waited {time.monotonic() - wait_start:.0f}s]"
+        tier, release_slot = grant
+        if tier == "primary":
             agent = self._inner
             model_name = PRIMARY_LLM_CFG["model"]
-            log_event("chat_start", detail=f"[primary] {str(user_msg.content)[:180]}" if user_msg else "[primary]")
+            log_event("chat_start", detail=f"[primary]{waited_note} {str(user_msg.content)[:180]}" if user_msg else f"[primary]{waited_note}")
         else:
-            # Primary saturated — every slot held by background work or other
-            # concurrent chats. Use the 397B backup (reserved for chat fallback).
             agent = self._backup
             model_name = BACKGROUND_LLM_CFG["model"]
-            log_event("chat_start", detail=f"[397b fallback] {str(user_msg.content)[:160]}" if user_msg else "[397b fallback]")
+            log_event("chat_start", detail=f"[secondary spill]{waited_note} {str(user_msg.content)[:160]}" if user_msg else f"[secondary spill]{waited_note}")
             logger.info(f"Chat routed to {model_name} (primary slots all in use)")
 
         user_preview = str(user_msg.content)[:100] if user_msg else "chat"
@@ -290,8 +329,7 @@ class LockingAgent(Assistant):
                 yield response
         finally:
             set_current_preview(None)
-            if got_lock:
-                self._lock.release()
+            release_slot()
             model_done(model_name)
 
         # Detect empty completion — model returned 200 but produced no content.
@@ -310,8 +348,16 @@ class LockingAgent(Assistant):
             logger.warning(_dump_response_for_debug(response, f"{model_name} empty"))
             log_event("silent_failure", detail=f"{model_name} returned empty response", model=model_name)
 
-            retry_agent = self._backup if agent is self._inner else self._inner
-            retry_model = BACKGROUND_LLM_CFG["model"] if agent is self._inner else PRIMARY_LLM_CFG["model"]
+            # The original slot was already released (finally above ran when
+            # the stream ended) — acquire fresh, preferring the OTHER tier.
+            # If that tier is full, the retry may legitimately land on the
+            # same model again; caps are never exceeded.
+            other = "secondary" if agent is self._inner else "primary"
+            retry_grant = (_acquire_turn_slot(blocking=False, prefer=other)
+                           or _acquire_turn_slot(blocking=True, prefer=other))
+            retry_tier, retry_release = retry_grant
+            retry_agent = self._inner if retry_tier == "primary" else self._backup
+            retry_model = PRIMARY_LLM_CFG["model"] if retry_tier == "primary" else BACKGROUND_LLM_CFG["model"]
             logger.info(f"Retrying on {retry_model}")
 
             # Visible interim notice so the user sees the fallback rather than
@@ -341,6 +387,7 @@ class LockingAgent(Assistant):
                 yield [err]
                 response = [err]
             finally:
+                retry_release()
                 model_done(retry_model)
 
             # If retry came back but also empty, surface that visibly too.
@@ -369,13 +416,14 @@ class LockingAgent(Assistant):
                 logger.debug("log_turn failed", exc_info=True)
 
     def run_nonstream(self, *args, **kwargs):
-        got_lock = self._lock.acquire(blocking=False)
-        agent = self._inner if got_lock else self._backup
+        grant = (_acquire_turn_slot(blocking=False)
+                 or _acquire_turn_slot(blocking=True))
+        tier, release_slot = grant
+        agent = self._inner if tier == "primary" else self._backup
         try:
             return agent.run_nonstream(*args, **kwargs)
         finally:
-            if got_lock:
-                self._lock.release()
+            release_slot()
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
@@ -476,26 +524,24 @@ def _summarize_task_result(task_name: str, result_text: str, tool_calls: List[di
 
 
 def run_on_best_available(system_message: str, messages: List[Message], task_label: str = "background task") -> List[Message]:
-    """Run a background agent session on the primary model.
+    """Run a background agent session on a tier slot.
 
-    Background tasks always use the primary model (qwen3.6-27b-linux).
-    The backup model (qwen3.5 397B) is reserved for user chat fallback only.
-    Acquires one of the PRIMARY_MODEL_CONCURRENCY semaphore slots for the
-    duration of the run; if all slots are full, this blocks until one frees.
-    Concurrent user chats can still grab a different slot — only when every
-    slot is occupied does chat fall through to the 397B backup.
+    Background work PREFERS the secondary tier (qwen3.6-27b-linux, 10 slots):
+    a long cron task must not eat one of chat's 3 primary (laguna) slots. It
+    spills INTO the primary tier only when all secondary slots are busy, and
+    blocks when all 13 slots are held.
     """
     timeout = compute_request_timeout(messages)
 
-    # Blocking acquire — wait for a primary-model slot to free up.
-    _primary_model_lock.acquire(blocking=True)
+    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="secondary")
+    tier_cfg = BACKGROUND_LLM_CFG if tier == "secondary" else PRIMARY_LLM_CFG
     try:
-        logger.info(f"Background task using primary model (timeout={timeout}s)")
-        set_state(model_in_use=PRIMARY_LLM_CFG["model"])
+        logger.info(f"Background task using {tier} tier ({tier_cfg['model']}, timeout={timeout}s)")
+        set_state(model_in_use=tier_cfg["model"])
         set_agent_status(status="background", current_task=task_label)
-        log_event("model_select", detail="primary (background)", model=PRIMARY_LLM_CFG["model"])
-        model_start(PRIMARY_LLM_CFG["model"], task_label)
-        agent = create_agent(system_message, llm_cfg=PRIMARY_LLM_CFG)
+        log_event("model_select", detail=f"{tier} (background)", model=tier_cfg["model"])
+        model_start(tier_cfg["model"], task_label)
+        agent = create_agent(system_message, llm_cfg=tier_cfg)
         agent.llm.generate_cfg["request_timeout"] = timeout
         # Compact context before running (handled by _compacting_run patch in create_agent,
         # but also compact the outer messages list for accurate timeout computation)
@@ -513,12 +559,12 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
 
         if not has_content:
             logger.warning(f"Silent LLM failure in background task: {task_label} — retrying")
-            log_event("silent_failure", detail=f"Empty response for: {task_label}", model=PRIMARY_LLM_CFG["model"])
-            model_done(PRIMARY_LLM_CFG["model"])
+            log_event("silent_failure", detail=f"Empty response for: {task_label}", model=tier_cfg["model"])
+            model_done(tier_cfg["model"])
 
-            # Retry with a fresh agent instance
-            model_start(PRIMARY_LLM_CFG["model"], f"Retry: {task_label}")
-            retry_agent = create_agent(system_message, llm_cfg=PRIMARY_LLM_CFG)
+            # Retry with a fresh agent instance (same tier — slot still held)
+            model_start(tier_cfg["model"], f"Retry: {task_label}")
+            retry_agent = create_agent(system_message, llm_cfg=tier_cfg)
             retry_agent.llm.generate_cfg["request_timeout"] = timeout
             response = []
             for response in retry_agent.run(messages=messages):
@@ -531,14 +577,14 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
 
             if not has_content_retry:
                 logger.error(f"Silent LLM failure on retry for background task: {task_label}")
-                log_event("silent_failure_retry", detail=f"Retry also empty for: {task_label}", model=PRIMARY_LLM_CFG["model"])
+                log_event("silent_failure_retry", detail=f"Retry also empty for: {task_label}", model=tier_cfg["model"])
 
         return response
     finally:
         set_current_preview(None)
-        model_done(PRIMARY_LLM_CFG["model"])
+        model_done(tier_cfg["model"])
         clear_agent_status()
-        _primary_model_lock.release()
+        release_slot()
 
 
 def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_before: int) -> None:
@@ -1056,7 +1102,7 @@ def _run_gradio(inner_agent: Assistant, backup_agent: Assistant, host: str, port
     from qwen_agent.gui import WebUI
 
     # Wrap with smart routing: vLLM when free, Ollama when vLLM is busy
-    agent = LockingAgent(inner_agent, backup_agent, _primary_model_lock)
+    agent = LockingAgent(inner_agent, backup_agent)
 
     chatbot_config = {
         "user.name": "User",
@@ -1127,17 +1173,18 @@ def _run_repl(inner_agent: Assistant, backup_agent: Assistant) -> None:
             messages = maybe_compact(messages)
 
             printer = StreamPrinter()
-            got_lock = _primary_model_lock.acquire(blocking=False)
-            agent = inner_agent if got_lock else backup_agent
-            if not got_lock:
+            grant = (_acquire_turn_slot(blocking=False)
+                     or _acquire_turn_slot(blocking=True))
+            tier, release_slot = grant
+            agent = inner_agent if tier == "primary" else backup_agent
+            if tier == "secondary":
                 print(f"  (primary slots full — using {BACKGROUND_LLM_CFG['model']})")
             try:
                 response: List[Message] = []
                 for response in agent.run(messages=messages):
                     printer.update(response)
             finally:
-                if got_lock:
-                    _primary_model_lock.release()
+                release_slot()
             printer.finish()
 
             log_turn(messages[-1], response)

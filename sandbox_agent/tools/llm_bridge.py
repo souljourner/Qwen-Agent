@@ -28,12 +28,14 @@ MAX_REQUEST_BODY = 1_000_000  # 1MB max request size
 def _build_fallback_chain(llm_cfg: Optional[dict]) -> list:
     """Ordered (model, server) pairs tried in sequence on each /llm request.
 
-    Always starts with primary → backup. A caller-supplied llm_cfg is only
+    Starts with the SECONDARY tier (qwen3.6, 10 slots): bridge traffic is
+    slot-unaware raw HTTP — often loops from exec scripts — and must not
+    hammer the 3-slot MLX primary (laguna). A caller-supplied llm_cfg is only
     honored if it matches one of the two canonical models — this keeps the
     bridge from silently routing to a misconfigured model."""
     canonical = {
-        PRIMARY_LLM_CFG["model"]: PRIMARY_LLM_CFG["model_server"],
         BACKGROUND_LLM_CFG["model"]: BACKGROUND_LLM_CFG["model_server"],
+        PRIMARY_LLM_CFG["model"]: PRIMARY_LLM_CFG["model_server"],
     }
     chain = []
     if llm_cfg and llm_cfg.get("model") in canonical:

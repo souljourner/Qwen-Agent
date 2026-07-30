@@ -69,7 +69,6 @@ from sandbox_agent.config import (
 )
 from sandbox_agent.main import (
     LockingAgent,
-    _primary_model_lock,
     bootstrap_background,
     create_agent,
 )
@@ -172,7 +171,7 @@ def _get_agent() -> LockingAgent:
                 system_message = load_system_message()
                 inner = create_agent(system_message, llm_cfg=PRIMARY_LLM_CFG)
                 backup = create_agent(system_message, llm_cfg=BACKGROUND_LLM_CFG)
-                _AGENT = LockingAgent(inner, backup, _primary_model_lock)
+                _AGENT = LockingAgent(inner, backup)
                 logger.info(
                     "Agent constructed (primary=%s, backup=%s)",
                     PRIMARY_LLM_CFG["model"], BACKGROUND_LLM_CFG["model"],

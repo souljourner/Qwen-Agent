@@ -18,6 +18,8 @@ services:
       - "7861:7861"
       - "6080:6080"
     environment:
+      - PRIMARY_MODEL_CONCURRENCY=3
+      - SECONDARY_MODEL_CONCURRENCY=10
       - TOOLS_API_BASE=http://host.docker.internal:8080
       - VLLM_BASE=http://192.168.4.66:8000/v1
       - DATA_DIR=/app/data
