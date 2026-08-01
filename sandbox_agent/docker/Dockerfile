@@ -28,7 +28,7 @@ COPY setup.py README.md /app/Qwen-Agent/
 COPY qwen_agent/ /app/Qwen-Agent/qwen_agent/
 RUN pip install --no-cache-dir "/app/Qwen-Agent[gui,rag]" croniter numpy soundfile \
     pandas requests Pillow beautifulsoup4 lxml yfinance \
-    chainlit aiosqlite "sqlalchemy>=2.0" \
+    chainlit==2.11.1 aiosqlite "sqlalchemy>=2.0" \
     playwright "cryptography>=42.0"
 
 # uv = default package manager for per-project venvs (cache-backed, near-instant
@@ -44,6 +44,11 @@ COPY scripts/ /app/scripts/
 
 # Copy sandbox_agent
 COPY sandbox_agent/ /app/sandbox_agent/
+# Chainlit app root baked into the image (config + custom JS shim) — WORKDIR
+# is the DATA volume, so without CHAINLIT_APP_ROOT chainlit would read config
+# from the volume (drifting, not code-managed).
+COPY .chainlit/ /app/chainlit_root/.chainlit/
+COPY public/ /app/chainlit_root/public/
 
 # Create non-root user and writable data directory
 RUN useradd -m agent && mkdir -p /app/data && chown agent:agent /app/data
@@ -59,6 +64,7 @@ USER agent
 RUN playwright install chromium
 
 ENV DATA_DIR=/app/data
+ENV CHAINLIT_APP_ROOT=/app/chainlit_root
 ENV PYTHONPATH=/app
 
 # Chainlit creates a `.files` cache in its working directory at startup. Run

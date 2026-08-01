@@ -120,3 +120,42 @@ def test_git_autocommit_respects_fresh_lock(tmp_path, monkeypatch):
     (tmp_path / "f.txt").write_text("hello")
     ga.autocommit("f.txt", "test commit")
     assert lock.exists()  # untouched
+
+
+class TestUiHardening:
+    """Chainlit UI audit (2026-08-01): scroll/paint stall fixes."""
+
+    def test_step_output_cap_passthrough_and_headtail(self):
+        from sandbox_agent.ui_output import (_STEP_OUTPUT_CAP_CHARS,
+                                            _cap_step_output)
+        small = "x" * (_STEP_OUTPUT_CAP_CHARS - 1)
+        assert _cap_step_output(small) is small
+        big = "H" * 30_000 + "T" * 5_000
+        out = _cap_step_output(big)
+        assert len(out) < len(big)
+        assert out.startswith("H" * 100)
+        assert out.endswith("T" * 100)
+        assert "chars omitted" in out and "agent received the full output" in out
+
+    def test_step_output_cap_tail_mode(self):
+        from sandbox_agent.ui_output import _cap_step_output
+        big = "E" * 30_000 + "LATEST-LINES"
+        out = _cap_step_output(big, keep="tail")
+        assert out.endswith("LATEST-LINES")
+        assert "earlier chars omitted" in out
+        assert len(out) < len(big)
+
+    def test_ui_deliverables_in_place(self):
+        # Drift-locks: the shim exists, config references it, cot collapsed,
+        # chainlit pinned, app root baked into the image.
+        import pathlib
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        shim = repo / "public" / "ui-unstick.js"
+        assert shim.exists() and "MutationObserver" in shim.read_text()
+        cfg = (repo / ".chainlit" / "config.toml").read_text()
+        assert 'custom_js = "/public/ui-unstick.js"' in cfg
+        assert 'cot = "tool_call"' in cfg
+        dockerfile = (repo / "sandbox_agent" / "docker" / "Dockerfile").read_text()
+        assert "chainlit==2.11.1" in dockerfile
+        assert "CHAINLIT_APP_ROOT=/app/chainlit_root" in dockerfile
+        assert "COPY public/ /app/chainlit_root/public/" in dockerfile

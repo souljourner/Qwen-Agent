@@ -35,6 +35,7 @@ import chainlit as cl
 from chainlit.utils import utc_now  # ISO timestamp helper Chainlit uses for step start/end
 
 from sandbox_agent import cancellation
+from sandbox_agent.ui_output import _cap_step_output
 
 # Import tool modules to trigger @register_tool registrations. Same set as
 # sandbox_agent/main.py — the agent expects these in TOOL_REGISTRY when it
@@ -911,7 +912,7 @@ class _StreamBridge:
             state = {"kind": "thought", "obj": step, "streamed": 0}
             self._by_index[key] = state
         if len(reasoning) > state["streamed"]:
-            state["obj"].output = reasoning  # cumulative; chainlit renders the whole thing
+            state["obj"].output = _cap_step_output(reasoning)  # cumulative; capped for the DOM
             state["streamed"] = len(reasoning)
             # Throttle the actual network round-trip — update_step sends the
             # entire cumulative `output` every call, so per-chunk updates flood
@@ -967,7 +968,7 @@ class _StreamBridge:
                     target = obj
         if target is None:
             return
-        target.output = text
+        target.output = _cap_step_output(text, keep="tail")
         try:
             await target.update()
         except Exception:  # noqa: BLE001
@@ -1025,7 +1026,7 @@ class _StreamBridge:
         result = getattr(msg, "content", "")
         if not isinstance(result, str):
             result = str(result)
-        target_step.output = result
+        target_step.output = _cap_step_output(result)
         # Mark the step done so its spinner clears immediately (not at end of run).
         if not getattr(target_step, "end", None):
             target_step.end = utc_now()
