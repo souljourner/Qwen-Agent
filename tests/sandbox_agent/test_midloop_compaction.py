@@ -310,3 +310,35 @@ class TestCompactionNotice:
             assert len(events) == before  # other thread's compaction: silent here
         finally:
             compaction.unregister_compaction_notice_hook()
+
+
+class TestSummaryMessageRole:
+    """Regression (found in in-band planning, 2026-08-01): the summary was
+    emitted as a SECOND system message — qwen_agent's input validation
+    (base.py: 'no more than one system message') rejects the very next
+    request, so summarize-tier compaction poisoned the conversation. The
+    validator only runs with max_input_tokens > 0, i.e. this was armed by
+    the truncation-backstop change."""
+
+    def _reassembled(self):
+        from sandbox_agent.compaction.compactor import reassemble
+        system = [Message(role=SYSTEM, content="the real system prompt")]
+        recent = [Message(role=USER, content="latest q"),
+                  Message(role=ASSISTANT, content="latest a")]
+        return reassemble(system, "DIGEST-BODY", recent, 42)
+
+    def test_exactly_one_system_message(self):
+        out = self._reassembled()
+        assert [m.role for m in out].count("system") == 1
+        assert out[0].role == "system"
+        summary = out[1]
+        assert summary.role == "user"
+        assert "DIGEST-BODY" in str(summary.content)
+        assert "[Context compacted" in str(summary.content)
+
+    def test_survives_qwen_agent_input_validation(self):
+        from qwen_agent.llm.base import _truncate_input_messages_roughly
+        out = self._reassembled()
+        # must NOT raise 'no more than one system message'
+        result = _truncate_input_messages_roughly(out, max_tokens=160_000)
+        assert result

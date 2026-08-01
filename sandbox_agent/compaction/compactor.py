@@ -296,11 +296,16 @@ def reassemble(
     """Build new message list: system + summary + recent turns."""
     result = list(system_msgs)
 
+    # role="user", NOT "system": qwen_agent rejects requests with two system
+    # messages (base.py _truncate_input_messages_roughly — active whenever
+    # max_input_tokens > 0), so a system-role summary poisons the very next
+    # call. Same marked-user convention as [system event] injections.
     summary_msg = Message(
-        role="system",
+        role="user",
         content=(
             f"[Context compacted: {summarized_count} earlier messages were summarized "
-            f"to save context space. Recent messages follow verbatim.]\n\n{summary}"
+            f"to save context space. This is an automated digest, not a message from "
+            f"the user. Recent messages follow verbatim.]\n\n{summary}"
         ),
     )
     result.append(summary_msg)
