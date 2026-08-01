@@ -237,3 +237,76 @@ class TestRequestTimeoutScaling:
         from sandbox_agent.token_budget import compute_request_timeout
         big = [Message(role=USER, content="x" * 3_600_000)]  # ~900k tokens
         assert compute_request_timeout(big) == 3600
+
+
+class TestCompactionNotice:
+    """The chat UI gets a heads-up when a summarization-tier compaction is
+    about to make the user wait (it can run for minutes: cold-prefill of the
+    whole history through the summarizer). Truncation-only tiers are fast —
+    no notice."""
+
+    def _register(self, monkeypatch):
+        events = []
+        compaction.register_compaction_notice_hook(lambda payload: events.append(payload))
+        return events
+
+    def _big_summarize_history(self):
+        msgs = [Message(role=SYSTEM, content="sys")]
+        for i in range(30):
+            msgs.append(Message(role=USER, content=f"q{i}"))
+            msgs.append(Message(role=ASSISTANT, content="a " * 22_000))  # ~11k tokens; no fn msgs → no truncation tier
+        return msgs
+
+    def test_notice_fired_for_summarize_tier(self, monkeypatch):
+        events = self._register(monkeypatch)
+        try:
+            maybe_compact(self._big_summarize_history())
+        finally:
+            compaction.unregister_compaction_notice_hook()
+        phases = [e["phase"] for e in events]
+        assert "start" in phases and "done" in phases
+        start = events[phases.index("start")]
+        assert start["est_tokens"] > 0
+        assert start["est_minutes"] >= 1
+
+    def test_no_notice_when_fits(self):
+        events = self._register(None)
+        try:
+            maybe_compact([Message(role=USER, content="small")])
+        finally:
+            compaction.unregister_compaction_notice_hook()
+        assert events == []
+
+    def test_no_notice_for_truncation_only(self):
+        # one giant tool result → tier 1 handles it fast; no scary banner
+        events = self._register(None)
+        msgs = [
+            Message(role=SYSTEM, content="s"),
+            Message(role=USER, content="t"),
+            Message(role=FUNCTION, name="t", content="z" * 900_000, extra={}),
+        ]
+        try:
+            maybe_compact(msgs)
+        finally:
+            compaction.unregister_compaction_notice_hook()
+        assert events == []
+
+    def test_hook_is_per_thread(self):
+        import threading
+        events = []
+        compaction.register_compaction_notice_hook(lambda p: events.append(p))
+        try:
+            seen_in_thread = []
+
+            def other_thread():
+                # no hook registered on THIS thread → nothing fires here
+                maybe_compact(self._big_summarize_history())
+                seen_in_thread.append(len(events))
+
+            before = len(events)
+            t = threading.Thread(target=other_thread)
+            t.start()
+            t.join()
+            assert len(events) == before  # other thread's compaction: silent here
+        finally:
+            compaction.unregister_compaction_notice_hook()

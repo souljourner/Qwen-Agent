@@ -229,6 +229,11 @@ def _run_agent_in_thread(
     # as ("tool_progress", text) so the on_message coroutine can show it on the
     # live tool step. Cleared in `finally` so it doesn't leak to a later run.
     register_progress_hook(lambda text: _push(("tool_progress", text)))
+    # Slow-compaction heads-up: summarize-tier compactions can run for minutes
+    # (cold prefill of the whole history through the summarizer) — surface a
+    # notice instead of a silent hang. Same per-thread lifecycle as above.
+    from sandbox_agent.compaction import register_compaction_notice_hook
+    register_compaction_notice_hook(lambda payload: _push(("compaction_notice", payload)))
     # display_doc pushes ("display_doc", payload) so the doc is rendered to the
     # user out-of-band — its content never enters the agent's message stream.
     register_display_hook(lambda payload: _push(("display_doc", payload)))
@@ -282,6 +287,8 @@ def _run_agent_in_thread(
         _push(("error", e))
     finally:
         unregister_progress_hook()
+        from sandbox_agent.compaction import unregister_compaction_notice_hook
+        unregister_compaction_notice_hook()
         unregister_display_hook()
         unregister_usage_hook()
         chat_origin.set_current_origin(None)
@@ -1129,6 +1136,26 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
             if kind == "display_doc":
                 # display_doc tool — render the file to the user out-of-band.
                 await bridge.display_document(payload)
+                continue
+            if kind == "compaction_notice":
+                # Slow-compaction heads-up (display-only; never enters the
+                # agent's context). ⏳ on start with a rough estimate, ✅ done.
+                try:
+                    if payload.get("phase") == "start":
+                        await cl.Message(
+                            author="background task",
+                            content=(f"⏳ **Compacting conversation history** "
+                                     f"(~{payload.get('est_tokens', 0):,} tokens, "
+                                     f"≈{payload.get('est_minutes', 1)} min). "
+                                     f"One-off housekeeping — your reply continues automatically."),
+                        ).send()
+                    elif payload.get("phase") == "done":
+                        secs = int(payload.get("elapsed_s", 0))
+                        pretty = f"{secs // 60}m {secs % 60}s" if secs >= 60 else f"{secs}s"
+                        await cl.Message(author="background task",
+                                         content=f"✅ Compaction done in {pretty}.").send()
+                except Exception:  # noqa: BLE001 — a notice must never break the turn
+                    logger.debug("compaction notice display failed", exc_info=True)
                 continue
             if kind == "tool_progress":
                 # Live stdout from a running code_interpreter call. Drain any

@@ -17,6 +17,35 @@ from sandbox_agent.config import COMPACTION_ENABLED
 
 logger = logging.getLogger(__name__)
 
+# UI heads-up hooks for slow (summarization-tier) compactions, keyed by worker
+# thread ident — same isolation pattern as code_interpreter's progress hooks.
+# A summarize compaction cold-prefills the whole history through the
+# summarizer model and can run for minutes; the chat must not hang silently.
+import math
+import threading
+import time as _time
+
+_notice_hooks: dict = {}
+_SECONDS_PER_CHUNK = 35  # summarizer prefill+generation per ~68k-token chunk
+
+
+def register_compaction_notice_hook(fn) -> None:
+    _notice_hooks[threading.get_ident()] = fn
+
+
+def unregister_compaction_notice_hook() -> None:
+    _notice_hooks.pop(threading.get_ident(), None)
+
+
+def _notify(payload: dict) -> None:
+    hook = _notice_hooks.get(threading.get_ident())
+    if hook is None:
+        return
+    try:
+        hook(payload)
+    except Exception:  # noqa: BLE001 — a UI hook must never break compaction
+        logger.debug("compaction notice hook failed", exc_info=True)
+
 
 def maybe_compact(messages: List[Message], pinned_head: int = 0,
                   context_tokens: Optional[int] = None) -> List[Message]:
@@ -76,13 +105,13 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0,
                 return head + tail_result
             # Not enough — escalate to tier 2
             logger.info("Tier 1 insufficient, escalating to summarization")
-            tail_result = summarize_history(tail_result)
+            tail_result = _summarize_with_notice(tail_result, est_tokens)
 
         elif tier == "compact":
-            tail_result = summarize_history(tail)
+            tail_result = _summarize_with_notice(tail, est_tokens)
 
         elif tier == "compact_and_truncate":
-            tail_result = summarize_history(tail)
+            tail_result = _summarize_with_notice(tail, est_tokens)
             tail_result = truncate_tool_results(tail_result)
 
         else:
@@ -116,6 +145,23 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0,
             clear_agent_status()
         except Exception:
             pass
+
+
+def _summarize_with_notice(msgs: List[Message], est_tokens: int) -> List[Message]:
+    """Wrap summarize_history with start/done UI notices + duration estimate."""
+    from sandbox_agent.compaction.compactor import summarize_history
+    from sandbox_agent.config import COMPACTION_RESERVE_TOKENS, SUMMARIZER_CONTEXT_TOKENS, COMPACTION_BASE_CHUNK_RATIO
+    chunk_tokens = max(1, int((SUMMARIZER_CONTEXT_TOKENS - COMPACTION_RESERVE_TOKENS)
+                              * COMPACTION_BASE_CHUNK_RATIO))
+    est_chunks = max(1, math.ceil(est_tokens / chunk_tokens))
+    est_minutes = max(1, round(est_chunks * _SECONDS_PER_CHUNK / 60))
+    _notify({"phase": "start", "est_tokens": est_tokens,
+             "est_chunks": est_chunks, "est_minutes": est_minutes})
+    started = _time.monotonic()
+    try:
+        return summarize_history(msgs)
+    finally:
+        _notify({"phase": "done", "elapsed_s": int(_time.monotonic() - started)})
 
 
 def compact_midrun(messages: List[Message],
