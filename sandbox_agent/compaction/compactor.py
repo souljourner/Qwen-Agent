@@ -236,7 +236,10 @@ def build_chunks(history: List[Message]) -> List[List[Message]]:
     if not history:
         return []
 
-    budget_tokens = MAX_CONTEXT_TOKENS - COMPACTION_RESERVE_TOKENS
+    # Chunks are consumed by the SUMMARIZER model (qwen3.6, ~262k window) —
+    # size them against ITS window, never the (possibly 900k) history budget.
+    from sandbox_agent.config import SUMMARIZER_CONTEXT_TOKENS
+    budget_tokens = SUMMARIZER_CONTEXT_TOKENS - COMPACTION_RESERVE_TOKENS
     total_tokens = estimate_messages_tokens(history)
 
     # Adaptive chunk ratio

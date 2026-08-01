@@ -30,6 +30,11 @@ from sandbox_agent.token_budget import estimate_messages_tokens
 
 BUDGET = MAX_CONTEXT_TOKENS - COMPACTION_RESERVE_TOKENS
 
+# Captured BEFORE the autouse identity-summarizer fixture patches it — the
+# chunk-sizing test needs the real summarize_history pipeline.
+import sandbox_agent.compaction.compactor as _compactor_mod
+_REAL_SUMMARIZE_HISTORY = _compactor_mod.summarize_history
+
 
 @pytest.fixture(autouse=True)
 def _quiet_side_effects(monkeypatch):
@@ -141,7 +146,94 @@ def test_select_tier_accounts_for_overhead():
 
 def test_llm_cfg_backstop():
     from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
-    # 160k, not 190k: the char-heuristics undercounted by ~16% in the real
-    # incident, so the backstop needs real margin below the 196,608 ceiling.
-    assert PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"] == 160_000
+    # Per-tier: laguna's 1M window gets an 800k backstop under its 900k
+    # budget; qwen keeps 160k (char-heuristics undercount ~16%, so the
+    # backstop needs real margin below its 196,608 ceiling).
+    assert PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"] == 800_000
     assert BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"] == 160_000
+    assert PRIMARY_LLM_CFG["context_window_tokens"] == 900_000
+    assert BACKGROUND_LLM_CFG["context_window_tokens"] == 200_000
+
+
+class TestPerTierBudgets:
+    """laguna's 1M window: compaction honors a per-tier context budget while
+    chunk sizing stays pinned to the SUMMARIZER's window."""
+
+    def _big_history(self, n_tokens):
+        # Multi-turn shape: segment_messages keeps the last 2 USER exchanges
+        # verbatim, so real user turns are needed for a summarizable history.
+        msgs = [Message(role=SYSTEM, content="sys")]
+        chunk = "w" * 40_000  # 10k tokens per message
+        for i in range(n_tokens // 10_000):
+            if i % 4 == 0:
+                msgs.append(Message(role=USER, content=f"question {i}"))
+            msgs.append(Message(role=ASSISTANT, content=""))
+            msgs.append(Message(role=FUNCTION, name="t", content=chunk, extra={}))
+        return msgs
+
+    def test_context_tokens_honored(self):
+        msgs = self._big_history(500_000)  # ~500k tokens
+        out = maybe_compact(msgs, context_tokens=900_000)
+        assert out is msgs  # fits the laguna budget — untouched
+        out2 = maybe_compact(list(msgs))
+        assert estimate_messages_tokens(out2) <= BUDGET  # default budget compacts
+
+    def test_chunks_never_exceed_summarizer_window(self, monkeypatch):
+        from sandbox_agent.config import COMPACTION_RESERVE_TOKENS as RESERVE
+        from sandbox_agent.config import SUMMARIZER_CONTEXT_TOKENS
+        import sandbox_agent.compaction.compactor as compactor
+        import sandbox_agent.compaction.summarizer as summarizer
+        sizes = []
+
+        def fake_chunk(text):
+            sizes.append(len(text) // 4)
+            return "summary"
+
+        # restore the REAL summarize_history (autouse fixture stubs it) and
+        # stub only the LLM boundary
+        monkeypatch.setattr(compactor, "summarize_history", _REAL_SUMMARIZE_HISTORY)
+        monkeypatch.setattr(summarizer, "summarize_chunk", fake_chunk)
+        monkeypatch.setattr(summarizer, "merge_summaries",
+                            lambda summaries, identifiers: "merged summary")
+        # over the laguna budget → summarization path with the BIG budget
+        msgs = self._big_history(1_000_000)
+        maybe_compact(msgs, context_tokens=900_000)
+        assert sizes, "summarizer was never invoked"
+        cap = SUMMARIZER_CONTEXT_TOKENS - RESERVE
+        assert max(sizes) <= cap, f"chunk of {max(sizes)} tokens exceeds summarizer window"
+
+    def test_exception_fallback_respects_budget(self, monkeypatch):
+        # A compaction exception on a big-budget history must NOT trim to the
+        # 200k default (that would amputate 600k tokens of pinned history).
+        import sandbox_agent.compaction.estimator as estimator
+
+        calls = {"n": 0}
+        real_select = estimator.select_tier
+
+        def exploding_select(messages, context_tokens=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real_select(messages, context_tokens)
+            raise RuntimeError("boom mid-compaction")
+
+        monkeypatch.setattr(estimator, "select_tier", exploding_select)
+        # 1M tokens: over even the laguna budget, so compaction runs and the
+        # second select_tier (post-truncation re-check) explodes
+        msgs = self._big_history(1_000_000)
+        out = maybe_compact(msgs, context_tokens=900_000)
+        # trimmed to the LAGUNA budget (fits 870k → basically untouched),
+        # not to the 200k default
+        assert estimate_messages_tokens(out) > 300_000
+
+
+class TestRequestTimeoutScaling:
+
+    def test_small_contexts_unchanged(self):
+        from sandbox_agent.token_budget import compute_request_timeout
+        small = [Message(role=USER, content="x" * 4_000)]  # ~1k tokens
+        assert 600 <= compute_request_timeout(small) < 700
+
+    def test_large_context_scales_to_3600(self):
+        from sandbox_agent.token_budget import compute_request_timeout
+        big = [Message(role=USER, content="x" * 3_600_000)]  # ~900k tokens
+        assert compute_request_timeout(big) == 3600

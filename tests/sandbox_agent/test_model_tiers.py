@@ -219,3 +219,139 @@ class TestConfigAndBridge:
         # bulk/unslotted traffic belongs on the high-concurrency tier
         assert models[0] == "qwen3.6-27b-linux"
         assert models[1] == "laguna-s-2.1"
+
+
+class TestOnlyTierAcquisition:
+
+    def test_only_primary_never_grants_secondary(self, fresh_locks):
+        primary, _ = fresh_locks
+        for _ in range(3):
+            primary.acquire(blocking=False)
+        assert m._acquire_turn_slot(blocking=False, only="primary") is None
+
+    def test_only_primary_blocks_until_primary_frees(self, fresh_locks):
+        primary, _ = fresh_locks
+        for _ in range(3):
+            primary.acquire(blocking=False)
+
+        def free_primary():
+            time.sleep(0.05)
+            primary.release()
+
+        t = threading.Thread(target=free_primary)
+        t.start()
+        tier, release = m._acquire_turn_slot(blocking=True, only="primary",
+                                             poll_interval=0.01)
+        t.join()
+        assert tier == "primary"
+        release()
+        for _ in range(2):
+            primary.release()
+
+
+class TestHistoryHasImages:
+
+    def test_plain_text_false(self):
+        assert not m._history_has_images([Message(role="user", content="hi")])
+
+    def test_content_item_image_true(self):
+        from qwen_agent.llm.schema import ContentItem
+        msg = Message(role="user", content=[ContentItem(image="data:image/png;base64,AAAA")])
+        assert m._history_has_images([Message(role="user", content="x"), msg])
+
+    def test_raw_dict_message_with_image_true(self):
+        # History items can arrive as raw dicts (pre-Message conversion).
+        msg = {"role": "user", "content": [{"image": "data:image/png;base64,AA"}]}
+        assert m._history_has_images([msg])
+
+    def test_text_content_items_false(self):
+        from qwen_agent.llm.schema import ContentItem
+        msg = Message(role="user", content=[ContentItem(text="just text")])
+        assert not m._history_has_images([msg])
+
+
+class TestPinnedRouting:
+
+    def _drain(self, gen):
+        out = []
+        for out in gen:
+            pass
+        return out
+
+    def _big_messages(self):
+        # > SPILLABLE_CONTEXT_TOKENS estimated
+        from sandbox_agent.config import SPILLABLE_CONTEXT_TOKENS
+        n_chars = (SPILLABLE_CONTEXT_TOKENS + 20_000) * 4
+        return [Message(role="user", content="x" * n_chars)]
+
+    def _image_messages(self):
+        from qwen_agent.llm.schema import ContentItem
+        return [Message(role="user", content=[ContentItem(image="data:image/png;base64,AAAA"),
+                                              ContentItem(text="what is this?")])]
+
+    def test_big_context_pins_to_primary(self, fresh_locks):
+        agent = m.LockingAgent(_FakeAgent("primary-model"), _FakeAgent("secondary-model"))
+        self._drain(agent.run(messages=self._big_messages()))
+        assert agent._inner.calls == 1 and agent._backup.calls == 0
+
+    def test_big_context_waits_for_primary_even_when_secondary_free(self, fresh_locks):
+        primary, _ = fresh_locks
+        for _ in range(3):
+            primary.acquire(blocking=False)
+
+        agent = m.LockingAgent(_FakeAgent("primary-model"), _FakeAgent("secondary-model"))
+        done = []
+
+        def run_pinned():
+            self._drain(agent.run(messages=self._big_messages()))
+            done.append(True)
+
+        t = threading.Thread(target=run_pinned)
+        t.start()
+        time.sleep(0.1)
+        assert not done  # waiting on primary, NOT running on free secondary
+        primary.release()
+        t.join(timeout=5)
+        assert done and agent._inner.calls == 1 and agent._backup.calls == 0
+        for _ in range(2):
+            primary.release()
+
+    def test_image_history_pins_to_secondary(self, fresh_locks):
+        agent = m.LockingAgent(_FakeAgent("primary-model"), _FakeAgent("secondary-model"))
+        self._drain(agent.run(messages=self._image_messages()))
+        assert agent._backup.calls == 1 and agent._inner.calls == 0
+
+    def test_image_beats_big_context(self, fresh_locks):
+        from qwen_agent.llm.schema import ContentItem
+        msgs = self._big_messages() + self._image_messages()
+        agent = m.LockingAgent(_FakeAgent("primary-model"), _FakeAgent("secondary-model"))
+        self._drain(agent.run(messages=msgs))
+        assert agent._backup.calls == 1 and agent._inner.calls == 0
+
+    def test_vision_retry_stays_on_secondary(self, fresh_locks):
+        empty_backup = _FakeAgent("secondary-model", replies=("",))
+        agent = m.LockingAgent(_FakeAgent("primary-model"), empty_backup)
+        self._drain(agent.run(messages=self._image_messages()))
+        # empty completion → retry must NOT go to laguna (it can't see images)
+        assert agent._inner.calls == 0
+        assert empty_backup.calls == 2  # original + retry, both on secondary
+
+
+class TestCreateAgentBudgetBinding:
+
+    def test_hooks_carry_tier_budget(self, monkeypatch):
+        import functools
+        from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
+
+        class _StubAssistant:
+            def __init__(self, **kwargs):
+                self.llm = type("L", (), {"generate_cfg": {}})()
+                self._run = lambda *a, **k: iter(())
+                self._call_tool = lambda *a, **k: ""
+
+        monkeypatch.setattr(m, "Assistant", _StubAssistant)
+        primary_agent = m.create_agent("sys", llm_cfg=PRIMARY_LLM_CFG)
+        secondary_agent = m.create_agent("sys", llm_cfg=BACKGROUND_LLM_CFG)
+        assert isinstance(primary_agent._precall_compact, functools.partial)
+        assert primary_agent._precall_compact.keywords["context_tokens"] == 900_000
+        assert secondary_agent._precall_compact.keywords["context_tokens"] == 200_000

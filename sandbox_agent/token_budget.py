@@ -95,6 +95,9 @@ def trim_to_budget(messages: List[Message], max_tokens: int = MAX_CONTEXT_TOKENS
 
 MIN_REQUEST_TIMEOUT = 600    # 10 minutes minimum
 MAX_REQUEST_TIMEOUT = 1800   # 30 minutes at full 200k context
+# Large-context turns (laguna pinned): a ~900k cold prefill measures ~27min
+# at laguna's ~550 tok/s — the 1800s cap would kill it mid-prefill.
+MAX_REQUEST_TIMEOUT_LARGE = 3600
 
 
 def compute_request_timeout(messages: List[Message]) -> int:
@@ -104,10 +107,16 @@ def compute_request_timeout(messages: List[Message]) -> int:
     Larger payloads need more time for prefill + generation.
     """
     tokens = estimate_messages_tokens(messages)
-    # Linear interpolation: 0 tokens → MIN, MAX_CONTEXT_TOKENS → MAX
-    fraction = min(tokens / MAX_CONTEXT_TOKENS, 1.0)
-    timeout = int(MIN_REQUEST_TIMEOUT + fraction * (MAX_REQUEST_TIMEOUT - MIN_REQUEST_TIMEOUT))
-    return timeout
+    if tokens <= MAX_CONTEXT_TOKENS:
+        # Linear interpolation: 0 tokens → MIN, MAX_CONTEXT_TOKENS → MAX
+        fraction = tokens / MAX_CONTEXT_TOKENS
+        return int(MIN_REQUEST_TIMEOUT + fraction * (MAX_REQUEST_TIMEOUT - MIN_REQUEST_TIMEOUT))
+    # Beyond the standard window (laguna-pinned turns): scale on toward
+    # MAX_REQUEST_TIMEOUT_LARGE at the primary tier's full budget.
+    from sandbox_agent.config import PRIMARY_CONTEXT_TOKENS
+    span = max(PRIMARY_CONTEXT_TOKENS - MAX_CONTEXT_TOKENS, 1)
+    fraction = min((tokens - MAX_CONTEXT_TOKENS) / span, 1.0)
+    return int(MAX_REQUEST_TIMEOUT + fraction * (MAX_REQUEST_TIMEOUT_LARGE - MAX_REQUEST_TIMEOUT))
 
 
 def truncate_output(text: str, max_tokens: int) -> str:

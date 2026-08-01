@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 Tier = Literal["fits", "truncate_tools", "compact", "compact_and_truncate"]
 
 
-def select_tier(messages: List[Message]) -> Tuple[Tier, int]:
+def select_tier(messages: List[Message], context_tokens: int = None) -> Tuple[Tier, int]:
     """Decide which compaction tier to use.
 
     Returns (tier, overflow_tokens) where overflow_tokens is how many tokens
@@ -36,7 +36,7 @@ def select_tier(messages: List[Message]) -> Tuple[Tier, int]:
     # Without it a request can measure "fits" here yet overflow on the wire.
     estimated = int((estimate_messages_tokens(messages) + ESTIMATOR_OVERHEAD_TOKENS)
                     * COMPACTION_SAFETY_MARGIN)
-    budget = MAX_CONTEXT_TOKENS - COMPACTION_RESERVE_TOKENS
+    budget = (context_tokens or MAX_CONTEXT_TOKENS) - COMPACTION_RESERVE_TOKENS
     overflow = max(0, estimated - budget)
 
     if overflow == 0:

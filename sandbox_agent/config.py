@@ -11,14 +11,18 @@ PRIMARY_LLM_CFG = {
     "model": os.getenv("PRIMARY_MODEL", "laguna-s-2.1"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
+    # laguna supports a 1M context (prefix-caching verified 2026-07-31);
+    # compaction for turns on this tier runs against this window.
+    "context_window_tokens": int(os.getenv("PRIMARY_CONTEXT_TOKENS", "900000")),
     "generate_cfg": {
         # Hard backstop, NOT the primary mechanism (compaction is): if the
         # compactor misses, qwen-agent roughly truncates instead of vLLM
         # 400-ing (real ceiling 262144-65536=196608; the char estimators
         # undercounted by ~16% in the 2026-07-15 incident, hence the margin).
         # KV-cache churn from truncation is acceptable in that failure mode.
-        "max_input_tokens": 160000,
-        "request_timeout": 1800,       # 30min — covers full 200k context window worst case
+        # laguna's 1M window: 800k backstop under the 900k compaction budget.
+        "max_input_tokens": 800000,
+        "request_timeout": 1800,       # rescaled per turn by compute_request_timeout
         "temperature": 0.6,
         # use_raw_api=True: pass `tools=` to vLLM natively. Required because
         # vLLM has auto-tool-call-parsing enabled for this model, and in
@@ -50,6 +54,7 @@ BACKGROUND_LLM_CFG = {
     "model": os.getenv("SECONDARY_MODEL", "qwen3.6-27b-linux"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
+    "context_window_tokens": int(os.getenv("MAX_CONTEXT_TOKENS", "200000")),
     "generate_cfg": {
         "max_input_tokens": 160000,   # same backstop rationale as PRIMARY_LLM_CFG
         "request_timeout": 1800,
@@ -71,6 +76,16 @@ LLM_CALL_CFG = {
 
 # Token budget — all models have 256k limit, we target 200k to leave room for generation
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "200000"))
+# laguna's raised budget (chat pinned-large-context tier); see PRIMARY_LLM_CFG.
+PRIMARY_CONTEXT_TOKENS = int(os.getenv("PRIMARY_CONTEXT_TOKENS", "900000"))
+# Pinning threshold: histories estimated above this can never fit qwen again
+# and are pinned to laguna. Estimates undercount ~16% — 150k est ≈ 174k real,
+# under qwen's 196,608 ceiling with the 160k backstop as final guard. Do NOT
+# raise past ~165k without redoing that arithmetic.
+SPILLABLE_CONTEXT_TOKENS = int(os.getenv("SPILLABLE_CONTEXT_TOKENS", "150000"))
+# The compaction summarizer (qwen3.6) window — CHUNK SIZING pins to this,
+# never to the raised history budget (0.4x870k chunks would overflow it).
+SUMMARIZER_CONTEXT_TOKENS = int(os.getenv("SUMMARIZER_CONTEXT_TOKENS", "200000"))
 MAX_TOOL_OUTPUT_TOKENS = int(os.getenv("MAX_TOOL_OUTPUT_TOKENS", "16000"))
 MAX_CODE_OUTPUT_TOKENS = int(os.getenv("MAX_CODE_OUTPUT_TOKENS", "16000"))
 CHARS_PER_TOKEN = 4  # Rough estimate for English/code; conservative for CJK

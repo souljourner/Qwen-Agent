@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import sys
+import functools
 import time
 from threading import BoundedSemaphore, Lock, Thread
 from typing import Iterator, List, Optional
@@ -25,6 +26,7 @@ from sandbox_agent.config import (
     PRIMARY_LLM_CFG,
     PRIMARY_MODEL_CONCURRENCY,
     SECONDARY_MODEL_CONCURRENCY,
+    SPILLABLE_CONTEXT_TOKENS,
     TOOL_LIST,
     load_system_message,
     session_metadata,
@@ -69,17 +71,21 @@ _secondary_model_lock = BoundedSemaphore(SECONDARY_MODEL_CONCURRENCY)
 
 
 def _acquire_turn_slot(blocking: bool, prefer: str = "primary",
-                       poll_interval: float = 0.25):
+                       poll_interval: float = 0.25, only: str = None):
     """Acquire one model-turn slot across the two tiers.
 
     Tries the `prefer` tier first, the other second (non-blocking each);
-    when `blocking`, polls until either tier frees. Returns
-    (tier_name, release) or None. `release` is idempotent — a double call
-    must never trip BoundedSemaphore's over-release check mid-stream."""
+    when `blocking`, polls until either tier frees. `only` restricts to a
+    single tier (pinned turns: big contexts must stay on primary/laguna,
+    image-bearing turns on secondary/qwen). Returns (tier_name, release) or
+    None. `release` is idempotent — a double call must never trip
+    BoundedSemaphore's over-release check mid-stream."""
     def _try_once():
         order = [("primary", _primary_model_lock), ("secondary", _secondary_model_lock)]
         if prefer == "secondary":
             order.reverse()
+        if only:
+            order = [(t, s) for t, s in order if t == only]
         for tier, sem in order:
             if sem.acquire(blocking=False):
                 released = [False]
@@ -96,6 +102,25 @@ def _acquire_turn_slot(blocking: bool, prefer: str = "primary",
         time.sleep(poll_interval)
         grant = _try_once()
     return grant
+
+
+def _history_has_images(messages) -> bool:
+    """True when any message carries image content (multimodal ContentItems,
+    b64 data URIs, image_url dicts). Such turns must run on the multimodal
+    SECONDARY tier (qwen3.6) — laguna is text-only."""
+    for msg in messages or []:
+        content = getattr(msg, "content", None)
+        if isinstance(msg, dict):
+            content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("image") or item.get("image_url"):
+                    return True
+            elif getattr(item, "image", None):
+                return True
+    return False
 
 # Lock for background work — ensures heartbeat and cron tasks run one at a time, never colliding.
 _background_work_lock = Lock()
@@ -152,7 +177,8 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
     # (system + task message pinned verbatim). Complements the entry-time
     # compaction below, which alone let tool results overflow the context.
     from sandbox_agent.compaction import compact_midrun
-    agent._precall_compact = compact_midrun
+    _cfg_ctx = (llm_cfg or {}).get("context_window_tokens")
+    agent._precall_compact = functools.partial(compact_midrun, context_tokens=_cfg_ctx)
 
     # Wrap _run to compact context before the FnCallAgent tool-call loop starts
     original_run = agent._run
@@ -160,7 +186,7 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
     def _compacting_run(messages, **kwargs):
         from sandbox_agent import cancellation
         from sandbox_agent.compaction import maybe_compact
-        messages = maybe_compact(messages)
+        messages = maybe_compact(messages, context_tokens=_cfg_ctx)
         # cancellation.guard raises RunCancelled at each yield point if this
         # run (see cancellation.begin_run) has been cancelled — between tool
         # calls and between streamed chunks. A tool call wedged inside a
@@ -297,26 +323,43 @@ class LockingAgent(Assistant):
                     user_msg = m
                     break
 
-        # Tiered slot: prefer primary (laguna, 3 turn slots), spill to
-        # secondary (qwen, 10). All 13 busy → WAIT with a visible notice.
-        grant = _acquire_turn_slot(blocking=False)
+        # Routing priority:
+        # 1. Image-bearing history → SECONDARY only (qwen is multimodal;
+        #    laguna is text-only — capability beats capacity).
+        # 2. History too big for qwen (> SPILLABLE_CONTEXT_TOKENS) → PRIMARY
+        #    only (laguna's 1M window; it can never fit qwen again).
+        # 3. Otherwise: prefer primary, spill to secondary.
+        # All-slots-busy in any mode → WAIT with a visible notice.
+        msg_objs = msg_list if messages else []
+        if _history_has_images(msg_objs):
+            pin_only, route_tag = "secondary", "[secondary pinned-vision]"
+        elif msg_objs and estimate_messages_tokens(msg_objs) > SPILLABLE_CONTEXT_TOKENS:
+            pin_only, route_tag = "primary", "[primary pinned]"
+        else:
+            pin_only, route_tag = None, None
+        self._pin_only = pin_only  # retry path must honor the same restriction
+
+        grant = _acquire_turn_slot(blocking=False, only=pin_only)
         waited_note = ""
         if grant is None:
             wait_start = time.monotonic()
             yield [Message(role="assistant",
                            content="⚠️ All model slots busy — waiting for a free slot…")]
-            grant = _acquire_turn_slot(blocking=True)
+            grant = _acquire_turn_slot(blocking=True, only=pin_only)
             waited_note = f" [waited {time.monotonic() - wait_start:.0f}s]"
         tier, release_slot = grant
         if tier == "primary":
             agent = self._inner
             model_name = PRIMARY_LLM_CFG["model"]
-            log_event("chat_start", detail=f"[primary]{waited_note} {str(user_msg.content)[:180]}" if user_msg else f"[primary]{waited_note}")
+            tag = route_tag or "[primary]"
+            log_event("chat_start", detail=f"{tag}{waited_note} {str(user_msg.content)[:180]}" if user_msg else f"{tag}{waited_note}")
         else:
             agent = self._backup
             model_name = BACKGROUND_LLM_CFG["model"]
-            log_event("chat_start", detail=f"[secondary spill]{waited_note} {str(user_msg.content)[:160]}" if user_msg else f"[secondary spill]{waited_note}")
-            logger.info(f"Chat routed to {model_name} (primary slots all in use)")
+            tag = route_tag or "[secondary spill]"
+            log_event("chat_start", detail=f"{tag}{waited_note} {str(user_msg.content)[:160]}" if user_msg else f"{tag}{waited_note}")
+            if not route_tag:
+                logger.info(f"Chat routed to {model_name} (primary slots all in use)")
 
         user_preview = str(user_msg.content)[:100] if user_msg else "chat"
         set_state(status="chatting", model_in_use=model_name)
@@ -350,11 +393,14 @@ class LockingAgent(Assistant):
 
             # The original slot was already released (finally above ran when
             # the stream ended) — acquire fresh, preferring the OTHER tier.
-            # If that tier is full, the retry may legitimately land on the
-            # same model again; caps are never exceeded.
-            other = "secondary" if agent is self._inner else "primary"
-            retry_grant = (_acquire_turn_slot(blocking=False, prefer=other)
-                           or _acquire_turn_slot(blocking=True, prefer=other))
+            # Pinned turns keep their restriction: a vision retry must never
+            # land on text-only laguna; a big-context retry can't fit qwen.
+            # If the preferred tier is full, the retry may legitimately land
+            # on the same model again; caps are never exceeded.
+            pin_only = getattr(self, "_pin_only", None)
+            other = pin_only or ("secondary" if agent is self._inner else "primary")
+            retry_grant = (_acquire_turn_slot(blocking=False, prefer=other, only=pin_only)
+                           or _acquire_turn_slot(blocking=True, prefer=other, only=pin_only))
             retry_tier, retry_release = retry_grant
             retry_agent = self._inner if retry_tier == "primary" else self._backup
             retry_model = PRIMARY_LLM_CFG["model"] if retry_tier == "primary" else BACKGROUND_LLM_CFG["model"]
@@ -416,8 +462,16 @@ class LockingAgent(Assistant):
                 logger.debug("log_turn failed", exc_info=True)
 
     def run_nonstream(self, *args, **kwargs):
-        grant = (_acquire_turn_slot(blocking=False)
-                 or _acquire_turn_slot(blocking=True))
+        messages = args[0] if args else kwargs.get("messages", [])
+        pin_only = None
+        if messages:
+            msg_list = [m if isinstance(m, Message) else Message(**m) for m in messages]
+            if _history_has_images(msg_list):
+                pin_only = "secondary"
+            elif estimate_messages_tokens(msg_list) > SPILLABLE_CONTEXT_TOKENS:
+                pin_only = "primary"
+        grant = (_acquire_turn_slot(blocking=False, only=pin_only)
+                 or _acquire_turn_slot(blocking=True, only=pin_only))
         tier, release_slot = grant
         agent = self._inner if tier == "primary" else self._backup
         try:
@@ -533,7 +587,10 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
     """
     timeout = compute_request_timeout(messages)
 
-    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="secondary")
+    # Image-bearing background work must run on the multimodal secondary
+    # tier — never spill into text-only laguna.
+    _only = "secondary" if _history_has_images(messages) else None
+    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="secondary", only=_only)
     tier_cfg = BACKGROUND_LLM_CFG if tier == "secondary" else PRIMARY_LLM_CFG
     try:
         logger.info(f"Background task using {tier} tier ({tier_cfg['model']}, timeout={timeout}s)")
@@ -546,7 +603,7 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
         # Compact context before running (handled by _compacting_run patch in create_agent,
         # but also compact the outer messages list for accurate timeout computation)
         from sandbox_agent.compaction import maybe_compact
-        messages = maybe_compact(messages)
+        messages = maybe_compact(messages, context_tokens=tier_cfg.get("context_window_tokens"))
         response: List[Message] = []
         for response in agent.run(messages=messages):
             _stream_tap(response, task_label)
@@ -1168,7 +1225,10 @@ def _run_repl(inner_agent: Assistant, backup_agent: Assistant) -> None:
 
             messages.append(Message(role="user", content=user_input))
 
-            # Compact context if approaching token budget (OpenClaw-style three-tier)
+            # Compact context if approaching token budget (OpenClaw-style
+            # three-tier). Default (secondary) budget: compaction runs before
+            # tier selection here, and a REPL history kept ≤170k stays
+            # spillable to either tier.
             from sandbox_agent.compaction import maybe_compact
             messages = maybe_compact(messages)
 

@@ -9,7 +9,7 @@ Three-tier strategy:
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from qwen_agent.llm.schema import Message
 
@@ -18,7 +18,8 @@ from sandbox_agent.config import COMPACTION_ENABLED
 logger = logging.getLogger(__name__)
 
 
-def maybe_compact(messages: List[Message], pinned_head: int = 0) -> List[Message]:
+def maybe_compact(messages: List[Message], pinned_head: int = 0,
+                  context_tokens: Optional[int] = None) -> List[Message]:
     """Compact messages if they exceed the token budget.
 
     `pinned_head` leading messages pass through VERBATIM (but still count
@@ -33,6 +34,10 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0) -> List[Message
     """
     if not COMPACTION_ENABLED or not messages:
         return messages
+    # Per-tier budget: laguna turns pass their 900k window; default is the
+    # secondary/global 200k. All tier decisions and fallbacks use this.
+    from sandbox_agent.config import MAX_CONTEXT_TOKENS as _DEFAULT_CTX
+    ctx = context_tokens or _DEFAULT_CTX
 
     from sandbox_agent.compaction.estimator import select_tier
     from sandbox_agent.compaction.compactor import truncate_tool_results, summarize_history
@@ -41,7 +46,7 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0) -> List[Message
     from sandbox_agent.token_budget import trim_to_budget, estimate_messages_tokens
 
     try:
-        tier, overflow = select_tier(messages)
+        tier, overflow = select_tier(messages, context_tokens=ctx)
 
         if tier == "fits":
             return messages
@@ -64,7 +69,7 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0) -> List[Message
 
         if tier == "truncate_tools":
             tail_result = truncate_tool_results(tail)
-            new_tier, _ = select_tier(head + tail_result)
+            new_tier, _ = select_tier(head + tail_result, context_tokens=ctx)
             if new_tier == "fits":
                 logger.info(f"Tier 1 (tool truncation) sufficient: {msg_count} -> "
                             f"{len(head) + len(tail_result)} messages")
@@ -86,12 +91,12 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0) -> List[Message
         result = head + tail_result
 
         # Final safety net — if still over budget, trim the tail (never the head)
-        final_tier, _ = select_tier(result)
+        final_tier, _ = select_tier(result, context_tokens=ctx)
         if final_tier != "fits":
             logger.warning(f"Compaction incomplete (tier={final_tier}), applying trim fallback")
-            from sandbox_agent.config import COMPACTION_RESERVE_TOKENS, MAX_CONTEXT_TOKENS
+            from sandbox_agent.config import COMPACTION_RESERVE_TOKENS
             head_tokens = estimate_messages_tokens(head) if head else 0
-            tail_budget = max(10_000, MAX_CONTEXT_TOKENS - COMPACTION_RESERVE_TOKENS - head_tokens)
+            tail_budget = max(10_000, ctx - COMPACTION_RESERVE_TOKENS - head_tokens)
             result = head + trim_to_budget(tail_result, max_tokens=tail_budget)
 
         new_tokens = estimate_messages_tokens(result)
@@ -101,8 +106,11 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0) -> List[Message
 
     except Exception:
         logger.exception("Compaction failed, falling back to trim_to_budget")
+        # Trim to THIS TIER's budget — the 200k default would amputate 600k
+        # tokens off a pinned 800k laguna history.
+        from sandbox_agent.config import COMPACTION_RESERVE_TOKENS
         from sandbox_agent.token_budget import trim_to_budget
-        return trim_to_budget(messages)
+        return trim_to_budget(messages, max_tokens=max(10_000, ctx - COMPACTION_RESERVE_TOKENS))
     finally:
         try:
             clear_agent_status()
@@ -110,7 +118,8 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0) -> List[Message
             pass
 
 
-def compact_midrun(messages: List[Message]) -> List[Message]:
+def compact_midrun(messages: List[Message],
+                   context_tokens: Optional[int] = None) -> List[Message]:
     """Compaction for INSIDE the fncall tool-call loop (runs before every LLM
     call). Pins the leading system message(s) + first user message — for a
     background/pipeline session that first user message IS the task; the
@@ -123,4 +132,4 @@ def compact_midrun(messages: List[Message]) -> List[Message]:
             break
     if head_end < len(messages) and messages[head_end].role == "user":
         head_end += 1
-    return maybe_compact(messages, pinned_head=head_end)
+    return maybe_compact(messages, pinned_head=head_end, context_tokens=context_tokens)
