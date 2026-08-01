@@ -103,7 +103,6 @@ def _create_handler(llm_cfg: Optional[dict], auth_token: str):
                                 json={
                                     "model": model,
                                     "messages": messages,
-                                    "temperature": 0.6,
                                 },
                                 timeout=600,
                             )

@@ -23,7 +23,8 @@ PRIMARY_LLM_CFG = {
         # laguna's 1M window: 800k backstop under the 900k compaction budget.
         "max_input_tokens": 800000,
         "request_timeout": 1800,       # rescaled per turn by compute_request_timeout
-        "temperature": 0.6,
+        # No temperature: the host's per-model default applies (each backend
+        # knows its own model's recommended sampling better than we do).
         # use_raw_api=True: pass `tools=` to vLLM natively. Required because
         # vLLM has auto-tool-call-parsing enabled for this model, and in
         # streaming mode it consumes the model's `<tool_call>...</tool_call>`
@@ -58,7 +59,7 @@ BACKGROUND_LLM_CFG = {
     "generate_cfg": {
         "max_input_tokens": 160000,   # same backstop rationale as PRIMARY_LLM_CFG
         "request_timeout": 1800,
-        "temperature": 0.6,
+        # No temperature — host default (see PRIMARY_LLM_CFG note).
         # Same reason as PRIMARY_LLM_CFG: vLLM auto-tool-parsing means we
         # must pass `tools=` natively or tool calls vanish from streaming.
         "use_raw_api": True,

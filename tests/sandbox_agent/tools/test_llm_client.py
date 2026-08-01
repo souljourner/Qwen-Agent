@@ -238,3 +238,30 @@ class TestModuleShape:
     def test_session_is_requests_session(self):
         import requests
         assert isinstance(llm_client._SESSION, requests.Session)
+
+
+class TestNoDefaultTemperature:
+    """Host defaults rule: nothing sends temperature unless a caller
+    explicitly passes one (each backend knows its model's recommended
+    sampling; we were blindly sending qwen's 0.6 to laguna)."""
+
+    def test_llm_call_omits_temperature_by_default(self, monkeypatch):
+        captured = {}
+
+        def fake_post(url, json=None, timeout=None, **kwargs):
+            captured["json"] = json
+            return _mock_response("hi")
+
+        monkeypatch.setattr(llm_client._SESSION, "post", fake_post)
+        llm_client.llm_call("say hi", timeout=30)
+        assert "temperature" not in captured["json"]
+
+    def test_agent_cfgs_have_no_temperature(self):
+        from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
+        assert "temperature" not in PRIMARY_LLM_CFG["generate_cfg"]
+        assert "temperature" not in BACKGROUND_LLM_CFG["generate_cfg"]
+
+    def test_bridge_body_has_no_temperature(self):
+        import inspect
+        from sandbox_agent.tools import llm_bridge
+        assert '"temperature"' not in inspect.getsource(llm_bridge)

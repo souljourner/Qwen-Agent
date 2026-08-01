@@ -61,7 +61,7 @@ def _resolve_chain() -> List[Tuple[str, str]]:
 def llm_call(
     prompt: str,
     system: str = "",
-    temperature: float = 0.6,
+    temperature: Optional[float] = None,
     timeout: int = 300,
     max_tokens: Optional[int] = None,
 ) -> str:
@@ -77,7 +77,9 @@ def llm_call(
     for model, base in _resolve_chain():
         for attempt in (1, 2):
             try:
-                body = {"model": model, "messages": messages, "temperature": temperature}
+                body = {"model": model, "messages": messages}
+                if temperature is not None:
+                    body["temperature"] = temperature
                 if max_tokens is not None:
                     body["max_tokens"] = max_tokens
                 resp = _SESSION.post(f"{base}/chat/completions", json=body, timeout=timeout)
@@ -97,7 +99,7 @@ def llm_batch(
     system: str,
     prompts: List[str],
     max_concurrent: int = 4,
-    temperature: float = 0.6,
+    temperature: Optional[float] = None,
     timeout: int = 300,
     max_tokens: Optional[int] = None,
 ) -> List[str]:
