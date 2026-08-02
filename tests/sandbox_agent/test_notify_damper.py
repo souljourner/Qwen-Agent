@@ -154,7 +154,7 @@ class TestUiHardening:
         assert shim.exists() and "MutationObserver" in shim.read_text()
         cfg = (repo / ".chainlit" / "config.toml").read_text()
         assert 'custom_js = "/public/ui-unstick.js"' in cfg
-        assert 'cot = "tool_call"' in cfg
+        assert 'cot = "full"' in cfg  # user's choice — display ALL steps incl. thinking
         dockerfile = (repo / "sandbox_agent" / "docker" / "Dockerfile").read_text()
         assert "chainlit==2.11.1" in dockerfile
         assert "CHAINLIT_APP_ROOT=/app/chainlit_root" in dockerfile
