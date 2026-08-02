@@ -355,3 +355,61 @@ class TestCreateAgentBudgetBinding:
         assert isinstance(primary_agent._precall_compact, functools.partial)
         assert primary_agent._precall_compact.keywords["context_tokens"] == 900_000
         assert secondary_agent._precall_compact.keywords["context_tokens"] == 200_000
+
+
+class TestReasoningSalvage:
+    """2026-08-02: laguna put a complete, polished answer in reasoning_content
+    with content empty — the UI showed only 'Used web_search' (thinking steps
+    are hidden under cot=tool_call) and history recorded an empty message.
+    Reasoning-only final responses must be PROMOTED to content, not dropped."""
+
+    def test_promotes_reasoning_to_content(self):
+        resp = [
+            Message(role="assistant", content="",
+                    reasoning_content="### The Answer\nBatteries last 2-4 weeks."),
+        ]
+        out, salvaged = m._salvage_reasoning_only(resp)
+        assert salvaged
+        assert "Batteries last 2-4 weeks" in out[-1].content
+        assert not out[-1].reasoning_content  # not doubled into history
+
+    def test_leaves_contentful_responses_alone(self):
+        resp = [Message(role="assistant", content="real answer",
+                        reasoning_content="thinking...")]
+        out, salvaged = m._salvage_reasoning_only(resp)
+        assert not salvaged
+        assert out[-1].content == "real answer"
+
+    def test_leaves_tool_call_responses_alone(self):
+        from qwen_agent.llm.schema import FunctionCall
+        resp = [Message(role="assistant", content="",
+                        function_call=FunctionCall(name="t", arguments="{}"),
+                        reasoning_content="I should call a tool")]
+        out, salvaged = m._salvage_reasoning_only(resp)
+        assert not salvaged
+
+    def test_handles_dict_messages(self):
+        resp = [{"role": "assistant", "content": "",
+                 "reasoning_content": "the dict-form answer, long enough to be substantive"}]
+        out, salvaged = m._salvage_reasoning_only(resp)
+        assert salvaged
+        assert out[-1]["content"] == "the dict-form answer, long enough to be substantive"
+
+    def test_ignores_trivial_reasoning(self):
+        resp = [Message(role="assistant", content="", reasoning_content="hm")]
+        out, salvaged = m._salvage_reasoning_only(resp)
+        assert not salvaged
+
+    def test_locking_agent_salvages_before_ui(self, fresh_locks):
+        class _ReasoningOnly(_FakeAgent):
+            def run(self, messages, **kwargs):
+                self.calls += 1
+                yield [Message(role="assistant", content="",
+                               reasoning_content="### Full answer here, long enough to matter.")]
+
+        agent = m.LockingAgent(_ReasoningOnly("primary-model"), _FakeAgent("secondary-model"))
+        out = []
+        for out in agent.run(messages=[Message(role="user", content="q")]):
+            pass
+        assert "Full answer here" in out[-1].content  # promoted, visible to the bridge
+        assert agent._backup.calls == 0               # salvage, not retry
