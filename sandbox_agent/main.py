@@ -223,43 +223,6 @@ def _stream_tap(response, label: str) -> None:
         return
 
 
-def _salvage_reasoning_only(response):
-    """Promote a reasoning-only final answer into visible content.
-
-    2026-08-02: laguna (behind the proxy's reasoning parser) can emit its
-    complete post-tool answer entirely in reasoning_content with content
-    empty — the UI shows nothing (thinking steps are hidden under
-    cot=tool_call) and history records an empty message. If NO assistant
-    message carries content or a tool call, but the last assistant message
-    has substantive reasoning, move it into content. Handles Message objects
-    and dict-form messages. Returns (response, salvaged: bool)."""
-    if not response:
-        return response, False
-
-    def _get(msg, key):
-        return msg.get(key) if isinstance(msg, dict) else getattr(msg, key, None)
-
-    assistants = [m for m in response if _get(m, "role") == "assistant"]
-    if not assistants:
-        return response, False
-    for msg in assistants:
-        if (_get(msg, "content") and str(_get(msg, "content")).strip()) or _get(msg, "function_call"):
-            return response, False
-    last = assistants[-1]
-    reasoning = str(_get(last, "reasoning_content") or "").strip()
-    if len(reasoning) < 40:
-        return response, False
-    if isinstance(last, dict):
-        last["content"] = reasoning
-        last["reasoning_content"] = ""
-    else:
-        last.content = reasoning
-        last.reasoning_content = ""
-    log_event("reasoning_salvage", detail=reasoning[:120])
-    logger.warning("Reasoning-only response salvaged into content (%d chars)", len(reasoning))
-    return response, True
-
-
 def _response_has_assistant_content(response) -> bool:
     """Qwen-Agent preserves input type: if conversation history is plain dicts,
     yielded items are dicts; if Message objects, they're Messages. Handle both
@@ -412,12 +375,6 @@ class LockingAgent(Assistant):
             release_slot()
             model_done(model_name)
 
-        # Salvage a reasoning-only answer BEFORE the empty-completion logic:
-        # promoted content must reach the UI (yield) and the history.
-        response, _salvaged = _salvage_reasoning_only(response)
-        if _salvaged:
-            yield response
-
         # Detect empty completion — model returned 200 but produced no content.
         # With reasoning-parser enabled on both models this can happen when
         # thinking burns the token budget; both models can hit it for the same
@@ -478,10 +435,6 @@ class LockingAgent(Assistant):
             finally:
                 retry_release()
                 model_done(retry_model)
-
-            response, _salvaged_retry = _salvage_reasoning_only(response)
-            if _salvaged_retry:
-                yield response
 
             # If retry came back but also empty, surface that visibly too.
             if not _response_has_assistant_content(response):
@@ -654,10 +607,6 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
         response: List[Message] = []
         for response in agent.run(messages=messages):
             _stream_tap(response, task_label)
-
-        # Salvage reasoning-only answers here too (background tasks parse the
-        # response text for results; an empty-content message loses the work).
-        response, _ = _salvage_reasoning_only(response)
 
         # Detect silent LLM failure — retry once with a fresh agent
         has_content = any(
