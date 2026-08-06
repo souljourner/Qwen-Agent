@@ -104,7 +104,7 @@ class TestChainResolution:
         monkeypatch.delenv("LLM_CALL_CHAIN", raising=False)
         monkeypatch.setenv("VLLM_BASE", "http://vllm.local/v1")
         chain = llm_client._resolve_chain()
-        assert chain == [("qwen3.6-27b-linux", "http://vllm.local/v1"), ("laguna-s-2.1", "http://vllm.local/v1")]
+        assert chain == [("qwen3.6-27b-linux", "http://vllm.local/v1"), ("qwen3.6-27b", "http://vllm.local/v1")]
 
     def test_legacy_single_pair(self, monkeypatch):
         monkeypatch.delenv("LLM_CALL_CHAIN", raising=False)
@@ -243,7 +243,7 @@ class TestModuleShape:
 class TestNoDefaultTemperature:
     """Host defaults rule: nothing sends temperature unless a caller
     explicitly passes one (each backend knows its model's recommended
-    sampling; we were blindly sending qwen's 0.6 to laguna)."""
+    sampling; we were blindly sending one model's 0.6 to another)."""
 
     def test_llm_call_omits_temperature_by_default(self, monkeypatch):
         captured = {}

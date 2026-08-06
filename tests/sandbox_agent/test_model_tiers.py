@@ -1,10 +1,13 @@
-"""Tests for tiered model concurrency: laguna-s-2.1 primary (3 turn slots),
+"""Tests for tiered model concurrency: qwen3.6-27b primary on the Mac (2 turn slots),
 qwen3.6-27b-linux secondary/overflow (10 turn slots).
 
 Selection is per-TURN: a slot is held for the whole streamed turn. Chat
 prefers primary and spills to secondary; background work prefers secondary
-and spills INTO primary only when all 10 secondary slots are busy; when all
-13 are busy, callers wait (no more ungated pile-on)."""
+and spills INTO primary only when all 10 secondary slots are busy; when every
+slot is busy, callers wait (no more ungated pile-on).
+
+Both tiers run qwen3.6-27b and both are multimodal, so there is deliberately
+NO vision pin — image turns route like any other turn."""
 
 import threading
 import time
@@ -15,13 +18,21 @@ import pytest
 from qwen_agent.llm.schema import Message
 
 import sandbox_agent.main as m
+from sandbox_agent.config import (PRIMARY_MODEL_CONCURRENCY,
+                                  SECONDARY_MODEL_CONCURRENCY)
+
+TOTAL_SLOTS = PRIMARY_MODEL_CONCURRENCY + SECONDARY_MODEL_CONCURRENCY
 
 
 @pytest.fixture
 def fresh_locks(monkeypatch):
-    """Small real semaphores so tests exercise true acquire/release."""
-    primary = BoundedSemaphore(3)
-    secondary = BoundedSemaphore(10)
+    """Small real semaphores so tests exercise true acquire/release.
+
+    Sized FROM CONFIG, not hardcoded: these previously hardcoded 3 primary
+    slots, so changing PRIMARY_MODEL_CONCURRENCY silently left the tests
+    asserting the old topology."""
+    primary = BoundedSemaphore(PRIMARY_MODEL_CONCURRENCY)
+    secondary = BoundedSemaphore(SECONDARY_MODEL_CONCURRENCY)
     monkeypatch.setattr(m, "_primary_model_lock", primary)
     monkeypatch.setattr(m, "_secondary_model_lock", secondary)
     return primary, secondary
@@ -30,9 +41,10 @@ def fresh_locks(monkeypatch):
 class TestAcquireTurnSlot:
 
     def test_prefers_primary_then_spills(self, fresh_locks):
-        grants = [m._acquire_turn_slot(blocking=False) for _ in range(4)]
+        grants = [m._acquire_turn_slot(blocking=False)
+                  for _ in range(PRIMARY_MODEL_CONCURRENCY + 1)]
         tiers = [g[0] for g in grants]
-        assert tiers == ["primary", "primary", "primary", "secondary"]
+        assert tiers == ["primary"] * PRIMARY_MODEL_CONCURRENCY + ["secondary"]
         for _, release in grants:
             release()
 
@@ -41,16 +53,16 @@ class TestAcquireTurnSlot:
         assert tier == "secondary"
         release()
 
-    def test_none_when_all_thirteen_held(self, fresh_locks):
-        grants = [m._acquire_turn_slot(blocking=False) for _ in range(13)]
+    def test_none_when_every_slot_held(self, fresh_locks):
+        grants = [m._acquire_turn_slot(blocking=False) for _ in range(TOTAL_SLOTS)]
         assert all(g is not None for g in grants)
         assert m._acquire_turn_slot(blocking=False) is None
         for _, release in grants:
             release()
 
     def test_blocking_wakes_when_any_tier_frees(self, fresh_locks):
-        grants = [m._acquire_turn_slot(blocking=False) for _ in range(13)]
-        released = grants[5]  # a secondary slot
+        grants = [m._acquire_turn_slot(blocking=False) for _ in range(TOTAL_SLOTS)]
+        released = grants[PRIMARY_MODEL_CONCURRENCY + 1]  # a secondary slot
 
         def free_one():
             time.sleep(0.05)
@@ -63,7 +75,7 @@ class TestAcquireTurnSlot:
         assert tier == "secondary"
         release()
         for i, (tier_name, rel) in enumerate(grants):
-            if i != 5:
+            if i != PRIMARY_MODEL_CONCURRENCY + 1:
                 rel()
 
     def test_release_is_idempotent(self, fresh_locks):
@@ -71,9 +83,10 @@ class TestAcquireTurnSlot:
         tier, release = m._acquire_turn_slot(blocking=False)
         release()
         release()  # second call must be a no-op, not a BoundedSemaphore error
-        # all 3 primary slots must be available again — not 4
-        grants = [m._acquire_turn_slot(blocking=False) for _ in range(3)]
-        assert [g[0] for g in grants] == ["primary"] * 3
+        # every primary slot must be available again — and no more than that
+        grants = [m._acquire_turn_slot(blocking=False)
+                  for _ in range(PRIMARY_MODEL_CONCURRENCY)]
+        assert [g[0] for g in grants] == ["primary"] * PRIMARY_MODEL_CONCURRENCY
         for _, rel in grants:
             rel()
 
@@ -116,21 +129,22 @@ class TestLockingAgentRouting:
 
     def test_spills_to_secondary_when_primary_exhausted(self, fresh_locks):
         primary, _ = fresh_locks
-        for _ in range(3):
+        for _ in range(PRIMARY_MODEL_CONCURRENCY):
             primary.acquire(blocking=False)
         agent = self._agent()
         self._drain(agent.run(messages=[Message(role="user", content="hi")]))
         assert agent._backup.calls == 1
         assert agent._inner.calls == 0
-        for _ in range(3):
+        for _ in range(PRIMARY_MODEL_CONCURRENCY):
             primary.release()
 
     def test_slot_released_after_turn(self, fresh_locks):
         agent = self._agent()
         self._drain(agent.run(messages=[Message(role="user", content="hi")]))
-        # all three primary slots free again
-        grants = [m._acquire_turn_slot(blocking=False) for _ in range(3)]
-        assert [g[0] for g in grants] == ["primary"] * 3
+        # every primary slot free again
+        grants = [m._acquire_turn_slot(blocking=False)
+                  for _ in range(PRIMARY_MODEL_CONCURRENCY)]
+        assert [g[0] for g in grants] == ["primary"] * PRIMARY_MODEL_CONCURRENCY
         for _, rel in grants:
             rel()
 
@@ -143,8 +157,9 @@ class TestLockingAgentRouting:
         agent = m.LockingAgent(_Boom("primary-model"), _FakeAgent("secondary-model"))
         with pytest.raises(RuntimeError):
             self._drain(agent.run(messages=[Message(role="user", content="hi")]))
-        grants = [m._acquire_turn_slot(blocking=False) for _ in range(3)]
-        assert [g[0] for g in grants] == ["primary"] * 3
+        grants = [m._acquire_turn_slot(blocking=False)
+                  for _ in range(PRIMARY_MODEL_CONCURRENCY)]
+        assert [g[0] for g in grants] == ["primary"] * PRIMARY_MODEL_CONCURRENCY
         for _, rel in grants:
             rel()
 
@@ -155,7 +170,7 @@ class TestLockingAgentRouting:
         out = self._drain(agent.run(messages=[Message(role="user", content="hi")]))
         assert agent._backup.calls == 1  # retry ran on the other tier
         # semaphore counts fully restored
-        grants = [m._acquire_turn_slot(blocking=False) for _ in range(13)]
+        grants = [m._acquire_turn_slot(blocking=False) for _ in range(TOTAL_SLOTS)]
         assert all(g is not None for g in grants)
         for _, rel in grants:
             rel()
@@ -207,9 +222,9 @@ class TestConfigAndBridge:
         from sandbox_agent.config import (BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG,
                                           PRIMARY_MODEL_CONCURRENCY,
                                           SECONDARY_MODEL_CONCURRENCY)
-        assert PRIMARY_LLM_CFG["model"] == "laguna-s-2.1"
+        assert PRIMARY_LLM_CFG["model"] == "qwen3.6-27b"
         assert BACKGROUND_LLM_CFG["model"] == "qwen3.6-27b-linux"
-        assert PRIMARY_MODEL_CONCURRENCY == 3
+        assert PRIMARY_MODEL_CONCURRENCY == 2
         assert SECONDARY_MODEL_CONCURRENCY == 10
 
     def test_bridge_chain_is_secondary_first(self):
@@ -218,20 +233,20 @@ class TestConfigAndBridge:
         models = [c[0] for c in chain]
         # bulk/unslotted traffic belongs on the high-concurrency tier
         assert models[0] == "qwen3.6-27b-linux"
-        assert models[1] == "laguna-s-2.1"
+        assert models[1] == "qwen3.6-27b"
 
 
 class TestOnlyTierAcquisition:
 
     def test_only_primary_never_grants_secondary(self, fresh_locks):
         primary, _ = fresh_locks
-        for _ in range(3):
+        for _ in range(PRIMARY_MODEL_CONCURRENCY):
             primary.acquire(blocking=False)
         assert m._acquire_turn_slot(blocking=False, only="primary") is None
 
     def test_only_primary_blocks_until_primary_frees(self, fresh_locks):
         primary, _ = fresh_locks
-        for _ in range(3):
+        for _ in range(PRIMARY_MODEL_CONCURRENCY):
             primary.acquire(blocking=False)
 
         def free_primary():
@@ -245,29 +260,8 @@ class TestOnlyTierAcquisition:
         t.join()
         assert tier == "primary"
         release()
-        for _ in range(2):
+        for _ in range(PRIMARY_MODEL_CONCURRENCY - 1):
             primary.release()
-
-
-class TestHistoryHasImages:
-
-    def test_plain_text_false(self):
-        assert not m._history_has_images([Message(role="user", content="hi")])
-
-    def test_content_item_image_true(self):
-        from qwen_agent.llm.schema import ContentItem
-        msg = Message(role="user", content=[ContentItem(image="data:image/png;base64,AAAA")])
-        assert m._history_has_images([Message(role="user", content="x"), msg])
-
-    def test_raw_dict_message_with_image_true(self):
-        # History items can arrive as raw dicts (pre-Message conversion).
-        msg = {"role": "user", "content": [{"image": "data:image/png;base64,AA"}]}
-        assert m._history_has_images([msg])
-
-    def test_text_content_items_false(self):
-        from qwen_agent.llm.schema import ContentItem
-        msg = Message(role="user", content=[ContentItem(text="just text")])
-        assert not m._history_has_images([msg])
 
 
 class TestPinnedRouting:
@@ -296,7 +290,7 @@ class TestPinnedRouting:
 
     def test_big_context_waits_for_primary_even_when_secondary_free(self, fresh_locks):
         primary, _ = fresh_locks
-        for _ in range(3):
+        for _ in range(PRIMARY_MODEL_CONCURRENCY):
             primary.acquire(blocking=False)
 
         agent = m.LockingAgent(_FakeAgent("primary-model"), _FakeAgent("secondary-model"))
@@ -313,28 +307,32 @@ class TestPinnedRouting:
         primary.release()
         t.join(timeout=5)
         assert done and agent._inner.calls == 1 and agent._backup.calls == 0
-        for _ in range(2):
+        for _ in range(PRIMARY_MODEL_CONCURRENCY - 1):
             primary.release()
 
-    def test_image_history_pins_to_secondary(self, fresh_locks):
+    def test_image_history_is_not_pinned(self, fresh_locks):
+        """Both tiers are multimodal qwen3.6-27b, so an image turn takes the
+        preferred (primary) tier like anything else. Pinning it to secondary
+        would waste the primary's capacity for no capability gain."""
         agent = m.LockingAgent(_FakeAgent("primary-model"), _FakeAgent("secondary-model"))
         self._drain(agent.run(messages=self._image_messages()))
-        assert agent._backup.calls == 1 and agent._inner.calls == 0
+        assert agent._inner.calls == 1 and agent._backup.calls == 0
 
-    def test_image_beats_big_context(self, fresh_locks):
-        from qwen_agent.llm.schema import ContentItem
+    def test_big_context_with_images_still_pins_to_primary(self, fresh_locks):
+        """Size is now the ONLY pin. Previously vision outranked it and sent
+        this to secondary."""
         msgs = self._big_messages() + self._image_messages()
         agent = m.LockingAgent(_FakeAgent("primary-model"), _FakeAgent("secondary-model"))
         self._drain(agent.run(messages=msgs))
-        assert agent._backup.calls == 1 and agent._inner.calls == 0
+        assert agent._inner.calls == 1 and agent._backup.calls == 0
 
-    def test_vision_retry_stays_on_secondary(self, fresh_locks):
-        empty_backup = _FakeAgent("secondary-model", replies=("",))
-        agent = m.LockingAgent(_FakeAgent("primary-model"), empty_backup)
+    def test_image_retry_may_use_either_tier(self, fresh_locks):
+        """An empty completion on an image turn retries on the other tier —
+        no longer forbidden, since both tiers see images."""
+        empty_primary = _FakeAgent("primary-model", replies=("",))
+        agent = m.LockingAgent(empty_primary, _FakeAgent("secondary-model"))
         self._drain(agent.run(messages=self._image_messages()))
-        # empty completion → retry must NOT go to laguna (it can't see images)
-        assert agent._inner.calls == 0
-        assert empty_backup.calls == 2  # original + retry, both on secondary
+        assert agent._backup.calls == 1, "retry did not reach the other tier"
 
 
 class TestCreateAgentBudgetBinding:

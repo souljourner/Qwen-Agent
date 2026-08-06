@@ -148,7 +148,7 @@ def test_llm_cfg_backstop():
     from sandbox_agent.config import (BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG,
                                       PRIMARY_CONTEXT_TOKENS,
                                       SPILLABLE_CONTEXT_TOKENS)
-    # Both tiers budgeted equally at 200k/160k. laguna's vendor-claimed 1M is
+    # Both tiers budgeted equally at 200k/160k. A vendor-claimed larger window is
     # UNVALIDATED (128x YaRN off an 8k base, 36/48 sliding-window-512 layers,
     # no published long-context eval); measured clean at 85k, confabulating
     # at 275k-281k live on 2026-08-05. Raising these requires evidence.
@@ -182,7 +182,7 @@ class TestPerTierBudgets:
     def test_context_tokens_honored(self):
         msgs = self._big_history(500_000)  # ~500k tokens
         out = maybe_compact(msgs, context_tokens=900_000)
-        assert out is msgs  # fits the laguna budget — untouched
+        assert out is msgs  # fits the primary-tier budget — untouched
         out2 = maybe_compact(list(msgs))
         assert estimate_messages_tokens(out2) <= BUDGET  # default budget compacts
 
@@ -203,7 +203,7 @@ class TestPerTierBudgets:
         monkeypatch.setattr(summarizer, "summarize_chunk", fake_chunk)
         monkeypatch.setattr(summarizer, "merge_summaries",
                             lambda summaries, identifiers: "merged summary")
-        # over the laguna budget → summarization path with the BIG budget
+        # over the primary-tier budget → summarization path with the BIG budget
         msgs = self._big_history(1_000_000)
         maybe_compact(msgs, context_tokens=900_000)
         assert sizes, "summarizer was never invoked"
@@ -225,11 +225,11 @@ class TestPerTierBudgets:
             raise RuntimeError("boom mid-compaction")
 
         monkeypatch.setattr(estimator, "select_tier", exploding_select)
-        # 1M tokens: over even the laguna budget, so compaction runs and the
+        # 1M tokens: over even the primary-tier budget, so compaction runs and the
         # second select_tier (post-truncation re-check) explodes
         msgs = self._big_history(1_000_000)
         out = maybe_compact(msgs, context_tokens=900_000)
-        # trimmed to the LAGUNA budget (fits 870k → basically untouched),
+        # trimmed to the PRIMARY-tier budget,
         # not to the 200k default
         assert estimate_messages_tokens(out) > 300_000
 

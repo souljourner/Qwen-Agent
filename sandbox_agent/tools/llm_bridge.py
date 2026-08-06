@@ -30,7 +30,7 @@ def _build_fallback_chain(llm_cfg: Optional[dict]) -> list:
 
     Starts with the SECONDARY tier (qwen3.6, 10 slots): bridge traffic is
     slot-unaware raw HTTP — often loops from exec scripts — and must not
-    hammer the 3-slot MLX primary (laguna). A caller-supplied llm_cfg is only
+    hammer the 2-slot MLX primary. A caller-supplied llm_cfg is only
     honored if it matches one of the two canonical models — this keeps the
     bridge from silently routing to a misconfigured model."""
     canonical = {

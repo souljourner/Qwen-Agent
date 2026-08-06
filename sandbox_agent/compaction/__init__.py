@@ -71,8 +71,8 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0,
     """
     if not COMPACTION_ENABLED or not messages:
         return messages
-    # Per-tier budget: laguna turns pass their 900k window; default is the
-    # secondary/global 200k. All tier decisions and fallbacks use this.
+    # Per-tier budget: callers pass their tier's window; default is the
+    # global 200k. All tier decisions and fallbacks use this.
     from sandbox_agent.config import MAX_CONTEXT_TOKENS as _DEFAULT_CTX
     ctx = context_tokens or _DEFAULT_CTX
 
@@ -150,7 +150,7 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0,
     except Exception:
         logger.exception("Compaction failed, falling back to trim_to_budget")
         # Trim to THIS TIER's budget — the 200k default would amputate 600k
-        # tokens off a pinned 800k laguna history.
+        # tokens off a pinned large-context history.
         from sandbox_agent.config import COMPACTION_RESERVE_TOKENS
         from sandbox_agent.token_budget import trim_to_budget
         return trim_to_budget(messages, max_tokens=max(10_000, ctx - COMPACTION_RESERVE_TOKENS))

@@ -76,8 +76,8 @@ def _acquire_turn_slot(blocking: bool, prefer: str = "primary",
 
     Tries the `prefer` tier first, the other second (non-blocking each);
     when `blocking`, polls until either tier frees. `only` restricts to a
-    single tier (pinned turns: big contexts must stay on primary/laguna,
-    image-bearing turns on secondary/qwen). Returns (tier_name, release) or
+    single tier (pinned turns: big contexts must stay on the primary).
+    Returns (tier_name, release) or
     None. `release` is idempotent — a double call must never trip
     BoundedSemaphore's over-release check mid-stream."""
     def _try_once():
@@ -103,24 +103,6 @@ def _acquire_turn_slot(blocking: bool, prefer: str = "primary",
         grant = _try_once()
     return grant
 
-
-def _history_has_images(messages) -> bool:
-    """True when any message carries image content (multimodal ContentItems,
-    b64 data URIs, image_url dicts). Such turns must run on the multimodal
-    SECONDARY tier (qwen3.6) — laguna is text-only."""
-    for msg in messages or []:
-        content = getattr(msg, "content", None)
-        if isinstance(msg, dict):
-            content = msg.get("content")
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if isinstance(item, dict):
-                if item.get("image") or item.get("image_url"):
-                    return True
-            elif getattr(item, "image", None):
-                return True
-    return False
 
 # Lock for background work — ensures heartbeat and cron tasks run one at a time, never colliding.
 _background_work_lock = Lock()
@@ -302,8 +284,8 @@ def _dump_response_for_debug(response, context: str) -> str:
 class LockingAgent(Assistant):
     """Wraps two model-bound Assistants with tiered turn routing.
 
-    Chat turns prefer the primary tier (laguna-s-2.1, 3 slots) and spill to
-    the secondary (qwen3.6-27b-linux, 10 slots). When all 13 slots are busy
+    Chat turns prefer the primary tier (qwen3.6-27b on the Mac, 2 slots) and spill to
+    the secondary (qwen3.6-27b-linux, 10 slots). When every slot is busy
     the turn WAITS with a visible notice — no more ungated pile-on. Slots are
     acquired per TURN via `_acquire_turn_slot` and held for the whole stream.
     """
@@ -311,7 +293,7 @@ class LockingAgent(Assistant):
     def __init__(self, inner: Assistant, backup: Assistant, lock=None):
         # `lock` accepted-and-ignored for signature compat; slots come from
         # the module-level tier semaphores via _acquire_turn_slot.
-        self._inner = inner      # PRIMARY tier agent (laguna-s-2.1)
+        self._inner = inner      # PRIMARY tier agent (qwen3.6-27b, Mac)
         self._backup = backup    # SECONDARY tier agent (qwen3.6-27b-linux)
 
     def run(self, *args, **kwargs) -> Iterator[List[Message]]:
@@ -329,19 +311,16 @@ class LockingAgent(Assistant):
                     break
 
         # Routing priority:
-        # 1. Image-bearing history → SECONDARY only (qwen is multimodal;
-        #    laguna is text-only — capability beats capacity).
-        # 2. History too big for qwen (> SPILLABLE_CONTEXT_TOKENS) → PRIMARY
-        #    only (the larger-window tier; it can never fit qwen again).
-        #    NOTE: with both tiers budgeted equally this cannot fire — see
-        #    PRIMARY_CONTEXT_TOKENS in config.py for why laguna is not trusted
-        #    at its claimed 1M.
-        # 3. Otherwise: prefer primary, spill to secondary.
+        # 1. History too big for the secondary (> SPILLABLE_CONTEXT_TOKENS) →
+        #    PRIMARY only. With both tiers budgeted equally this cannot fire;
+        #    it re-activates if PRIMARY_CONTEXT_TOKENS is ever raised.
+        # 2. Otherwise: prefer primary, spill to secondary.
         # All-slots-busy in any mode → WAIT with a visible notice.
+        # NOTE: there is deliberately no vision pin. Both tiers run
+        # qwen3.6-27b (Mac and Linux) and both are multimodal, so pinning
+        # image turns to one tier would only waste the other's capacity.
         msg_objs = msg_list if messages else []
-        if _history_has_images(msg_objs):
-            pin_only, route_tag = "secondary", "[secondary pinned-vision]"
-        elif msg_objs and estimate_messages_tokens(msg_objs) > SPILLABLE_CONTEXT_TOKENS:
+        if msg_objs and estimate_messages_tokens(msg_objs) > SPILLABLE_CONTEXT_TOKENS:
             pin_only, route_tag = "primary", "[primary pinned]"
         else:
             pin_only, route_tag = None, None
@@ -401,8 +380,8 @@ class LockingAgent(Assistant):
 
             # The original slot was already released (finally above ran when
             # the stream ended) — acquire fresh, preferring the OTHER tier.
-            # Pinned turns keep their restriction: a vision retry must never
-            # land on text-only laguna; a big-context retry can't fit qwen.
+            # Pinned turns keep their restriction: a big-context retry must
+            # not land on a tier that cannot fit it.
             # If the preferred tier is full, the retry may legitimately land
             # on the same model again; caps are never exceeded.
             pin_only = getattr(self, "_pin_only", None)
@@ -474,9 +453,7 @@ class LockingAgent(Assistant):
         pin_only = None
         if messages:
             msg_list = [m if isinstance(m, Message) else Message(**m) for m in messages]
-            if _history_has_images(msg_list):
-                pin_only = "secondary"
-            elif estimate_messages_tokens(msg_list) > SPILLABLE_CONTEXT_TOKENS:
+            if estimate_messages_tokens(msg_list) > SPILLABLE_CONTEXT_TOKENS:
                 pin_only = "primary"
         grant = (_acquire_turn_slot(blocking=False, only=pin_only)
                  or _acquire_turn_slot(blocking=True, only=pin_only))
@@ -589,16 +566,13 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
     """Run a background agent session on a tier slot.
 
     Background work PREFERS the secondary tier (qwen3.6-27b-linux, 10 slots):
-    a long cron task must not eat one of chat's 3 primary (laguna) slots. It
-    spills INTO the primary tier only when all secondary slots are busy, and
-    blocks when all 13 slots are held.
+    a long cron task must not eat one of chat's 2 primary slots. It spills
+    INTO the primary tier only when all secondary slots are busy, and blocks
+    when all 12 slots are held.
     """
     timeout = compute_request_timeout(messages)
 
-    # Image-bearing background work must run on the multimodal secondary
-    # tier — never spill into text-only laguna.
-    _only = "secondary" if _history_has_images(messages) else None
-    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="secondary", only=_only)
+    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="secondary")
     tier_cfg = BACKGROUND_LLM_CFG if tier == "secondary" else PRIMARY_LLM_CFG
     try:
         logger.info(f"Background task using {tier} tier ({tier_cfg['model']}, timeout={timeout}s)")

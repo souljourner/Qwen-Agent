@@ -1,18 +1,19 @@
 import os
 from pathlib import Path
 
-# PRIMARY tier: laguna-s-2.1 (Poolside, MLX-served via the proxy) — the
-# chat-priority model, max 3 concurrent turns (must match the server's real
+# PRIMARY tier: qwen3.6-27b on the Mac (MLX-served via the proxy) — the
+# chat-priority model, max 2 concurrent turns (must match the server's real
 # concurrency). Chat turns prefer this tier and spill to the secondary
 # (qwen3.6-27b-linux) when its slots are full; background work prefers the
 # secondary and spills INTO this tier only when all 10 secondary slots are
 # busy. See main.py `_acquire_turn_slot`.
+
 PRIMARY_LLM_CFG = {
-    "model": os.getenv("PRIMARY_MODEL", "laguna-s-2.1"),
+    "model": os.getenv("PRIMARY_MODEL", "qwen3.6-27b"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
-    # Context window: treated as EQUAL to the secondary tier (200k), NOT the
-    # vendor's claimed 1M. See PRIMARY_CONTEXT_TOKENS below for the evidence.
+    # Same 200k window as the secondary tier — both tiers are qwen3.6-27b,
+    # one on the Mac and one on Linux.
     "context_window_tokens": int(os.getenv("PRIMARY_CONTEXT_TOKENS", "200000")),
     "generate_cfg": {
         # Hard backstop, NOT the primary mechanism (compaction is): if the
@@ -20,8 +21,7 @@ PRIMARY_LLM_CFG = {
         # 400-ing (real ceiling 262144-65536=196608; the char estimators
         # undercounted by ~16% in the 2026-07-15 incident, hence the margin).
         # KV-cache churn from truncation is acceptable in that failure mode.
-        # 160k backstop, same as the secondary tier — the 800k backstop that
-        # went with the 1M claim let conversations reach 281k un-compacted.
+        # 160k backstop, same as the secondary tier.
         "max_input_tokens": 160000,
         "request_timeout": 1800,       # rescaled per turn by compute_request_timeout
         # No temperature: the host's per-model default applies (each backend
@@ -41,17 +41,17 @@ PRIMARY_LLM_CFG = {
 
 # Turn-slot caps per tier. Raising either above the server's actual limit
 # causes server-side queueing instead of clean spill — tune both sides
-# together. laguna (MLX) sustains 3; qwen3.6-27b-linux (vLLM) sustains 10
-# gated turns (plus slot-unaware bridge/llm_call/compaction traffic on top;
-# the server was sized for 15).
-PRIMARY_MODEL_CONCURRENCY = int(os.getenv("PRIMARY_MODEL_CONCURRENCY", "3"))
+# together. The Mac qwen3.6-27b (MLX) sustains 2; qwen3.6-27b-linux (vLLM)
+# sustains 10 gated turns (plus slot-unaware bridge/llm_call/compaction
+# traffic on top; the server was sized for 15).
+PRIMARY_MODEL_CONCURRENCY = int(os.getenv("PRIMARY_MODEL_CONCURRENCY", "2"))
 SECONDARY_MODEL_CONCURRENCY = int(os.getenv("SECONDARY_MODEL_CONCURRENCY", "10"))
 
 # SECONDARY/overflow tier: qwen3.6-27b-linux on vLLM — hosts background work
 # (cron/heartbeat/pipeline prefer it), chat spillover, and all bulk/unslotted
 # traffic (llm_bridge, llm_call/llm_batch, compaction, digests).
 # NOTE: the old BACKUP_MODEL env var is intentionally NOT honored anymore —
-# a stale BACKUP_MODEL=laguna-s-2.1 would make both tiers laguna.
+# a stale value would collapse both tiers onto one model.
 BACKGROUND_LLM_CFG = {
     "model": os.getenv("SECONDARY_MODEL", "qwen3.6-27b-linux"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
@@ -68,8 +68,8 @@ BACKGROUND_LLM_CFG = {
 }
 
 # llm_call() endpoint: no longer pinned to a specific model — the bridge and
-# the standalone llm_client both fall through primary (qwen3.6-27b-linux) →
-# backup (qwen3.5) on every call. LLM_CALL_MODEL/LLM_CALL_BASE are honored as
+# the standalone llm_client both fall through primary → secondary on every
+# call. LLM_CALL_MODEL/LLM_CALL_BASE are honored as
 # a legacy override (single-entry chain) if explicitly set.
 LLM_CALL_CFG = {
     "model": os.getenv("LLM_CALL_MODEL", PRIMARY_LLM_CFG["model"]),
@@ -78,16 +78,10 @@ LLM_CALL_CFG = {
 
 # Token budget — all models have 256k limit, we target 200k to leave room for generation
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "200000"))
-# laguna's raised budget (chat pinned-large-context tier); see PRIMARY_LLM_CFG.
-# Primary-tier compaction budget. Poolside CLAIMS a 1M window for
-# laguna-s-2.1, but that is a 128x YaRN extension of an 8k-trained base with
-# only 12 of 48 layers doing full attention (the other 36 are sliding-window
-# 512), and there is NO published long-context validation. Measured here
-# 2026-08-05: clean needle recall at 85k; severe confabulation (invented
-# tokens presented as quoted history, day-of-week arithmetic failing with the
-# correct date in the prompt) observed live at 275k-281k. So this tier is
-# budgeted EQUAL to the secondary until the real cliff is measured.
-# Env-overridable: raise PRIMARY_CONTEXT_TOKENS only with evidence.
+# Primary-tier compaction budget. Both tiers run the same model, so this
+# matches the secondary. Env-overridable, but raise it ONLY on measured
+# evidence of clean recall at the larger size — a previous tier was budgeted
+# on a vendor's claimed window and confabulated badly well below it.
 PRIMARY_CONTEXT_TOKENS = int(os.getenv("PRIMARY_CONTEXT_TOKENS", "200000"))
 # Pinning threshold: a history too large for the SECONDARY tier gets pinned to
 # the primary. With both windows equal this can never fire (compaction caps
@@ -95,8 +89,8 @@ PRIMARY_CONTEXT_TOKENS = int(os.getenv("PRIMARY_CONTEXT_TOKENS", "200000"))
 # conversation should be trapped on one tier by size. It re-activates
 # automatically if PRIMARY_CONTEXT_TOKENS is ever raised on evidence.
 SPILLABLE_CONTEXT_TOKENS = int(os.getenv("SPILLABLE_CONTEXT_TOKENS", "200000"))
-# The compaction summarizer (qwen3.6) window — CHUNK SIZING pins to this,
-# never to the raised history budget (0.4x870k chunks would overflow it).
+# The compaction summarizer window — CHUNK SIZING pins to this, never to a
+# raised history budget (oversized chunks would overflow the summarizer).
 SUMMARIZER_CONTEXT_TOKENS = int(os.getenv("SUMMARIZER_CONTEXT_TOKENS", "200000"))
 MAX_TOOL_OUTPUT_TOKENS = int(os.getenv("MAX_TOOL_OUTPUT_TOKENS", "16000"))
 MAX_CODE_OUTPUT_TOKENS = int(os.getenv("MAX_CODE_OUTPUT_TOKENS", "16000"))
