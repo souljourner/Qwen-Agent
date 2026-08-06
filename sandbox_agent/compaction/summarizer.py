@@ -9,8 +9,8 @@ import logging
 
 import requests
 
-from sandbox_agent.config import (COMPACTION_CHUNK_MAX_TOKENS, COMPACTION_MODEL,
-                                   COMPACTION_TIMEOUT, COMPACTION_URL)
+from sandbox_agent.config import (COMPACTION_ATTEMPTS, COMPACTION_CHUNK_MAX_TOKENS,
+                                   COMPACTION_MODEL, COMPACTION_TIMEOUT, COMPACTION_URL)
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,22 @@ def merge_summaries(summaries: list, identifiers: set) -> str:
 
 
 def _call_ollama(system_prompt: str, user_prompt: str) -> str:
-    """Call compaction model via OpenAI-compatible API. Returns empty string on failure."""
+    """Call the compaction model. Returns "" on failure (never raises).
+
+    Retries once by default: compaction is all-or-nothing, so a single
+    transient failure (notably a cold model load on the lazily-spawning
+    proxy) would otherwise abandon the whole compaction and repeat it next
+    turn — minutes of work thrown away each time.
+    """
+    last_error = None
+    for attempt in range(max(1, COMPACTION_ATTEMPTS)):
+        result = _attempt_call(system_prompt, user_prompt, attempt)
+        if result:
+            return result
+    return ""
+
+
+def _attempt_call(system_prompt: str, user_prompt: str, attempt: int) -> str:
     try:
         from sandbox_agent.model_tracker import model_start, model_done
         model_start(COMPACTION_MODEL, "context compaction")
@@ -113,7 +128,8 @@ def _call_ollama(system_prompt: str, user_prompt: str) -> str:
         model_done(COMPACTION_MODEL)
         return result
     except Exception as e:
-        logger.warning(f"Compaction summarizer failed: {e}")
+        logger.warning("Compaction summarizer attempt %d/%d failed: %s",
+                       attempt + 1, COMPACTION_ATTEMPTS, e)
         try:
             from sandbox_agent.model_tracker import model_done
             model_done(COMPACTION_MODEL)

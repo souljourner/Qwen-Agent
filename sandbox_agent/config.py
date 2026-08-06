@@ -116,12 +116,22 @@ COMPACTION_SAFETY_MARGIN = 1.2             # 20% buffer on token estimates
 COMPACTION_TOOL_RESULT_MAX_SHARE = 0.30    # max 30% of context per tool result
 COMPACTION_TOOL_RESULT_HARD_CAP = 40000    # 40k chars hard cap per tool result
 COMPACTION_TOOL_RESULT_MIN_KEEP = 2000     # min 2k chars kept after truncation
-COMPACTION_BASE_CHUNK_RATIO = 0.4          # base chunk size as fraction of context
+COMPACTION_BASE_CHUNK_RATIO = 0.25         # fraction of the summarizer window per
+# chunk. Lowered from 0.4 with the full-fidelity renderer: more, smaller
+# requests beat one huge one that times out and aborts everything.
 COMPACTION_MIN_CHUNK_RATIO = 0.15          # minimum chunk ratio
 COMPACTION_MAX_FAILURES = 8                # tool failures to extract
 COMPACTION_FAILURE_CHARS = 240             # chars per failure summary
 COMPACTION_MAX_IDENTIFIERS = 12            # unique identifiers to preserve
-COMPACTION_TIMEOUT = int(os.getenv("COMPACTION_TIMEOUT", "120"))
+# 120s was sized for the old truncating renderer, which sent the summarizer
+# ~2% of a chunk. Now that chunks carry their full content the request
+# legitimately takes minutes (big prefill + generation, plus a possible
+# cold model load on the lazily-spawning proxy) — at 120s EVERY chunk
+# timed out, all-or-nothing correctly refused to compact, and the whole
+# thing retried every turn (observed live 2026-08-06).
+COMPACTION_TIMEOUT = int(os.getenv("COMPACTION_TIMEOUT", "600"))
+# One retry: the first request may be paying for a cold model load.
+COMPACTION_ATTEMPTS = int(os.getenv("COMPACTION_ATTEMPTS", "2"))
 # Max tokens for ONE chunk summary / merge. Bounds digest size: an
 # unbounded summarizer can hand back a "summary" as large as its input.
 # --- compactor rebuild (2026-08-06) -------------------------------------

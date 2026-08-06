@@ -465,3 +465,41 @@ class TestPersistedCompaction:
         cap = min(PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"],
                   BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"])
         assert b.target < b.trigger <= b.hard <= cap
+
+
+class TestSummarizerResilience:
+    """2026-08-06 live regression: full-fidelity chunks made each summarizer
+    request take minutes, but the timeout was still 120s — so every chunk
+    timed out, all-or-nothing refused to compact, and the whole thing
+    repeated every turn ('it seems to continuously compact')."""
+
+    def test_timeout_fits_a_full_fidelity_chunk(self):
+        from sandbox_agent.config import COMPACTION_TIMEOUT
+        assert COMPACTION_TIMEOUT >= 300, "too short for a full-content chunk"
+
+    def test_retries_once_before_giving_up(self, monkeypatch):
+        import sandbox_agent.compaction.summarizer as s
+        calls = {"n": 0}
+
+        class _Resp:
+            def raise_for_status(self): pass
+            def json(self): return {"choices": [{"message": {"content": "recovered"}}]}
+
+        def flaky(url, json=None, timeout=None, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise s.requests.exceptions.ReadTimeout("cold model load")
+            return _Resp()
+
+        monkeypatch.setattr(s.requests, "post", flaky)
+        assert s.summarize_chunk("text") == "recovered"
+        assert calls["n"] == 2
+
+    def test_still_returns_empty_after_all_attempts(self, monkeypatch):
+        import sandbox_agent.compaction.summarizer as s
+
+        def always_fail(url, json=None, timeout=None, **kw):
+            raise s.requests.exceptions.ReadTimeout("down")
+
+        monkeypatch.setattr(s.requests, "post", always_fail)
+        assert s.summarize_chunk("text") == ""  # never raises; caller aborts safely
