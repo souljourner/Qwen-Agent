@@ -145,19 +145,27 @@ def test_select_tier_accounts_for_overhead():
 
 
 def test_llm_cfg_backstop():
-    from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
-    # Per-tier: laguna's 1M window gets an 800k backstop under its 900k
-    # budget; qwen keeps 160k (char-heuristics undercount ~16%, so the
-    # backstop needs real margin below its 196,608 ceiling).
-    assert PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"] == 800_000
+    from sandbox_agent.config import (BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG,
+                                      PRIMARY_CONTEXT_TOKENS,
+                                      SPILLABLE_CONTEXT_TOKENS)
+    # Both tiers budgeted equally at 200k/160k. laguna's vendor-claimed 1M is
+    # UNVALIDATED (128x YaRN off an 8k base, 36/48 sliding-window-512 layers,
+    # no published long-context eval); measured clean at 85k, confabulating
+    # at 275k-281k live on 2026-08-05. Raising these requires evidence.
+    assert PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"] == 160_000
     assert BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"] == 160_000
-    assert PRIMARY_LLM_CFG["context_window_tokens"] == 900_000
+    assert PRIMARY_LLM_CFG["context_window_tokens"] == 200_000
     assert BACKGROUND_LLM_CFG["context_window_tokens"] == 200_000
+    # Size-based pinning must be unreachable: compaction caps every history
+    # at budget (170k) < threshold, so no conversation gets trapped on a tier.
+    assert SPILLABLE_CONTEXT_TOKENS >= PRIMARY_CONTEXT_TOKENS
 
 
 class TestPerTierBudgets:
-    """laguna's 1M window: compaction honors a per-tier context budget while
-    chunk sizing stays pinned to the SUMMARIZER's window."""
+    """Compaction honors a per-tier context budget (passed explicitly here —
+    the 900k values exercise the PARAMETER, not the deployed config, which
+    now budgets both tiers at 200k) while chunk sizing stays pinned to the
+    SUMMARIZER's window."""
 
     def _big_history(self, n_tokens):
         # Multi-turn shape: segment_messages keeps the last 2 USER exchanges

@@ -11,17 +11,18 @@ PRIMARY_LLM_CFG = {
     "model": os.getenv("PRIMARY_MODEL", "laguna-s-2.1"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
-    # laguna supports a 1M context (prefix-caching verified 2026-07-31);
-    # compaction for turns on this tier runs against this window.
-    "context_window_tokens": int(os.getenv("PRIMARY_CONTEXT_TOKENS", "900000")),
+    # Context window: treated as EQUAL to the secondary tier (200k), NOT the
+    # vendor's claimed 1M. See PRIMARY_CONTEXT_TOKENS below for the evidence.
+    "context_window_tokens": int(os.getenv("PRIMARY_CONTEXT_TOKENS", "200000")),
     "generate_cfg": {
         # Hard backstop, NOT the primary mechanism (compaction is): if the
         # compactor misses, qwen-agent roughly truncates instead of vLLM
         # 400-ing (real ceiling 262144-65536=196608; the char estimators
         # undercounted by ~16% in the 2026-07-15 incident, hence the margin).
         # KV-cache churn from truncation is acceptable in that failure mode.
-        # laguna's 1M window: 800k backstop under the 900k compaction budget.
-        "max_input_tokens": 800000,
+        # 160k backstop, same as the secondary tier — the 800k backstop that
+        # went with the 1M claim let conversations reach 281k un-compacted.
+        "max_input_tokens": 160000,
         "request_timeout": 1800,       # rescaled per turn by compute_request_timeout
         # No temperature: the host's per-model default applies (each backend
         # knows its own model's recommended sampling better than we do).
@@ -78,12 +79,22 @@ LLM_CALL_CFG = {
 # Token budget — all models have 256k limit, we target 200k to leave room for generation
 MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "200000"))
 # laguna's raised budget (chat pinned-large-context tier); see PRIMARY_LLM_CFG.
-PRIMARY_CONTEXT_TOKENS = int(os.getenv("PRIMARY_CONTEXT_TOKENS", "900000"))
-# Pinning threshold: histories estimated above this can never fit qwen again
-# and are pinned to laguna. Estimates undercount ~16% — 150k est ≈ 174k real,
-# under qwen's 196,608 ceiling with the 160k backstop as final guard. Do NOT
-# raise past ~165k without redoing that arithmetic.
-SPILLABLE_CONTEXT_TOKENS = int(os.getenv("SPILLABLE_CONTEXT_TOKENS", "150000"))
+# Primary-tier compaction budget. Poolside CLAIMS a 1M window for
+# laguna-s-2.1, but that is a 128x YaRN extension of an 8k-trained base with
+# only 12 of 48 layers doing full attention (the other 36 are sliding-window
+# 512), and there is NO published long-context validation. Measured here
+# 2026-08-05: clean needle recall at 85k; severe confabulation (invented
+# tokens presented as quoted history, day-of-week arithmetic failing with the
+# correct date in the prompt) observed live at 275k-281k. So this tier is
+# budgeted EQUAL to the secondary until the real cliff is measured.
+# Env-overridable: raise PRIMARY_CONTEXT_TOKENS only with evidence.
+PRIMARY_CONTEXT_TOKENS = int(os.getenv("PRIMARY_CONTEXT_TOKENS", "200000"))
+# Pinning threshold: a history too large for the SECONDARY tier gets pinned to
+# the primary. With both windows equal this can never fire (compaction caps
+# every history at budget = window - reserve), which is the intent: no
+# conversation should be trapped on one tier by size. It re-activates
+# automatically if PRIMARY_CONTEXT_TOKENS is ever raised on evidence.
+SPILLABLE_CONTEXT_TOKENS = int(os.getenv("SPILLABLE_CONTEXT_TOKENS", "200000"))
 # The compaction summarizer (qwen3.6) window — CHUNK SIZING pins to this,
 # never to the raised history budget (0.4x870k chunks would overflow it).
 SUMMARIZER_CONTEXT_TOKENS = int(os.getenv("SUMMARIZER_CONTEXT_TOKENS", "200000"))

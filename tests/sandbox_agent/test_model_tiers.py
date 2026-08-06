@@ -353,5 +353,9 @@ class TestCreateAgentBudgetBinding:
         primary_agent = m.create_agent("sys", llm_cfg=PRIMARY_LLM_CFG)
         secondary_agent = m.create_agent("sys", llm_cfg=BACKGROUND_LLM_CFG)
         assert isinstance(primary_agent._precall_compact, functools.partial)
-        assert primary_agent._precall_compact.keywords["context_tokens"] == 900_000
-        assert secondary_agent._precall_compact.keywords["context_tokens"] == 200_000
+        # Both tiers budgeted at 200k after the 2026-08-05 rollback; the
+        # binding mechanism is what's under test, not the numbers.
+        assert (primary_agent._precall_compact.keywords["context_tokens"]
+                == PRIMARY_LLM_CFG["context_window_tokens"])
+        assert (secondary_agent._precall_compact.keywords["context_tokens"]
+                == BACKGROUND_LLM_CFG["context_window_tokens"])

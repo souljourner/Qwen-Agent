@@ -327,7 +327,10 @@ class LockingAgent(Assistant):
         # 1. Image-bearing history → SECONDARY only (qwen is multimodal;
         #    laguna is text-only — capability beats capacity).
         # 2. History too big for qwen (> SPILLABLE_CONTEXT_TOKENS) → PRIMARY
-        #    only (laguna's 1M window; it can never fit qwen again).
+        #    only (the larger-window tier; it can never fit qwen again).
+        #    NOTE: with both tiers budgeted equally this cannot fire — see
+        #    PRIMARY_CONTEXT_TOKENS in config.py for why laguna is not trusted
+        #    at its claimed 1M.
         # 3. Otherwise: prefer primary, spill to secondary.
         # All-slots-busy in any mode → WAIT with a visible notice.
         msg_objs = msg_list if messages else []
