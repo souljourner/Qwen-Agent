@@ -426,3 +426,85 @@ class TestResume:
 
         assert entry_calls == 0, f"entry path made {entry_calls} summarizer calls"
         assert persist_calls > 0, "end-of-turn path did not summarize"
+
+
+class TestArchiveSurvivesSidecarLoss:
+    """If the sidecar is lost/corrupted, resume rebuilds the FULL raw
+    conversation from chat.db and the next compaction re-archives messages
+    already on disk — replay would then double-count them."""
+
+    def _msgs(self, n, tag="m"):
+        return [Message(role=USER, content=f"{tag}{i} " + "x" * 500) for i in range(n)]
+
+    def test_re_archiving_the_same_prefix_does_not_duplicate(self, tmp_path, monkeypatch):
+        from sandbox_agent.compaction import archive
+        monkeypatch.setattr(archive, "DATA_DIR", str(tmp_path))
+        monkeypatch.setattr(archive, "_archive_path", lambda t: str(tmp_path / f"{t}.raw.jsonl"))
+
+        first = self._msgs(40)
+        assert archive.archive_append("t", first)
+        assert len(archive.load_archive("t")) == 40
+
+        # sidecar lost -> rebuild -> compaction archives the same prefix plus
+        # 10 messages that were never archived
+        again = first + self._msgs(10, tag="new")
+        assert archive.archive_append("t", again), (
+            "must still authorize destruction — those messages ARE preserved")
+
+        replay = archive.load_archive("t")
+        assert len(replay) == 50, f"expected 50 unique archived messages, got {len(replay)}"
+        contents = [str(m.content) for m in replay]
+        assert len(contents) == len(set(contents)), "duplicate messages in archive replay"
+
+        # Assert on the BYTES, not just the replay — otherwise read-time
+        # dedupe alone satisfies this test and the write-time layer is
+        # untested (the archive would still grow without bound).
+        stored = 0
+        with open(str(tmp_path / "t.raw.jsonl")) as f:
+            for line in f:
+                if line.strip():
+                    stored += len(__import__("json").loads(line)["messages"])
+        assert stored == 50, f"{stored} messages written to disk; 10 should be new"
+
+    def test_genuinely_repeated_messages_are_not_collapsed(self, tmp_path, monkeypatch):
+        """Dedupe is LEADING-run only: a user really saying 'yes' twice must
+        survive as two messages."""
+        from sandbox_agent.compaction import archive
+        monkeypatch.setattr(archive, "_archive_path", lambda t: str(tmp_path / f"{t}.raw.jsonl"))
+
+        yes = Message(role=USER, content="yes")
+        archive.archive_append("t", [Message(role=USER, content="start"), yes,
+                                     Message(role=ASSISTANT, content="ok"), yes])
+        replay = archive.load_archive("t")
+        assert sum(1 for m in replay if str(m.content) == "yes") == 2, (
+            "collapsed a genuinely repeated message")
+
+    def test_fully_redundant_archive_still_authorizes_destruction(self, tmp_path, monkeypatch):
+        from sandbox_agent.compaction import archive
+        monkeypatch.setattr(archive, "_archive_path", lambda t: str(tmp_path / f"{t}.raw.jsonl"))
+
+        msgs = self._msgs(20)
+        assert archive.archive_append("t", msgs)
+        assert archive.archive_append("t", msgs) is True, (
+            "returned False for already-preserved messages — compaction would "
+            "refuse to proceed forever")
+        assert len(archive.load_archive("t")) == 20
+
+    def test_legacy_duplicate_segments_replay_cleanly(self, tmp_path, monkeypatch):
+        """Archives written BEFORE write-time dedupe existed can already hold
+        an overlapping segment; replay must still be correct."""
+        import json as _json
+        from sandbox_agent.compaction import archive
+        path = tmp_path / "t.raw.jsonl"
+        monkeypatch.setattr(archive, "_archive_path", lambda t: str(path))
+
+        first = [Message(role=USER, content=f"m{i}") for i in range(10)]
+        overlapping = first + [Message(role=USER, content="brand-new")]
+        with open(path, "w") as f:                      # bypass archive_append
+            for seg in (first, overlapping):
+                f.write(_json.dumps({"ts": "x", "count": len(seg),
+                                     "messages": [m.model_dump(mode="json") for m in seg]}) + "\n")
+
+        replay = archive.load_archive("t")
+        assert len(replay) == 11, f"legacy overlap not handled: got {len(replay)}"
+        assert str(replay[-1].content) == "brand-new"

@@ -11,13 +11,21 @@ across a long conversation). Replaying every segment in order and appending
 the current sidecar reconstructs the full raw conversation.
 
 Mirrors the archive-then-compact pattern already used for MEMORIES.md.
+
+Appends are idempotent at the leading edge. If the sidecar is ever lost or
+corrupted, resume rebuilds the FULL raw conversation from chat.db, and the
+next compaction would re-archive messages already on disk — so replaying
+the segments would double-count them. Rather than trust that never to
+happen, `archive_append` skips the leading run of messages it has already
+archived. That also covers a retried or double-run compaction.
 """
 
+import hashlib
 import json
 import logging
 import os
 import time
-from typing import List
+from typing import List, Set
 
 from qwen_agent.llm.schema import Message
 
@@ -31,11 +39,55 @@ def _archive_path(thread_id: str) -> str:
     return _path(thread_id).replace(".json", ".raw.jsonl")
 
 
+def _fingerprint(msg) -> str:
+    """Stable identity for a message, independent of object identity."""
+    if hasattr(msg, "model_dump"):
+        d = msg.model_dump(mode="json")
+    else:
+        d = dict(msg or {})
+    fc = d.get("function_call") or {}
+    parts = [str(d.get("role") or ""), str(d.get("name") or ""),
+             str(d.get("content") or ""),
+             str(fc.get("name") or ""), str(fc.get("arguments") or "")]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8", "replace")).hexdigest()
+
+
+def _archived_fingerprints(path: str) -> Set[str]:
+    out: Set[str] = set()
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                for raw in json.loads(line).get("messages", []):
+                    out.add(_fingerprint(raw))
+    except Exception:  # noqa: BLE001 — unreadable archive: dedupe nothing
+        logger.exception("Could not read archive fingerprints for %s", path)
+    return out
+
+
+def _strip_already_archived(messages: List[Message], known: Set[str]) -> List[Message]:
+    """Drop the LEADING run of messages already on disk.
+
+    Leading-only, deliberately: a re-archive after a chat.db rebuild repeats
+    a PREFIX of the conversation. Deduping every position would collapse
+    genuinely repeated messages (a user saying "yes" twice) into one.
+    """
+    i = 0
+    while i < len(messages) and _fingerprint(messages[i]) in known:
+        i += 1
+    return messages[i:]
+
+
 def archive_append(thread_id: str, messages: List[Message]) -> bool:
     """Append destroyed messages as one JSONL segment.
 
-    Returns True only if the bytes are durably written — the caller MUST
-    NOT destroy anything when this returns False.
+    Returns True only if the destroyed messages are durably on disk — the
+    caller MUST NOT destroy anything when this returns False. Messages
+    already archived count as preserved, so skipping them still returns True.
     """
     if not thread_id:
         return False
@@ -48,6 +100,17 @@ def archive_append(thread_id: str, messages: List[Message]) -> bool:
             logger.error("Raw archive for %s exceeds %d bytes — refusing to "
                          "destroy more history", thread_id, COMPACTION_ARCHIVE_MAX_BYTES)
             return False
+
+        original_count = len(messages)
+        messages = _strip_already_archived(messages, _archived_fingerprints(path))
+        skipped = original_count - len(messages)
+        if skipped:
+            logger.info("Archive for %s: %d of %d messages already archived "
+                        "(sidecar was likely rebuilt from chat.db) — skipping them",
+                        thread_id, skipped, original_count)
+        if not messages:
+            return True  # everything already preserved
+
         segment = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "count": len(messages),
@@ -65,9 +128,17 @@ def archive_append(thread_id: str, messages: List[Message]) -> bool:
 
 
 def load_archive(thread_id: str) -> List[Message]:
-    """Replay every archived segment in order (oldest first)."""
+    """Replay every archived segment in order (oldest first).
+
+    Defensive mirror of the write-time rule: a segment's LEADING run of
+    already-seen messages is skipped, so legacy segments written before
+    write-time dedupe still replay cleanly. Deliberately not a global
+    per-message dedupe — that would collapse genuinely repeated messages
+    (a user saying "yes" twice) into one.
+    """
     path = _archive_path(thread_id)
     out: List[Message] = []
+    seen: Set[str] = set()
     if not os.path.exists(path):
         return out
     try:
@@ -76,7 +147,12 @@ def load_archive(thread_id: str) -> List[Message]:
                 line = line.strip()
                 if not line:
                     continue
-                for raw in json.loads(line).get("messages", []):
+                raws = json.loads(line).get("messages", [])
+                start = 0
+                while start < len(raws) and _fingerprint(raws[start]) in seen:
+                    start += 1
+                for raw in raws[start:]:
+                    seen.add(_fingerprint(raw))
                     try:
                         out.append(Message(**raw))
                     except Exception:  # noqa: BLE001
