@@ -9,6 +9,8 @@ import logging
 
 import requests
 
+from sandbox_agent.compaction import breaker
+
 from sandbox_agent.config import (COMPACTION_ATTEMPTS, COMPACTION_CHUNK_MAX_TOKENS,
                                    COMPACTION_MODEL, COMPACTION_TIMEOUT, COMPACTION_URL)
 
@@ -93,16 +95,32 @@ def _call_ollama(system_prompt: str, user_prompt: str) -> str:
     transient failure (notably a cold model load on the lazily-spawning
     proxy) would otherwise abandon the whole compaction and repeat it next
     turn — minutes of work thrown away each time.
+
+    Guarded by a circuit breaker so that a summarizer which is genuinely
+    down makes compaction fail FAST rather than stalling every turn for the
+    full timeout budget. See compaction/breaker.py.
     """
-    last_error = None
+    if breaker.is_open():
+        logger.warning("Compaction summarizer breaker OPEN — skipping call "
+                       "(history left intact). Status: %s", breaker.status())
+        return ""
     for attempt in range(max(1, COMPACTION_ATTEMPTS)):
-        result = _attempt_call(system_prompt, user_prompt, attempt)
+        result, timed_out = _attempt_call(system_prompt, user_prompt, attempt)
         if result:
+            breaker.record_success()
             return result
+        if timed_out:
+            # A timeout already consumed the whole budget; retrying it just
+            # doubles the stall the user is sitting through. Only fast
+            # failures (connection refused, 5xx, cold-start) are worth a
+            # second try.
+            break
+    breaker.record_failure()
     return ""
 
 
-def _attempt_call(system_prompt: str, user_prompt: str, attempt: int) -> str:
+def _attempt_call(system_prompt: str, user_prompt: str, attempt: int):
+    """Returns (text, timed_out). Empty text means this attempt failed."""
     try:
         from sandbox_agent.model_tracker import model_start, model_done
         model_start(COMPACTION_MODEL, "context compaction")
@@ -126,7 +144,7 @@ def _attempt_call(system_prompt: str, user_prompt: str, attempt: int) -> str:
         resp.raise_for_status()
         result = resp.json()["choices"][0]["message"].get("content", "")
         model_done(COMPACTION_MODEL)
-        return result
+        return result, False
     except Exception as e:
         logger.warning("Compaction summarizer attempt %d/%d failed: %s",
                        attempt + 1, COMPACTION_ATTEMPTS, e)
@@ -135,4 +153,4 @@ def _attempt_call(system_prompt: str, user_prompt: str, attempt: int) -> str:
             model_done(COMPACTION_MODEL)
         except Exception:
             pass
-        return ""
+        return "", isinstance(e, requests.exceptions.Timeout)

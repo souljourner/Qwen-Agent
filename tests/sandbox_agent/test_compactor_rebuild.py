@@ -477,8 +477,13 @@ class TestSummarizerResilience:
         from sandbox_agent.config import COMPACTION_TIMEOUT
         assert COMPACTION_TIMEOUT >= 300, "too short for a full-content chunk"
 
-    def test_retries_once_before_giving_up(self, monkeypatch):
+    def test_retries_a_fast_failure_before_giving_up(self, monkeypatch):
+        """A connection error is cheap to retry and often just a cold model
+        spawn. (A TIMEOUT is deliberately NOT retried — see
+        test_compaction_workflow.TestRetryPolicy.)"""
         import sandbox_agent.compaction.summarizer as s
+        from sandbox_agent.compaction import breaker
+        breaker.reset()
         calls = {"n": 0}
 
         class _Resp:
@@ -488,7 +493,7 @@ class TestSummarizerResilience:
         def flaky(url, json=None, timeout=None, **kw):
             calls["n"] += 1
             if calls["n"] == 1:
-                raise s.requests.exceptions.ReadTimeout("cold model load")
+                raise s.requests.exceptions.ConnectionError("model still spawning")
             return _Resp()
 
         monkeypatch.setattr(s.requests, "post", flaky)
@@ -497,6 +502,8 @@ class TestSummarizerResilience:
 
     def test_still_returns_empty_after_all_attempts(self, monkeypatch):
         import sandbox_agent.compaction.summarizer as s
+        from sandbox_agent.compaction import breaker
+        breaker.reset()
 
         def always_fail(url, json=None, timeout=None, **kw):
             raise s.requests.exceptions.ReadTimeout("down")

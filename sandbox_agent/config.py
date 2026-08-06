@@ -132,6 +132,13 @@ COMPACTION_MAX_IDENTIFIERS = 12            # unique identifiers to preserve
 COMPACTION_TIMEOUT = int(os.getenv("COMPACTION_TIMEOUT", "600"))
 # One retry: the first request may be paying for a cold model load.
 COMPACTION_ATTEMPTS = int(os.getenv("COMPACTION_ATTEMPTS", "2"))
+# Circuit breaker. With a 600s timeout, a dead summarizer would otherwise
+# stall EVERY turn for timeout x attempts x chunks. Fail fast instead.
+# 1, not 2: a recorded failure already means the in-call retry was
+# exhausted, and at a 600s timeout a second failing turn would stall the
+# chat another 10 minutes to learn what we already know.
+COMPACTION_BREAKER_THRESHOLD = int(os.getenv("COMPACTION_BREAKER_THRESHOLD", "1"))
+COMPACTION_BREAKER_COOLDOWN = int(os.getenv("COMPACTION_BREAKER_COOLDOWN", "900"))
 # Max tokens for ONE chunk summary / merge. Bounds digest size: an
 # unbounded summarizer can hand back a "summary" as large as its input.
 # --- compactor rebuild (2026-08-06) -------------------------------------
