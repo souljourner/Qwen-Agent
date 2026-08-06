@@ -1074,13 +1074,15 @@ def _compaction_budgets():
 def _persist_compaction(thread_id, history) -> None:
     """Compact the stored history in place, once it exceeds the trigger.
 
-    Transactional: the ladder is pure, and nothing is destroyed until the
-    destroyed delta is durably archived. `history` is mutated IN PLACE
+    Transactional: the ladder is pure. Nothing needs a private archive —
+    chat.db already holds every step (Chainlit persists them during the turn,
+    unconditionally, via @cl.data_layer), and that is exactly what
+    `session_search` reads. Compaction shrinks what the agent CARRIES, not
+    what it can REACH. `history` is mutated IN PLACE
     (slice-assign) because the list is aliased into cl.user_session and the
     notifier loop; rebinding here would silently drop anything appended
     while summarization was running.
     """
-    from sandbox_agent.compaction.archive import archive_append
     from sandbox_agent.compaction.policy import compact_for_persistence
     from sandbox_agent.token_budget import estimate_messages_tokens
 
@@ -1095,17 +1097,15 @@ def _persist_compaction(thread_id, history) -> None:
             if result.error:
                 logger.warning("Compaction made no progress: %s", result.error)
             return
-        if not archive_append(thread_id, result.archived):
-            logger.error("Raw archive failed — keeping full history uncompacted")
-            return
-
         # Splice: anything the notifier appended while we were compacting
         # lives past the snapshot and must survive.
         appended_since = history[len(snapshot):]
         history[:] = result.messages + appended_since
-        logger.info("Persisted compaction for %s: %d -> %d tokens (%s)",
+        logger.info("Persisted compaction for %s: %d -> %d tokens (%s); "
+                    "%d messages folded into the digest — their full text stays "
+                    "in chat.db and is retrievable via session_search",
                     thread_id, result.before_tokens, result.after_tokens,
-                    "+".join(result.levels) or "none")
+                    "+".join(result.levels) or "none", len(result.archived))
     except Exception:  # noqa: BLE001 — never break a turn over housekeeping
         logger.exception("Persisted compaction failed; history left intact")
 

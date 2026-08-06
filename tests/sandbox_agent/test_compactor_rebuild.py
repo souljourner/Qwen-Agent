@@ -359,37 +359,17 @@ class TestLadder:
         assert [str(m.content) for m in msgs] == snapshot
 
 
-class TestArchive:
-
-    def test_roundtrip_and_delta_only(self, tmp_path, monkeypatch):
-        import sandbox_agent.chat_history as ch
-        from sandbox_agent.compaction import archive
-        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
-        a = [Message(role=USER, content="first"), Message(role=ASSISTANT, content="second")]
-        b = [Message(role=USER, content="third")]
-        assert archive.archive_append("t1", a)
-        assert archive.archive_append("t1", b)
-        loaded = archive.load_archive("t1")
-        assert [str(m.content) for m in loaded] == ["first", "second", "third"]
-
-    def test_empty_delta_is_success(self, tmp_path, monkeypatch):
-        import sandbox_agent.chat_history as ch
-        from sandbox_agent.compaction import archive
-        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
-        assert archive.archive_append("t2", []) is True
-
-
 class TestPersistedCompaction:
     """The wiring: compaction must COMMIT into the stored history, exactly
-    once per overflow, and never destroy anything that isn't archived."""
+    once per overflow. Durability is chat.db's job (Chainlit persists every
+    step during the turn), so there is no private archive to gate on."""
 
     def _history(self, n=40):
         return [m for i in range(n) for m in _turn(i, tool_chars=20_000, args_chars=8_000)]
 
-    def test_compacts_in_place_and_archives_delta(self, tmp_path, monkeypatch):
+    def test_compacts_in_place(self, tmp_path, monkeypatch):
         import sandbox_agent.chat_app as ca
         import sandbox_agent.chat_history as ch
-        from sandbox_agent.compaction import archive
         monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
         _stub_summarizer(monkeypatch)
 
@@ -397,7 +377,6 @@ class TestPersistedCompaction:
         before = len(history)
         ca._persist_compaction("thr", history)
         assert len(history) < before, "compaction did not commit into the list"
-        assert archive.load_archive("thr"), "destroyed messages were not archived"
 
     def test_second_call_is_a_noop(self, tmp_path, monkeypatch):
         import sandbox_agent.chat_app as ca
@@ -416,18 +395,6 @@ class TestPersistedCompaction:
         ca._persist_compaction("thr", history)
         assert calls["n"] == 0, "re-compacted an already-compacted history"
         assert [str(m.content) for m in history] == after_first
-
-    def test_nothing_destroyed_when_archive_fails(self, tmp_path, monkeypatch):
-        import sandbox_agent.chat_app as ca
-        import sandbox_agent.chat_history as ch
-        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
-        _stub_summarizer(monkeypatch)
-        monkeypatch.setattr("sandbox_agent.compaction.archive.archive_append",
-                            lambda *a, **k: False)
-        history = self._history()
-        snapshot = [str(m.content) for m in history]
-        ca._persist_compaction("thr", history)
-        assert [str(m.content) for m in history] == snapshot
 
     def test_notifier_append_during_compaction_survives(self, tmp_path, monkeypatch):
         import sandbox_agent.chat_app as ca

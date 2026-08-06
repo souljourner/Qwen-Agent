@@ -112,6 +112,12 @@ def render_digest(durable: List[str], working: str, summarized_count: int) -> st
         f"to save context space. This is an automated digest, not a message from "
         f"the user. Recent messages follow verbatim.]",
         "",
+        "The full text of those messages was NOT deleted — it is still searchable. "
+        "If this digest lacks a detail you need (an exact number, a file path, what "
+        "was decided, what a tool returned), call `session_search` to retrieve it "
+        "before answering. Say you do not know only after searching, and never "
+        "guess at a detail that predates this digest.",
+        "",
         DURABLE_HEADER,
     ]
     body.extend(durable or ["- (none recorded yet)"])

@@ -160,7 +160,6 @@ COMPACTION_DIGEST_DURABLE_MAX_TOKENS = int(os.getenv("COMPACTION_DIGEST_DURABLE_
 # it changes how the model sees its own past actions; A/B before enabling.
 COMPACTION_POINTERS_ENABLED = os.getenv("COMPACTION_POINTERS_ENABLED", "false").lower() == "true"
 POINTER_MIN_CHARS = int(os.getenv("POINTER_MIN_CHARS", "2000"))
-COMPACTION_ARCHIVE_MAX_BYTES = int(os.getenv("COMPACTION_ARCHIVE_MAX_BYTES", str(200 * 1024 * 1024)))
 COMPACTION_CHUNK_MAX_TOKENS = int(os.getenv("COMPACTION_CHUNK_MAX_TOKENS", "4096"))
 COMPACTION_MODEL = os.getenv("COMPACTION_MODEL", "qwen3.6-27b-linux")
 COMPACTION_URL = os.getenv("COMPACTION_URL", "http://192.168.4.66:8000")
