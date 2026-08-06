@@ -377,3 +377,91 @@ class TestArchive:
         from sandbox_agent.compaction import archive
         monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
         assert archive.archive_append("t2", []) is True
+
+
+class TestPersistedCompaction:
+    """The wiring: compaction must COMMIT into the stored history, exactly
+    once per overflow, and never destroy anything that isn't archived."""
+
+    def _history(self, n=40):
+        return [m for i in range(n) for m in _turn(i, tool_chars=20_000, args_chars=8_000)]
+
+    def test_compacts_in_place_and_archives_delta(self, tmp_path, monkeypatch):
+        import sandbox_agent.chat_app as ca
+        import sandbox_agent.chat_history as ch
+        from sandbox_agent.compaction import archive
+        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
+        _stub_summarizer(monkeypatch)
+
+        history = self._history()
+        before = len(history)
+        ca._persist_compaction("thr", history)
+        assert len(history) < before, "compaction did not commit into the list"
+        assert archive.load_archive("thr"), "destroyed messages were not archived"
+
+    def test_second_call_is_a_noop(self, tmp_path, monkeypatch):
+        import sandbox_agent.chat_app as ca
+        import sandbox_agent.chat_history as ch
+        import sandbox_agent.compaction.summarizer as s
+        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
+        _stub_summarizer(monkeypatch)
+
+        history = self._history()
+        ca._persist_compaction("thr", history)
+        after_first = [str(m.content) for m in history]
+
+        calls = {"n": 0}
+        monkeypatch.setattr(s, "summarize_chunk",
+                            lambda t: calls.__setitem__("n", calls["n"] + 1) or "x")
+        ca._persist_compaction("thr", history)
+        assert calls["n"] == 0, "re-compacted an already-compacted history"
+        assert [str(m.content) for m in history] == after_first
+
+    def test_nothing_destroyed_when_archive_fails(self, tmp_path, monkeypatch):
+        import sandbox_agent.chat_app as ca
+        import sandbox_agent.chat_history as ch
+        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
+        _stub_summarizer(monkeypatch)
+        monkeypatch.setattr("sandbox_agent.compaction.archive.archive_append",
+                            lambda *a, **k: False)
+        history = self._history()
+        snapshot = [str(m.content) for m in history]
+        ca._persist_compaction("thr", history)
+        assert [str(m.content) for m in history] == snapshot
+
+    def test_notifier_append_during_compaction_survives(self, tmp_path, monkeypatch):
+        import sandbox_agent.chat_app as ca
+        import sandbox_agent.chat_history as ch
+        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
+        history = self._history()
+
+        # simulate the notifier appending mid-summarization
+        def racing_compact(snapshot, *, target_tokens, allow_llm=True):
+            from sandbox_agent.compaction.policy import CompactionResult
+            history.append(Message(role=USER, content="LATE ARRIVAL",
+                                   extra={"synthetic": "notifier"}))
+            return CompactionResult(messages=snapshot[:5], changed=True,
+                                    archived=snapshot[5:], before_tokens=9, after_tokens=1)
+
+        monkeypatch.setattr("sandbox_agent.compaction.policy.compact_for_persistence",
+                            racing_compact)
+        ca._persist_compaction("thr", history)
+        assert any(str(m.content) == "LATE ARRIVAL" for m in history), \
+            "a message appended during compaction was lost"
+
+    def test_under_trigger_does_nothing(self, tmp_path, monkeypatch):
+        import sandbox_agent.chat_app as ca
+        import sandbox_agent.compaction.summarizer as s
+        monkeypatch.setattr(s, "summarize_chunk",
+                            lambda t: pytest.fail("compacted a small history"))
+        history = [Message(role=USER, content="hi"), Message(role=ASSISTANT, content="hello")]
+        ca._persist_compaction("thr", history)
+        assert len(history) == 2
+
+    def test_budgets_use_the_tighter_tier(self):
+        import sandbox_agent.chat_app as ca
+        from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
+        b = ca._compaction_budgets()
+        cap = min(PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"],
+                  BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"])
+        assert b.target < b.trigger <= b.hard <= cap

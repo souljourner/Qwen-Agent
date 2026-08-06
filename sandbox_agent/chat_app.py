@@ -391,7 +391,11 @@ async def _completion_notifier_loop() -> None:
                         if hist is None:
                             hist = []
                             cl.user_session.set(HISTORY_KEY, hist)
-                        hist.append(Message(role="user", content=agent_line))
+                        # extra marks this as machine chatter, not the
+                        # user speaking — the retention ladder protects
+                        # real user text far more aggressively.
+                        hist.append(Message(role="user", content=agent_line,
+                                            extra={"synthetic": "notifier"}))
                         # 3. Trigger a synthetic agent turn right now so it can
                         # follow up (read a result file, schedule the next step,
                         # send a notification) without waiting for the user.
@@ -1055,6 +1059,57 @@ def _get_turn_lock() -> asyncio.Lock:
     return lock
 
 
+def _compaction_budgets():
+    """Thresholds for the tier that will serve the NEXT turn. That tier is
+    unknown here, so use the tighter of the two — a history that fits the
+    smaller one fits either."""
+    from sandbox_agent.compaction.budget import derive_budgets
+    from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
+    both = [derive_budgets(c["context_window_tokens"],
+                           c["generate_cfg"]["max_input_tokens"])
+            for c in (PRIMARY_LLM_CFG, BACKGROUND_LLM_CFG)]
+    return min(both, key=lambda b: b.target)
+
+
+def _persist_compaction(thread_id, history) -> None:
+    """Compact the stored history in place, once it exceeds the trigger.
+
+    Transactional: the ladder is pure, and nothing is destroyed until the
+    destroyed delta is durably archived. `history` is mutated IN PLACE
+    (slice-assign) because the list is aliased into cl.user_session and the
+    notifier loop; rebinding here would silently drop anything appended
+    while summarization was running.
+    """
+    from sandbox_agent.compaction.archive import archive_append
+    from sandbox_agent.compaction.policy import compact_for_persistence
+    from sandbox_agent.token_budget import estimate_messages_tokens
+
+    try:
+        budgets = _compaction_budgets()
+        snapshot = list(history)
+        if estimate_messages_tokens(snapshot) <= budgets.trigger:
+            return
+
+        result = compact_for_persistence(snapshot, target_tokens=budgets.target)
+        if not result.changed:
+            if result.error:
+                logger.warning("Compaction made no progress: %s", result.error)
+            return
+        if not archive_append(thread_id, result.archived):
+            logger.error("Raw archive failed — keeping full history uncompacted")
+            return
+
+        # Splice: anything the notifier appended while we were compacting
+        # lives past the snapshot and must survive.
+        appended_since = history[len(snapshot):]
+        history[:] = result.messages + appended_since
+        logger.info("Persisted compaction for %s: %d -> %d tokens (%s)",
+                    thread_id, result.before_tokens, result.after_tokens,
+                    "+".join(result.levels) or "none")
+    except Exception:  # noqa: BLE001 — never break a turn over housekeeping
+        logger.exception("Persisted compaction failed; history left intact")
+
+
 async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Optional[Message] = None) -> None:
     """Run one agent turn against `history` (last item = the triggering message —
     user message, or a synthesized [system: …] line from the notifier).
@@ -1243,6 +1298,12 @@ async def _execute_agent_turn(agent, history: List[Message], *, log_user_msg: Op
         ):
             history.append(msg)
     cl.user_session.set(HISTORY_KEY, history)
+    # PERSISTED COMPACTION. Compaction used to run on a throwaway deepcopy
+    # inside the agent, so it repeated every turn and regenerated a
+    # different digest each time (the agent's memory silently changed
+    # between turns, and the KV prefix never matched). Committing it here
+    # makes it once-per-overflow and keeps the next turn's prefix stable.
+    _persist_compaction(thread_id, history)
     # Persist the agent-side history sidecar so a reload/restart restores this
     # exact context (incl. tool results) instead of the text-only rebuild.
     from sandbox_agent.chat_history import save_history
