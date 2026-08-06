@@ -183,3 +183,65 @@ class TestAggregateToolBudget:
         once = compactor.truncate_tool_results(msgs, total_budget_chars=50_000)
         twice = compactor.truncate_tool_results(once, total_budget_chars=50_000)
         assert str(once[0].content) == str(twice[0].content)
+
+
+class TestPointers:
+    """L0: replace recoverable bulk with pointers — allow-list only."""
+
+    def _write(self, path="notes.md", mode=None, n=20_000, name="project_write_file"):
+        args = {"project": "p", "path": path, "content": "X" * n}
+        if mode:
+            args["mode"] = mode
+        return Message(role=ASSISTANT, content="",
+                       function_call=FunctionCall(name=name, arguments=json.dumps(args)))
+
+    def test_large_write_becomes_pointer_with_valid_json(self):
+        from sandbox_agent.compaction.pointers import pointerize
+        msgs = [self._write("a.md"), self._write("b.md")]  # b is newest for b.md
+        out, saved = pointerize(msgs)
+        args = json.loads(out[0].function_call.arguments)
+        assert saved > 10_000
+        assert "elided" in args["content"] and "sha256:" in args["content"]
+        assert set(args) == {"project", "path", "content"}  # shape preserved
+
+    def test_tail_is_the_only_inline_protection(self):
+        # Uniform rule: everything eligible outside the protected tail is
+        # pointer-ized. The tail is where "just wrote it, may edit next"
+        # lives, so no extra per-path carve-out is needed.
+        from sandbox_agent.compaction.pointers import pointerize
+        msgs = [self._write("same.md"), self._write("same.md")]
+        out, _ = pointerize(msgs, protect_indices={1})
+        assert "elided" in json.loads(out[0].function_call.arguments)["content"]
+        assert "X" * 100 in json.loads(out[1].function_call.arguments)["content"]
+
+    def test_edit_mode_never_pointerized(self):
+        from sandbox_agent.compaction.pointers import pointerize
+        msgs = [self._write("a.md", mode="edit"), self._write("z.md")]
+        out, _ = pointerize(msgs)
+        assert "X" * 100 in json.loads(out[0].function_call.arguments)["content"]
+
+    def test_forbidden_tools_untouched(self):
+        from sandbox_agent.compaction.pointers import pointerize
+        for tool in ("project_apply_patch", "code_interpreter", "exec", "send_email"):
+            msgs = [self._write("a.md", name=tool), self._write("z.md")]
+            out, _ = pointerize(msgs)
+            assert "X" * 100 in out[0].function_call.arguments, tool
+
+    def test_protected_indices_untouched(self):
+        from sandbox_agent.compaction.pointers import pointerize
+        msgs = [self._write("a.md"), self._write("z.md")]
+        out, _ = pointerize(msgs, protect_indices={0})
+        assert "X" * 100 in out[0].function_call.arguments
+
+    def test_small_writes_and_malformed_args_skipped(self):
+        from sandbox_agent.compaction.pointers import pointerize
+        small = self._write("s.md", n=50)
+        bad = Message(role=ASSISTANT, content="",
+                      function_call=FunctionCall(name="project_write_file", arguments="{not json"))
+        out, saved = pointerize([small, bad])
+        assert saved == 0, "neither a small write nor malformed args may be touched"
+        assert out[1].function_call.arguments == "{not json"
+
+    def test_ships_disabled_by_default(self):
+        from sandbox_agent.config import COMPACTION_POINTERS_ENABLED
+        assert COMPACTION_POINTERS_ENABLED is False
