@@ -140,12 +140,15 @@ def summarize_history(messages: List[Message]) -> List[Message]:
             chunk_text += failures_text
 
         summary = summarize_chunk(chunk_text)
-        if summary:
-            summaries.append(summary)
-
-    if not summaries:
-        logger.warning("Compaction: all chunk summarizations failed, falling back to original messages")
-        return messages
+        if not summary:
+            # ALL-OR-NOTHING. Previously a failed chunk was skipped and the
+            # remaining summaries still became the digest — silently DELETING
+            # the material those failed chunks covered. Aborting leaves the
+            # history intact; the caller retries next turn.
+            logger.warning("Compaction: chunk %d/%d failed to summarize — aborting "
+                           "compaction (history left intact)", i + 1, len(chunks))
+            return messages
+        summaries.append(summary)
 
     # Merge if multiple chunks
     final_summary = merge_summaries(summaries, identifiers)
@@ -400,23 +403,37 @@ def quality_audit(summary: str, identifiers: Set[str], latest_user_ask: str) -> 
     return len(issues) == 0, issues
 
 
-def _messages_to_text(messages: List[Message]) -> str:
-    """Render messages to plain text for summarization."""
+def _messages_to_text(messages: List[Message], *, char_budget: Optional[int] = None) -> str:
+    """Render messages to plain text for summarization.
+
+    FULL FIDELITY by design. This used to truncate every message inline
+    (tool results 8k chars, user/assistant 4k, function_call args 500) while
+    build_chunks MEASURED the same messages at full size — a ~50x gap that
+    handed the summarizer ~2% of the conversation and produced the
+    2026-08-06 "compacted 281k into 13.4k and knows nothing" incident.
+    Chunks are already sized to the summarizer's window by build_chunks, so
+    rendering everything is correct by construction; `char_budget` is only a
+    belt-and-braces guard against a mis-sized chunk."""
     parts = []
     for msg in messages:
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
+        content = msg.content if isinstance(msg.content, str) else str(msg.content or "")
         if msg.role == "function":
             name = msg.name or "tool"
-            parts.append(f"[Tool Result: {name}]\n{content[:8000]}")
+            parts.append(f"[Tool Result: {name}]\n{content}")
         elif msg.role == "assistant":
             if msg.function_call:
                 fc = msg.function_call
-                parts.append(f"[Assistant calls tool: {fc.name}({fc.arguments[:500]})]\n{content[:4000]}")
+                parts.append(f"[Assistant calls tool: {fc.name}({fc.arguments})]\n{content}")
             else:
-                parts.append(f"[Assistant]\n{content[:4000]}")
+                parts.append(f"[Assistant]\n{content}")
         elif msg.role == "user":
-            parts.append(f"[User]\n{content[:4000]}")
-    return "\n\n".join(parts)
+            parts.append(f"[User]\n{content}")
+    text = "\n\n".join(parts)
+    if char_budget and len(text) > char_budget:
+        logger.warning("Chunk render %d chars exceeds budget %d — head/tail guard applied",
+                       len(text), char_budget)
+        text = _head_tail_truncate(text, char_budget, COMPACTION_TOOL_RESULT_MIN_KEEP)
+    return text
 
 
 def _find_latest_user_ask(messages: List[Message]) -> str:

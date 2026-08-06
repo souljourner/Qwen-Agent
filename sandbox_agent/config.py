@@ -122,6 +122,9 @@ COMPACTION_MAX_FAILURES = 8                # tool failures to extract
 COMPACTION_FAILURE_CHARS = 240             # chars per failure summary
 COMPACTION_MAX_IDENTIFIERS = 12            # unique identifiers to preserve
 COMPACTION_TIMEOUT = int(os.getenv("COMPACTION_TIMEOUT", "120"))
+# Max tokens for ONE chunk summary / merge. Bounds digest size: an
+# unbounded summarizer can hand back a "summary" as large as its input.
+COMPACTION_CHUNK_MAX_TOKENS = int(os.getenv("COMPACTION_CHUNK_MAX_TOKENS", "4096"))
 COMPACTION_MODEL = os.getenv("COMPACTION_MODEL", "qwen3.6-27b-linux")
 COMPACTION_URL = os.getenv("COMPACTION_URL", "http://192.168.4.66:8000")
 

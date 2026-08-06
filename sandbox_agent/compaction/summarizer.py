@@ -9,7 +9,8 @@ import logging
 
 import requests
 
-from sandbox_agent.config import COMPACTION_MODEL, COMPACTION_TIMEOUT, COMPACTION_URL
+from sandbox_agent.config import (COMPACTION_CHUNK_MAX_TOKENS, COMPACTION_MODEL,
+                                   COMPACTION_TIMEOUT, COMPACTION_URL)
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,11 @@ def _call_ollama(system_prompt: str, user_prompt: str) -> str:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
                 ],
+                # Bound the digest so a rambling summary can't blow the budget
+                # we just spent effort computing. NOTE: temperature is
+                # deliberately NOT sent — host per-model defaults apply
+                # (standing instruction; see commit e7f458c). Do not re-add.
+                "max_tokens": COMPACTION_CHUNK_MAX_TOKENS,
             },
             timeout=COMPACTION_TIMEOUT,
         )
