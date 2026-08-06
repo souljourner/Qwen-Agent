@@ -890,3 +890,57 @@ class TestSortinoKeyMetricInLoop:
         ]
         d = _decide_from_pilot_history(self._ls(rows))
         assert d.type == "converge", d.feedback
+
+
+class TestTradeCountGateIsAStatisticalFloor:
+    """The trade-count gate is a bare statistical floor (20), NOT a frequency
+    target. Fewer trades does not make a strategy worse — a small universe is
+    a property of the asset class, not a defect.
+
+    Anchored to a real case: prem14a-event-driven-v3 passed 5 of 6 gates with
+    a t-stat of 4.52 and OOS Sharpe ABOVE its pilot Sharpe, and was rejected
+    on 2026-04-18 purely for having 30 trades against a 100 gate. ff5d077
+    lowered that gate to 20 on 2026-07-16.
+    """
+
+    PREM14A = {
+        "pilot_sharpe": 0.8189, "oos_sharpe": 0.8783, "oos_pilot_ratio": 1.0726,
+        "walk_forward_wins": 5, "walk_forward_total": 5, "walk_forward_win_rate": 1.0,
+        "total_trades": 30, "t_stat_daily_returns": 4.52, "deflated_sharpe": 0.4,
+        "turnover_annual": 24.33, "holding_period_days_claimed": 90,
+        "holding_period_days_observed": 90, "benchmark": "SPY",
+        # The April artifact predates ff5d077, which made annualized Sortino
+        # the key metric and required annualized returns to be present. A
+        # re-run must emit these; the stored metrics.json cannot simply be
+        # re-judged. Values consistent with its Sharpe/trade profile.
+        "pilot_sortino": 1.21, "oos_sortino": 1.30,
+        "pilot_annualized_return_pct": 14.2, "oos_annualized_return_pct": 15.1,
+    }
+
+    def _run(self, tmp_path, metrics):
+        import json as _json
+        d = tmp_path / "backtest" / "full"
+        d.mkdir(parents=True)
+        (d / "metrics.json").write_text(_json.dumps(metrics))
+        from sandbox_agent.pipeline.evaluator import _check_full_validation_metrics
+        return _check_full_validation_metrics(str(tmp_path))
+
+    def test_gate_value_is_twenty(self):
+        from sandbox_agent.pipeline.evaluator import _FULL_VALIDATION_GATES
+        assert _FULL_VALIDATION_GATES["min_trades"] == 20, (
+            "trade-count gate changed; it is a statistical floor, not a "
+            "frequency target — see prem14a")
+
+    def test_prem14a_metrics_now_pass(self, tmp_path):
+        passed, msg = self._run(tmp_path, dict(self.PREM14A))
+        assert passed, f"prem14a would still be rejected: {msg}"
+
+    def test_thirty_trades_is_not_a_failure_reason(self, tmp_path):
+        passed, msg = self._run(tmp_path, dict(self.PREM14A))
+        assert "total_trades" not in msg, f"trade count cited as a failure: {msg}"
+
+    def test_below_the_statistical_floor_still_fails(self, tmp_path):
+        """The floor is real — 20 exists so a 3-trade fluke cannot pass."""
+        m = dict(self.PREM14A, total_trades=19)
+        passed, msg = self._run(tmp_path, m)
+        assert not passed and "total_trades" in msg

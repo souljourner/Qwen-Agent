@@ -1488,9 +1488,14 @@ _FULL_VALIDATION_REPORT_FIELDS = ("pilot_annualized_return_pct", "oos_annualized
 
 def _check_full_validation_metrics(project_dir: str) -> Tuple[bool, str]:
     """Stage-3 gate. Reads backtest/full/metrics.json (machine-readable) and
-    enforces: OOS/IS Sharpe >= 0.5, walk-forward benchmark-beat >= 60%,
-    total trades >= 100, |t-stat| > 2.0, deflated Sharpe > 0, turnover matches
-    declared holding period within ± 50%. Any failure rejects the stage."""
+    enforces the thresholds in _FULL_VALIDATION_GATES: OOS/IS Sharpe,
+    walk-forward benchmark-beat, total trades, |t-stat|, deflated Sharpe, and
+    turnover vs declared holding period. Any failure rejects the stage.
+
+    Thresholds are NOT restated here — this docstring said "total trades >=
+    100" for three months after ff5d077 lowered it to 20, which is exactly the
+    kind of stale duplicate that misleads a reader into thinking the old gate
+    is still live. Read _FULL_VALIDATION_GATES."""
     path = os.path.join(project_dir, "backtest", "full", "metrics.json")
     if not os.path.exists(path):
         return False, "Missing artifact: backtest/full/metrics.json"
