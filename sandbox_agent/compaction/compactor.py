@@ -199,8 +199,16 @@ def summarize_history(messages: List[Message], *,
     # Merge if multiple chunks
     final_summary = merge_summaries(summaries, identifiers)
     if not final_summary:
-        logger.warning("Compaction: summary merge failed, using first chunk summary")
-        final_summary = summaries[0]
+        # Falling back to summaries[0] would DELETE the material behind
+        # chunks 2..N — the same "partial failure loses the remainder" bug
+        # fixed in the chunk loop above, just relocated to the merge step.
+        # Concatenating is uglier (sections repeat) but loses nothing, and
+        # the merge is only a tidying pass.
+        logger.warning("Compaction: summary merge failed — concatenating %d chunk "
+                       "summaries unmerged rather than dropping %d of them",
+                       len(summaries), len(summaries) - 1)
+        final_summary = "\n\n".join(
+            f"### Segment {i + 1} of {len(summaries)}\n\n{s}" for i, s in enumerate(summaries))
 
     # Quality audit (non-blocking)
     latest_user_ask = _find_latest_user_ask(messages)

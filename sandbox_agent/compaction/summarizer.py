@@ -67,7 +67,11 @@ Output the merged summary using the same section format as the inputs."""
 
 
 def summarize_chunk(conversation_text: str) -> str:
-    """Summarize a chunk of conversation history."""
+    """Summarize a chunk of conversation history.
+
+    Failure here is FATAL to the compaction (all-or-nothing), so it counts
+    against the circuit breaker.
+    """
     return _call_ollama(CHUNK_SYSTEM_PROMPT, conversation_text)
 
 
@@ -85,10 +89,13 @@ def merge_summaries(summaries: list, identifiers: set) -> str:
     user = "\n\n---\n\n".join(
         f"### Summary {i+1}\n\n{s}" for i, s in enumerate(summaries)
     )
-    return _call_ollama(system, user)
+    # count_failures=False: the merge is a tidying pass with a lossless
+    # fallback, so failing it must not open the breaker and thereby block
+    # the chunk summarization that actually matters.
+    return _call_ollama(system, user, count_failures=False)
 
 
-def _call_ollama(system_prompt: str, user_prompt: str) -> str:
+def _call_ollama(system_prompt: str, user_prompt: str, *, count_failures: bool = True) -> str:
     """Call the compaction model. Returns "" on failure (never raises).
 
     Retries once by default: compaction is all-or-nothing, so a single
@@ -107,7 +114,8 @@ def _call_ollama(system_prompt: str, user_prompt: str) -> str:
     for attempt in range(max(1, COMPACTION_ATTEMPTS)):
         result, timed_out = _attempt_call(system_prompt, user_prompt, attempt)
         if result:
-            breaker.record_success()
+            if count_failures:
+                breaker.record_success()
             return result
         if timed_out:
             # A timeout already consumed the whole budget; retrying it just
@@ -115,7 +123,8 @@ def _call_ollama(system_prompt: str, user_prompt: str) -> str:
             # failures (connection refused, 5xx, cold-start) are worth a
             # second try.
             break
-    breaker.record_failure()
+    if count_failures:
+        breaker.record_failure()
     return ""
 
 

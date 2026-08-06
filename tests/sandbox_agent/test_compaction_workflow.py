@@ -246,3 +246,74 @@ class TestRetryPolicy:
         t = _Transport(cold_then_warm).install(monkeypatch)
         result = compact_for_persistence(_history(), target_tokens=TARGET)
         assert len(t.calls) >= 2 and result.changed
+
+
+class TestMergeFailureLosesNothing:
+    """The chunk loop is all-or-nothing, but the MERGE step had the same
+    'partial failure drops the remainder' bug: it fell back to summaries[0]
+    while still deleting every message chunks 2..N covered."""
+
+    def _merge_fails(self, i):
+        # Chunk calls succeed; the merge (the call carrying "### Summary")
+        # fails. Distinguished by payload below.
+        raise AssertionError("unused")
+
+    def test_all_chunk_summaries_survive_a_failed_merge(self, monkeypatch):
+        seen = []
+
+        def behavior(i):
+            raise AssertionError("unused")
+
+        class T(_Transport):
+            def post(self, url, json=None, timeout=None, **kw):
+                payload = str(json)
+                seen.append(payload)
+                is_merge = "Merge these conversation summaries" in payload
+                if is_merge:
+                    raise requests.exceptions.ConnectionError("merge endpoint down")
+
+                class _R:
+                    def raise_for_status(s): pass
+
+                    def json(s):
+                        n = len([p for p in seen if "Merge these" not in p])
+                        return {"choices": [{"message": {
+                            "content": f"## Decisions Made\n- UNIQUE_MARKER_{n}"}}]}
+
+                return _R()
+
+        t = T(behavior).install(monkeypatch)
+        result = compact_for_persistence(_history(turns=90), target_tokens=TARGET)
+
+        chunk_calls = len([p for p in seen if "Merge these" not in p])
+        assert chunk_calls >= 2, "need multiple chunks to exercise the merge"
+
+        digest = "\n".join(str(m.content) for m in result.messages)
+        for n in range(1, chunk_calls + 1):
+            assert f"UNIQUE_MARKER_{n}" in digest, (
+                f"chunk {n}'s summary was dropped when the merge failed — "
+                "its messages were deleted but its content did not survive")
+
+    def test_failed_merge_does_not_open_the_breaker(self, monkeypatch):
+        seen = []
+
+        class T(_Transport):
+            def post(self, url, json=None, timeout=None, **kw):
+                payload = str(json)
+                seen.append(payload)
+                if "Merge these conversation summaries" in payload:
+                    raise requests.exceptions.ConnectionError("merge down")
+
+                class _R:
+                    def raise_for_status(s): pass
+
+                    def json(s):
+                        return {"choices": [{"message": {"content": "## Decisions Made\n- ok"}}]}
+
+                return _R()
+
+        T(lambda i: "").install(monkeypatch)
+        compact_for_persistence(_history(turns=90), target_tokens=TARGET)
+        assert not breaker.is_open(), (
+            "a failed merge opened the breaker, blocking the chunk "
+            "summarization that actually matters for 900s")
