@@ -24,6 +24,14 @@ PipelineStatus = Literal[
     "cancelled",
 ]
 
+# A pipeline in any of these is DONE and must never be advanced, rescheduled,
+# or re-notified. Defined once because it was previously spelled out inline in
+# two places that drifted: the cancel guard listed all four, while the startup
+# stall-recovery sweep listed only ("completed", "failed") — so a
+# completed_rejected pipeline was "advanced" on every startup, re-ran the
+# reject transition, and emailed the owner again each time.
+TERMINAL_PIPELINE_STATUSES = ("completed", "completed_rejected", "failed", "cancelled")
+
 
 # Statuses written by older code versions, normalized on load so historical
 # state files keep loading (observed live: 'complete', 'skipped',
@@ -82,3 +90,7 @@ class PipelineState(BaseModel):
     # verdict was rendered on different metrics than the file now holds).
     # None = legacy pipeline predating this contract; the hash gate is skipped.
     pinned_full_metrics_hash: Optional[str] = None
+    # Set the first time the owner's completion email is sent. Guards against
+    # re-notifying if any path re-enters a terminal transition. None = legacy
+    # state file predating this field (or never completed).
+    completion_notified_at: Optional[datetime] = None

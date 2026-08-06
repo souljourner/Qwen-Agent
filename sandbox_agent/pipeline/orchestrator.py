@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Optional
 
 from sandbox_agent.config import DATA_DIR
-from sandbox_agent.pipeline.models import PipelineState, StageState
+from sandbox_agent.pipeline.models import (TERMINAL_PIPELINE_STATUSES,
+                                           PipelineState, StageState)
 
 logger = logging.getLogger(__name__)
 
@@ -473,7 +474,7 @@ def cancel_pipeline(project_name: str) -> str:
     state = load_state(project_name)
     if state is None:
         return f"No pipeline found for project '{project_name}'."
-    if state.status in ("completed", "completed_rejected", "failed", "cancelled"):
+    if state.status in TERMINAL_PIPELINE_STATUSES:
         return f"Pipeline '{project_name}' already terminal: {state.status}."
 
     from sandbox_agent.scheduler.scheduler_tools import get_task_queue
@@ -537,7 +538,20 @@ def _notify_pipeline_complete(state: PipelineState, outcome: str) -> None:
     """Email the owner the final result of ANY pipeline (startup or trading).
 
     Deterministic code path on every terminal transition — never left to the
-    LLM to remember. Non-fatal: a failed send never breaks the pipeline."""
+    LLM to remember. Non-fatal: a failed send never breaks the pipeline.
+
+    Sends AT MOST ONCE per pipeline. The caller is responsible for persisting
+    state afterwards; every current caller does. This is a second line of
+    defence — the guard that actually stopped the repeat emails is the
+    running-only check in the startup sweep — but a completion email is
+    outward-facing, so it should not depend on every caller upstream being
+    correct forever."""
+    if state.completion_notified_at is not None:
+        logger.info("Pipeline %s already notified at %s — not emailing again "
+                    "(outcome: %s)", state.project_name,
+                    state.completion_notified_at, outcome)
+        return
+    state.completion_notified_at = datetime.now()
     try:
         lines = [
             f"# Pipeline: {state.project_name}",
@@ -799,7 +813,14 @@ def reschedule_orphaned_stages_on_startup() -> list:
         state = load_state(project_name)
         if not state:
             continue
-        if state.status in ("completed", "failed"):
+        # ONLY running pipelines. This is crash recovery, so anything else is
+        # either done (terminal) or deliberately stopped ("paused") — advancing
+        # those is never right. The old guard listed just
+        # ("completed", "failed"), so every startup re-advanced
+        # completed_rejected pipelines, re-ran the reject transition and
+        # emailed the owner again ("prem14a-event-driven-v3: REJECTED"
+        # arriving several times a day, for a pipeline finished long ago).
+        if state.status != "running":
             continue
 
         stage = state.stages.get(state.current_stage)

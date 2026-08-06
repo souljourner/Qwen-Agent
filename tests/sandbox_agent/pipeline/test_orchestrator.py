@@ -680,3 +680,104 @@ class TestExecutionStrategyInEmail:
         for sec in ("Execution Strategy", "Entry Criteria", "Exit Criteria",
                     "Position Sizing", "Portfolio Strategy", "Risk Management"):
             assert sec in req, sec
+
+
+class TestStartupSweepRespectsTerminalPipelines:
+    """A finished pipeline was 'advanced' on every startup, re-ran its reject
+    transition and re-emailed the owner — 'prem14a-event-driven-v3: REJECTED'
+    arriving several times a day for work completed long ago."""
+
+    def _write_reject_verdict(self, data_dir, name):
+        """Without this the sweep merely advances the stage — the REPEAT EMAIL
+        only happens when stage 4's verdict says reject, which is precisely
+        the prem14a case."""
+        d = os.path.join(data_dir, "projects", name, "pipeline")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "verdict.md"), "w") as f:
+            f.write("## Final Recommendation\n\nreject - fails the Sortino gate.\n")
+
+    def _rejected_pipeline(self, name="prem14a-event-driven-v3"):
+        # All stages exist, as init_pipeline creates them — stage 4 done,
+        # current_stage still 4, pipeline already marked rejected.
+        state = PipelineState(project_name=name, description="d",
+                              pipeline_type="trading", current_stage=4,
+                              status="completed_rejected")
+        for num, defn in TRADING_STAGES.items():
+            state.stages[num] = StageState(
+                stage_number=num, stage_name=defn["name"],
+                status="completed" if num <= 4 else "scheduled")
+        return state
+
+    def _sweep(self, monkeypatch, emails):
+        import sandbox_agent.pipeline.orchestrator as o
+        monkeypatch.setattr(o, "_notify_pipeline_complete",
+                            lambda s, outcome: emails.append((s.project_name, outcome)))
+
+        class _Q:
+            def __init__(self): self.added = []
+
+            def list_tasks(self): return []
+
+            def add_task(self, *a, **k):
+                self.added.append((a, k))
+                return type("T", (), {"id": f"task-{len(self.added)}"})()
+
+        monkeypatch.setattr("sandbox_agent.scheduler.scheduler_tools.get_task_queue",
+                            lambda: _Q())
+        return o.reschedule_orphaned_stages_on_startup()
+
+    def test_rejected_pipeline_is_not_re_notified(self, tmp_data_dir, monkeypatch):
+        save_state(self._rejected_pipeline())
+        self._write_reject_verdict(tmp_data_dir, "prem14a-event-driven-v3")
+        emails = []
+        self._sweep(monkeypatch, emails)
+        assert emails == [], f"re-emailed a finished pipeline: {emails}"
+
+    def test_rejected_pipeline_stays_terminal(self, tmp_data_dir, monkeypatch):
+        save_state(self._rejected_pipeline())
+        self._write_reject_verdict(tmp_data_dir, "prem14a-event-driven-v3")
+        self._sweep(monkeypatch, [])
+        assert load_state("prem14a-event-driven-v3").status == "completed_rejected"
+
+    def test_repeated_startups_never_email(self, tmp_data_dir, monkeypatch):
+        """The symptom was per-startup, so one sweep proves nothing."""
+        save_state(self._rejected_pipeline())
+        self._write_reject_verdict(tmp_data_dir, "prem14a-event-driven-v3")
+        emails = []
+        for _ in range(5):
+            self._sweep(monkeypatch, emails)
+        assert emails == [], f"{len(emails)} emails across 5 startups"
+
+    @pytest.mark.parametrize("status", ["cancelled", "paused", "completed", "failed"])
+    def test_non_running_pipelines_are_left_alone(self, tmp_data_dir, monkeypatch, status):
+        state = self._rejected_pipeline(name=f"p-{status}")
+        state.status = status
+        save_state(state)
+        self._write_reject_verdict(tmp_data_dir, f"p-{status}")
+        emails = []
+        self._sweep(monkeypatch, emails)
+        assert emails == []
+        assert load_state(f"p-{status}").status == status, (
+            f"sweep mutated a {status} pipeline")
+
+    def test_genuinely_stalled_running_pipeline_still_advances(self, tmp_data_dir, monkeypatch):
+        """The sweep's real job — crash recovery — must still work."""
+        state = self._rejected_pipeline(name="stalled")
+        state.status = "running"
+        save_state(state)
+        self._sweep(monkeypatch, [])
+        assert load_state("stalled").current_stage == 5, "crash recovery broke"
+
+
+class TestCompletionEmailIsSentOnce:
+
+    def test_second_notify_is_suppressed(self, tmp_data_dir, monkeypatch):
+        import sandbox_agent.pipeline.orchestrator as o
+        sent = []
+        monkeypatch.setattr("sandbox_agent.tools.notification_tools.send_email_message",
+                            lambda *a, **k: sent.append(a) or "ok")
+        state = PipelineState(project_name="p", description="d", status="completed")
+        o._notify_pipeline_complete(state, "completed")
+        o._notify_pipeline_complete(state, "completed")
+        assert len(sent) == 1, f"sent {len(sent)} completion emails"
+        assert state.completion_notified_at is not None
