@@ -51,6 +51,10 @@ def _function(name, content):
 # --- segment_messages ---
 
 class TestSegmentMessages:
+    """NOTE: these exercise LEGACY mode (no target_tokens), which still uses
+    the fixed COMPACTION_RECENT_TURNS_PRESERVE count. Budget-filled
+    segmentation is covered in test_compactor_rebuild.py."""
+
     def test_basic_segmentation(self):
         """System msgs separated, recent turns preserved."""
         msgs = [
@@ -346,15 +350,22 @@ class TestBuildChunks:
 # --- reassemble ---
 
 class TestReassemble:
+
     def test_basic_reassembly(self):
-        system = [_sys("You are helpful.")]
-        summary = "Previous: user asked about cats."
-        recent = [_user("New question"), _assistant("New answer")]
-        result = reassemble(system, summary, recent, 10)
-        assert len(result) == 4  # 1 system + 1 summary + 2 recent
+        system = [Message(role="system", content="You are helpful")]
+        recent = [Message(role="user", content="New question")]
+        result = reassemble(system, "## Decisions Made\nSummary of everything", recent, 10)
         assert result[0].role == "system"
-        assert result[0].content == "You are helpful."
-        assert result[1].role == "system"
+        # The digest is role="user", NOT a second system message: two system
+        # messages make qwen_agent reject the entire request (fixed 2cb762e).
+        # This assertion used to say "system" and had been failing silently
+        # because tests/compaction/ was never in the CI path.
+        assert result[1].role == "user"
         assert "compacted" in result[1].content.lower()
         assert "10 earlier messages" in result[1].content
         assert result[2].content == "New question"
+
+    def test_digest_carries_marker(self):
+        from sandbox_agent.compaction.digest import is_digest
+        out = reassemble([], "## Decisions Made\nx", [], 4)
+        assert is_digest(out[0])

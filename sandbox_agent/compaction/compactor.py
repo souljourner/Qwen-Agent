@@ -23,6 +23,7 @@ from sandbox_agent.config import (
     COMPACTION_SAFETY_MARGIN,
     COMPACTION_TOOL_RESULT_HARD_CAP,
     COMPACTION_TOOL_RESULT_MAX_SHARE,
+    COMPACTION_MIN_TAIL_TURNS,
     COMPACTION_PROTECT_LAST_TOOL_RESULTS,
     COMPACTION_TOOL_RESULT_MIN_KEEP,
     MAX_CONTEXT_TOKENS,
@@ -40,10 +41,16 @@ _ALREADY_TRUNCATED = "... truncated "
 
 @dataclass
 class MessageSegments:
-    """Messages split into logical segments for compaction."""
+    """Messages split into logical segments for compaction.
+
+    `digest` is a previously-persisted compaction digest peeled off the
+    front so it can never be re-summarized into a digest-of-a-digest, and
+    so it never opens a spurious "turn" (it is role="user").
+    """
     system: List[Message] = field(default_factory=list)
-    history: List[Message] = field(default_factory=list)
-    recent: List[Message] = field(default_factory=list)
+    digest: Optional[Message] = None
+    history: List[Message] = field(default_factory=list)   # to be summarized
+    recent: List[Message] = field(default_factory=list)    # kept verbatim
 
 
 # --- Tier 1: Tool result truncation ---
@@ -143,7 +150,8 @@ def _head_tail_truncate(text: str, budget: int, min_keep: int) -> str:
 # --- Tier 2: History summarization ---
 
 
-def summarize_history(messages: List[Message]) -> List[Message]:
+def summarize_history(messages: List[Message], *,
+                      target_tokens: Optional[int] = None) -> List[Message]:
     """Summarize older conversation history, keeping recent turns verbatim.
 
     Returns a new message list with: system msgs + summary msg + recent turns.
@@ -151,7 +159,7 @@ def summarize_history(messages: List[Message]) -> List[Message]:
     """
     from sandbox_agent.compaction.summarizer import summarize_chunk, merge_summaries
 
-    segments = segment_messages(messages)
+    segments = segment_messages(messages, target_tokens=target_tokens)
 
     if not segments.history:
         logger.info("Compaction: no history to summarize (all messages are recent)")
@@ -201,49 +209,82 @@ def summarize_history(messages: List[Message]) -> List[Message]:
         logger.warning(f"Compaction quality audit issues: {issues}")
 
     # Reassemble
-    return reassemble(segments.system, final_summary, segments.recent, len(segments.history))
+    return reassemble(segments.system, final_summary, segments.recent,
+                      len(segments.history), existing_digest=segments.digest,
+                      durable=_durable_from_failures(failures))
 
 
-def segment_messages(messages: List[Message]) -> MessageSegments:
-    """Split messages into system, history (older), and recent (preserved) segments.
+def segment_messages(messages: List[Message], *,
+                     target_tokens: Optional[int] = None,
+                     min_tail_turns: int = None) -> MessageSegments:
+    """Split into system / digest / history-to-summarize / verbatim tail.
 
-    Respects tool-use/result pairing: an assistant message with function_call is
-    always grouped with its following function-result message.
+    The tail is BUDGET-FILLED: walk backwards keeping whole turns until the
+    budget is spent, instead of the old hardcoded 2 turns. That fixed count
+    is what turned a 281k history into 13.4k when the budget allowed 170k
+    (2026-08-06 incident) — it discarded ~12x more than necessary.
+
+    The newest turn is always kept even if it alone busts the budget; the
+    ladder's cheaper tiers shrink it instead.
     """
+    from sandbox_agent.compaction.digest import is_digest
+
+    if min_tail_turns is None:
+        min_tail_turns = COMPACTION_MIN_TAIL_TURNS
     segments = MessageSegments()
 
-    # Separate system messages
     non_system = []
     for msg in messages:
         if msg.role == "system":
             segments.system.append(msg)
         else:
             non_system.append(msg)
-
     if not non_system:
         return segments
 
-    # Find turn boundaries (each user message starts a new turn)
+    # Peel a leading digest so it never opens a turn nor gets re-summarized.
+    if is_digest(non_system[0]):
+        segments.digest = non_system[0]
+        non_system = non_system[1:]
+    if not non_system:
+        return segments
+
     turns = _split_into_turns(non_system)
 
-    # Preserve last N turns
-    preserve_count = min(COMPACTION_RECENT_TURNS_PRESERVE, len(turns))
-    if preserve_count > 0 and len(turns) > preserve_count:
-        history_turns = turns[:-preserve_count]
-        recent_turns = turns[-preserve_count:]
-    elif preserve_count > 0:
-        # All turns are "recent" — nothing to summarize
-        segments.recent = non_system
+    if not target_tokens:  # legacy callers: previous fixed-count behavior
+        preserve = min(COMPACTION_RECENT_TURNS_PRESERVE, len(turns))
+        if preserve and len(turns) > preserve:
+            segments.history = [m for t in turns[:-preserve] for m in t]
+            segments.recent = [m for t in turns[-preserve:] for m in t]
+        else:
+            segments.recent = non_system
         return segments
-    else:
-        history_turns = turns
-        recent_turns = []
 
-    for turn in history_turns:
-        segments.history.extend(turn)
-    for turn in recent_turns:
-        segments.recent.extend(turn)
+    budget = target_tokens - estimate_messages_tokens(segments.system)
+    if segments.digest is not None:
+        budget -= estimate_message_tokens(segments.digest)
+    budget = max(budget, 1_000)
 
+    kept: List[List[Message]] = []
+    used = 0
+    for turn in reversed(turns):
+        cost = estimate_messages_tokens(turn)
+        # `kept and` is load-bearing: the newest turn is kept unconditionally
+        if kept and used + cost > budget:
+            break
+        kept.insert(0, turn)
+        used += cost
+    while len(kept) < min(min_tail_turns, len(turns)):
+        kept.insert(0, turns[len(turns) - len(kept) - 1])
+
+    older = turns[:len(turns) - len(kept)]
+    segments.history = [m for t in older for m in t]
+    segments.recent = [m for t in kept for m in t]
+
+    # A tail must start with a user message or qwen_agent rejects the
+    # request; a rebuilt history can begin mid tool-exchange.
+    while segments.recent and segments.recent[0].role != "user":
+        segments.history.append(segments.recent.pop(0))
     return segments
 
 
@@ -328,33 +369,31 @@ def _compute_adaptive_chunk_ratio(messages: List[Message], budget_tokens: int) -
     return COMPACTION_BASE_CHUNK_RATIO
 
 
-def reassemble(
-    system_msgs: List[Message],
-    summary: str,
-    recent: List[Message],
-    summarized_count: int,
-) -> List[Message]:
-    """Build new message list: system + summary + recent turns."""
-    result = list(system_msgs)
-
-    # role="user", NOT "system": qwen_agent rejects requests with two system
-    # messages (base.py _truncate_input_messages_roughly — active whenever
-    # max_input_tokens > 0), so a system-role summary poisons the very next
-    # call. Same marked-user convention as [system event] injections.
-    summary_msg = Message(
-        role="user",
-        content=(
-            f"[Context compacted: {summarized_count} earlier messages were summarized "
-            f"to save context space. This is an automated digest, not a message from "
-            f"the user. Recent messages follow verbatim.]\n\n{summary}"
-        ),
-    )
-    result.append(summary_msg)
-    result.extend(recent)
-    return result
+def _durable_from_failures(failures: List[str]) -> List[str]:
+    """Tool failures are a user-priority retention category — record them as
+    DURABLE bullets so a later summarization can never paraphrase them away."""
+    return [f"- ERROR: {f}" for f in (failures or [])[:8]]
 
 
-# --- Helpers ---
+def reassemble(system_msgs: List[Message], summary: str, recent: List[Message],
+               summarized_count: int, *, existing_digest: Optional[Message] = None,
+               durable: Optional[List[str]] = None) -> List[Message]:
+    """Build [system] + [digest] + [verbatim tail].
+
+    MERGES into `existing_digest` rather than stacking a second one — a
+    persisted history already starts with a digest, and stacking would give
+    the model two conflicting "[Context compacted…]" preambles and
+    eventually digests-of-digests.
+    """
+    from sandbox_agent.compaction.digest import merge_into, parse_sections
+
+    proposed_durable, working = parse_sections(summary)
+    if not proposed_durable and not working:
+        working = summary  # model ignored the section format — keep it all
+    proposed_durable = list(durable or []) + proposed_durable
+
+    digest_msg = merge_into(existing_digest, proposed_durable, working, summarized_count)
+    return list(system_msgs) + [digest_msg] + list(recent)
 
 
 def extract_identifiers(text: str) -> Set[str]:

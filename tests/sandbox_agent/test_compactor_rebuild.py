@@ -245,3 +245,135 @@ class TestPointers:
     def test_ships_disabled_by_default(self):
         from sandbox_agent.config import COMPACTION_POINTERS_ENABLED
         assert COMPACTION_POINTERS_ENABLED is False
+
+
+def _stub_summarizer(monkeypatch, text="## Decisions Made\nchose SQLite"):
+    import sandbox_agent.compaction.summarizer as s
+    monkeypatch.setattr(s, "summarize_chunk", lambda t: text)
+    monkeypatch.setattr(s, "merge_summaries", lambda su, i: text)
+
+
+class TestBudgetFilledTail:
+    """The 281k->13.4k incident: a fixed 2-turn tail discarded ~12x more
+    than the budget required."""
+
+    def test_tail_fills_budget_not_two_turns(self):
+        msgs = [m for i in range(60) for m in _turn(i, tool_chars=800, args_chars=200)]
+        seg = compactor.segment_messages(msgs, target_tokens=60_000)
+        kept_turns = sum(1 for m in seg.recent if m.role == USER)
+        assert kept_turns > 2, f"budget-filled tail kept only {kept_turns} turns"
+
+    def test_newest_turn_always_kept_even_if_oversized(self):
+        msgs = _turn(0, tool_chars=4_000) + _turn(1, tool_chars=900_000)
+        seg = compactor.segment_messages(msgs, target_tokens=5_000)
+        assert seg.recent, "the newest turn must survive even when oversized"
+        assert seg.recent[-1].content.startswith("tool output 1")
+
+    def test_tail_starts_with_user_message(self):
+        msgs = [Message(role=ASSISTANT, content="orphan"),
+                Message(role=FUNCTION, name="t", content="r")] + \
+               [m for i in range(6) for m in _turn(i, tool_chars=500, args_chars=100)]
+        seg = compactor.segment_messages(msgs, target_tokens=30_000)
+        if seg.recent:
+            assert seg.recent[0].role == USER
+
+
+class TestDigestAccretion:
+
+    def test_durable_survives_a_hostile_summarizer(self):
+        from sandbox_agent.compaction.digest import make_digest, merge_into, parse_sections
+        d1 = make_digest(["- USER CORRECTION: never use tabs"], "doing things", 10)
+        d2 = merge_into(d1, [], "TOTALLY DIFFERENT", 5)
+        d3 = merge_into(d2, [], "DIFFERENT AGAIN", 5)
+        durable, _ = parse_sections(str(d3.content))
+        assert any("never use tabs" in x for x in durable)
+
+    def test_digest_is_user_role_and_marked(self):
+        from sandbox_agent.compaction.digest import is_digest, make_digest
+        d = make_digest(["- a decision"], "state", 3)
+        assert d.role == "user" and is_digest(d)
+
+    def test_legacy_unmarked_digest_still_detected(self):
+        from sandbox_agent.compaction.digest import is_digest
+        legacy = Message(role=USER, content="[Context compacted: 12 earlier messages...]\n\nstuff")
+        assert is_digest(legacy), "existing threads' digests must be recognized"
+
+    def test_digest_never_re_summarized(self):
+        from sandbox_agent.compaction.digest import make_digest
+        d = make_digest(["- keep me"], "w", 5)
+        msgs = [d] + [m for i in range(6) for m in _turn(i, tool_chars=500, args_chars=100)]
+        seg = compactor.segment_messages(msgs, target_tokens=20_000)
+        assert seg.digest is d
+        assert all(m is not d for m in seg.history)
+
+    def test_digests_merge_not_stack(self, monkeypatch):
+        from sandbox_agent.compaction.digest import is_digest, make_digest
+        _stub_summarizer(monkeypatch)
+        d = make_digest(["- prior fact"], "prior", 5)
+        msgs = [d] + [m for i in range(10) for m in _turn(i, tool_chars=2_000, args_chars=500)]
+        out = compactor.summarize_history(msgs, target_tokens=8_000)
+        assert sum(1 for m in out if is_digest(m)) == 1
+        assert "prior fact" in str(out[0].content)
+
+
+class TestLadder:
+
+    def test_stops_early_without_calling_the_llm(self, monkeypatch):
+        from sandbox_agent.compaction import policy
+        import sandbox_agent.compaction.summarizer as s
+        called = {"n": 0}
+        monkeypatch.setattr(s, "summarize_chunk",
+                            lambda t: called.__setitem__("n", called["n"] + 1) or "x")
+        # Sized so the aggregate tool-result budget CAN reach target on its
+        # own (the newest few results are exempt from the shared budget, so
+        # they set a floor the target must clear).
+        msgs = []
+        for i in range(20):
+            msgs.append(Message(role=USER, content=f"q{i}"))
+            msgs.append(Message(role=FUNCTION, name="t", content="z" * 10_000))
+        res = policy.compact_for_persistence(msgs, target_tokens=45_000)
+        assert res.changed, "ladder should have compacted"
+        assert called["n"] == 0, f"LLM used despite cheap tiers sufficing: {res.levels}"
+        assert res.levels == ["tool_results"]
+
+    def test_no_llm_mode_never_summarizes(self, monkeypatch):
+        from sandbox_agent.compaction import policy
+        import sandbox_agent.compaction.summarizer as s
+        monkeypatch.setattr(s, "summarize_chunk",
+                            lambda t: pytest.fail("LLM used in allow_llm=False mode"))
+        msgs = [m for i in range(30) for m in _turn(i)]
+        policy.compact_for_persistence(msgs, target_tokens=5_000, allow_llm=False)
+
+    def test_under_target_is_a_noop(self):
+        from sandbox_agent.compaction import policy
+        msgs = [Message(role=USER, content="tiny")]
+        res = policy.compact_for_persistence(msgs, target_tokens=100_000)
+        assert not res.changed and res.messages == msgs
+
+    def test_input_never_mutated(self, monkeypatch):
+        from sandbox_agent.compaction import policy
+        _stub_summarizer(monkeypatch)
+        msgs = [m for i in range(20) for m in _turn(i)]
+        snapshot = [str(m.content) for m in msgs]
+        policy.compact_for_persistence(msgs, target_tokens=10_000)
+        assert [str(m.content) for m in msgs] == snapshot
+
+
+class TestArchive:
+
+    def test_roundtrip_and_delta_only(self, tmp_path, monkeypatch):
+        import sandbox_agent.chat_history as ch
+        from sandbox_agent.compaction import archive
+        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
+        a = [Message(role=USER, content="first"), Message(role=ASSISTANT, content="second")]
+        b = [Message(role=USER, content="third")]
+        assert archive.archive_append("t1", a)
+        assert archive.archive_append("t1", b)
+        loaded = archive.load_archive("t1")
+        assert [str(m.content) for m in loaded] == ["first", "second", "third"]
+
+    def test_empty_delta_is_success(self, tmp_path, monkeypatch):
+        import sandbox_agent.chat_history as ch
+        from sandbox_agent.compaction import archive
+        monkeypatch.setattr(ch, "DATA_DIR", str(tmp_path))
+        assert archive.archive_append("t2", []) is True
