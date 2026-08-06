@@ -5,7 +5,7 @@ import unicodedata
 
 from sandbox_agent.config import CHARS_PER_TOKEN, MAX_TOOL_OUTPUT_TOKENS
 
-DEFAULT_MAX_LENGTH = MAX_TOOL_OUTPUT_TOKENS * CHARS_PER_TOKEN  # Convert token budget to chars
+DEFAULT_MAX_LENGTH = int(MAX_TOOL_OUTPUT_TOKENS * CHARS_PER_TOKEN)  # token budget -> chars
 
 # Chat template special tokens that could be used for prompt injection
 SPECIAL_TOKEN_PATTERNS = [

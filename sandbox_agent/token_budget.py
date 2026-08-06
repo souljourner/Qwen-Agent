@@ -1,8 +1,19 @@
 """Token budget management — keeps conversations under the context limit.
 
-Uses a cheap heuristic (chars / 4) instead of real tokenization.
-Drops oldest non-system turns to stay under budget while preserving
-the system message prefix (for KV cache hits).
+Cheap heuristic (chars / CHARS_PER_TOKEN) — deliberately NOT real
+tokenization: the bundled tiktoken tokenizer takes 2.2s on 100k chars of
+repetitive content and raises "Max stack size exceeded for backtracking"
+outright above ~1M chars, neither of which is acceptable in the hot path
+(this runs several times per turn over the whole history).
+
+CHARS_PER_TOKEN is calibrated against reality instead: a real 419-message
+thread measured 718,405 chars -> 207,492 true tokens = 3.46 chars/token.
+
+History: this undercounted a live 281,152-token chat as 183,684 (1.53x),
+letting it blow past every budget until the model confabulated. Two causes,
+both fixed: the 4.0 divisor was too generous, and function_call arguments
+(whole file contents — 51,179 tokens across 131 calls in that thread) were
+never counted at all.
 """
 
 import logging
@@ -16,22 +27,44 @@ logger = logging.getLogger(__name__)
 
 
 def estimate_tokens(text: str) -> int:
-    """Estimate token count from character length. ~4 chars per token for English."""
-    return len(text) // CHARS_PER_TOKEN
+    """Estimated tokens for a string (calibrated chars-per-token heuristic)."""
+    if not text:
+        return 0
+    return int(len(text) / CHARS_PER_TOKEN)
 
 
 def estimate_message_tokens(msg: Message) -> int:
-    """Estimate tokens for a single message (content + overhead)."""
-    overhead = 10  # role, name, formatting tokens
-    if isinstance(msg.content, str):
-        return estimate_tokens(msg.content) + overhead
-    elif isinstance(msg.content, list):
-        total = 0
-        for item in msg.content:
-            if hasattr(item, "text") and item.text:
-                total += estimate_tokens(item.text)
-        return total + overhead
-    return overhead
+    """Tokens for one message: content + function_call + reasoning + framing.
+
+    function_call arguments MUST be counted — tools like project_write_file
+    pass entire file contents there, and treating them as ~10 tokens of
+    overhead is what silently blew the context budget (2026-08-05)."""
+    overhead = 10  # role, name, chat-template framing
+    total = 0
+
+    content = msg.content
+    if isinstance(content, str):
+        total += estimate_tokens(content)
+    elif isinstance(content, list):
+        for item in content:
+            text = getattr(item, "text", None) if not isinstance(item, dict) else item.get("text")
+            if text:
+                total += estimate_tokens(str(text))
+
+    fc = getattr(msg, "function_call", None)
+    if fc is not None:
+        name = getattr(fc, "name", None) or (fc.get("name") if isinstance(fc, dict) else None)
+        args = getattr(fc, "arguments", None) or (fc.get("arguments") if isinstance(fc, dict) else None)
+        if name:
+            total += estimate_tokens(str(name))
+        if args:
+            total += estimate_tokens(str(args))
+
+    reasoning = getattr(msg, "reasoning_content", None)
+    if reasoning:
+        total += estimate_tokens(str(reasoning))
+
+    return total + overhead
 
 
 def estimate_messages_tokens(messages: List[Message]) -> int:
@@ -121,7 +154,7 @@ def compute_request_timeout(messages: List[Message]) -> int:
 
 def truncate_output(text: str, max_tokens: int) -> str:
     """Truncate text to fit within a token budget."""
-    max_chars = max_tokens * CHARS_PER_TOKEN
+    max_chars = int(max_tokens * CHARS_PER_TOKEN)
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + (

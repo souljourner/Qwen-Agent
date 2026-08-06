@@ -1,5 +1,7 @@
 """Tests for token budget management."""
 
+import json
+
 from qwen_agent.llm.schema import Message
 
 from sandbox_agent.token_budget import (
@@ -14,11 +16,17 @@ from sandbox_agent.token_budget import (
 class TestEstimateTokens:
 
     def test_simple(self):
-        # 20 chars / 4 = 5 tokens
-        assert estimate_tokens("a" * 20) == 5
+        # Real BPE now, not chars/4 — assert plausibility, not a fixed ratio
+        # (repeated chars merge into few tokens; prose lands near chars/4).
+        assert 1 <= estimate_tokens("a" * 20) <= 20
+        prose = "The quick brown fox jumps over the lazy dog. " * 20
+        assert 0.5 <= estimate_tokens(prose) / (len(prose) / 4) <= 2.0
 
     def test_empty(self):
         assert estimate_tokens("") == 0
+
+    def test_monotonic(self):
+        assert estimate_tokens("hello world " * 100) > estimate_tokens("hello world " * 10)
 
 
 class TestTrimToBudget:
@@ -91,6 +99,48 @@ class TestTruncateOutput:
         assert "TRUNCATED" in result
 
     def test_exact_boundary(self):
-        text = "a" * 400  # exactly 100 tokens
+        # Boundary expressed via the calibrated divisor, not a hardcoded 4.0
+        from sandbox_agent.config import CHARS_PER_TOKEN
+        text = "a" * int(100 * CHARS_PER_TOKEN)
         result = truncate_output(text, 100)
-        assert result == text  # Should not truncate
+        assert result == text  # exactly at budget — must not truncate
+
+
+class TestEstimatorAccuracy:
+    """2026-08-05: a live chat reached 281,152 real tokens while the estimator
+    reported 183,684 (1.53x undercount) — the conversation blew past every
+    budget because the ruler was wrong. Two root causes, both fixed here:
+      1. function_call arguments were NEVER counted (51,179 tokens across 131
+         tool calls in that thread — project_write_file passes whole files).
+      2. chars/4 undercounts real content (~207k real vs ~180k estimated)."""
+
+    def test_function_call_arguments_are_counted(self):
+        from qwen_agent.llm.schema import FunctionCall, Message
+        from sandbox_agent.token_budget import estimate_message_tokens
+        big_args = json.dumps({"path": "x.py", "content": "print('hi')\n" * 4000})
+        with_call = Message(role="assistant", content="",
+                            function_call=FunctionCall(name="project_write_file",
+                                                       arguments=big_args))
+        bare = Message(role="assistant", content="")
+        # the arguments must dominate — not be charged as ~10 tokens of overhead
+        assert estimate_message_tokens(with_call) > estimate_message_tokens(bare) + 5_000
+
+    def test_reasoning_content_is_counted(self):
+        from qwen_agent.llm.schema import Message
+        from sandbox_agent.token_budget import estimate_message_tokens
+        m = Message(role="assistant", content="short")
+        m.reasoning_content = "deliberation " * 2000
+        assert estimate_message_tokens(m) > 2_000
+
+    def test_divisor_is_calibrated_not_four(self):
+        # 4.0 undercounted real agent traffic by 1.53x; 3.46 was measured on a
+        # real 419-message thread. Real tokenization is NOT used here: tiktoken
+        # takes 2.2s on 100k repetitive chars and crashes above ~1M.
+        from sandbox_agent.config import CHARS_PER_TOKEN
+        from sandbox_agent.token_budget import estimate_tokens
+        assert 3.0 <= CHARS_PER_TOKEN <= 3.6
+        assert estimate_tokens("x" * 35_000) > 35_000 // 4
+
+    def test_never_raises_on_pathological_input(self):
+        from sandbox_agent.token_budget import estimate_tokens
+        assert estimate_tokens("x" * 2_000_000) > 0  # tokenizers choke here; we must not

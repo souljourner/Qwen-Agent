@@ -44,7 +44,7 @@ def select_tier(messages: List[Message], context_tokens: int = None) -> Tuple[Ti
 
     # Check if truncating tool results alone would be enough
     reducible_chars = _estimate_tool_result_reduction(messages)
-    overflow_chars = overflow * CHARS_PER_TOKEN
+    overflow_chars = int(overflow * CHARS_PER_TOKEN)
     # Need 50% headroom beyond the overflow to be confident truncation alone works
     truncate_threshold = int(overflow_chars * 1.5)
 

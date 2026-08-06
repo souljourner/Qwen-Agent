@@ -100,7 +100,9 @@ SPILLABLE_CONTEXT_TOKENS = int(os.getenv("SPILLABLE_CONTEXT_TOKENS", "200000"))
 SUMMARIZER_CONTEXT_TOKENS = int(os.getenv("SUMMARIZER_CONTEXT_TOKENS", "200000"))
 MAX_TOOL_OUTPUT_TOKENS = int(os.getenv("MAX_TOOL_OUTPUT_TOKENS", "16000"))
 MAX_CODE_OUTPUT_TOKENS = int(os.getenv("MAX_CODE_OUTPUT_TOKENS", "16000"))
-CHARS_PER_TOKEN = 4  # Rough estimate for English/code; conservative for CJK
+CHARS_PER_TOKEN = float(os.getenv("CHARS_PER_TOKEN", "3.5"))  # measured 3.46 on a
+# real 419-message agent thread (718,405 chars -> 207,492 true tokens). Was 4.0,
+# which undercounted a live conversation by 1.53x and let it reach 281k tokens.
 
 # --- Compaction (OpenClaw-style context management) ---
 COMPACTION_ENABLED = os.getenv("COMPACTION_ENABLED", "true").lower() == "true"
