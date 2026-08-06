@@ -124,6 +124,26 @@ COMPACTION_MAX_IDENTIFIERS = 12            # unique identifiers to preserve
 COMPACTION_TIMEOUT = int(os.getenv("COMPACTION_TIMEOUT", "120"))
 # Max tokens for ONE chunk summary / merge. Bounds digest size: an
 # unbounded summarizer can hand back a "summary" as large as its input.
+# --- compactor rebuild (2026-08-06) -------------------------------------
+# Budget ladder, derived per tier in compaction/budget.py. Ordering is an
+# invariant: target < trigger < hard <= max_input_tokens < real window.
+COMPACTION_HARD_RATIO = float(os.getenv("COMPACTION_HARD_RATIO", "0.95"))
+COMPACTION_TRIGGER_RATIO = float(os.getenv("COMPACTION_TRIGGER_RATIO", "0.80"))
+COMPACTION_TARGET_RATIO = float(os.getenv("COMPACTION_TARGET_RATIO", "0.55"))
+# Tool results get an AGGREGATE share of the target (previously each result
+# was capped individually, so 60 results x 40k chars all passed "within cap").
+COMPACTION_TOOL_RESULT_TOTAL_SHARE = float(os.getenv("COMPACTION_TOOL_RESULT_TOTAL_SHARE", "0.45"))
+COMPACTION_PROTECT_LAST_TOOL_RESULTS = int(os.getenv("COMPACTION_PROTECT_LAST_TOOL_RESULTS", "6"))
+COMPACTION_MIN_TAIL_TURNS = int(os.getenv("COMPACTION_MIN_TAIL_TURNS", "2"))
+# Digest caps. DURABLE holds user corrections/decisions/TODOs/errors and is
+# spliced by CODE, never re-sent through the model, so it cannot drift.
+COMPACTION_DIGEST_MAX_TOKENS = int(os.getenv("COMPACTION_DIGEST_MAX_TOKENS", "12000"))
+COMPACTION_DIGEST_DURABLE_MAX_TOKENS = int(os.getenv("COMPACTION_DIGEST_DURABLE_MAX_TOKENS", "8000"))
+# Pointer-ization (L0): replace recoverable bulk with a pointer. Ships OFF —
+# it changes how the model sees its own past actions; A/B before enabling.
+COMPACTION_POINTERS_ENABLED = os.getenv("COMPACTION_POINTERS_ENABLED", "false").lower() == "true"
+POINTER_MIN_CHARS = int(os.getenv("POINTER_MIN_CHARS", "2000"))
+COMPACTION_ARCHIVE_MAX_BYTES = int(os.getenv("COMPACTION_ARCHIVE_MAX_BYTES", str(200 * 1024 * 1024)))
 COMPACTION_CHUNK_MAX_TOKENS = int(os.getenv("COMPACTION_CHUNK_MAX_TOKENS", "4096"))
 COMPACTION_MODEL = os.getenv("COMPACTION_MODEL", "qwen3.6-27b-linux")
 COMPACTION_URL = os.getenv("COMPACTION_URL", "http://192.168.4.66:8000")

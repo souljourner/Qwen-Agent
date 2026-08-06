@@ -112,3 +112,74 @@ class TestSummarizerRequestShape:
         assert captured.get("max_tokens", 0) > 0
         # ...but temperature stays a HOST default (standing instruction).
         assert "temperature" not in captured
+
+
+class TestBudgetOrdering:
+    """target < trigger < hard <= max_input_tokens — so the model's own
+    truncation backstop never fires on healthy compacted output, and can
+    never delete the digest (which sits at position 0)."""
+
+    def test_ordering_invariant(self):
+        from sandbox_agent.compaction.budget import derive_budgets
+        b = derive_budgets(200_000, 160_000)
+        assert b.target < b.trigger <= b.hard <= 160_000
+
+    def test_hard_stays_under_model_input_cap(self):
+        from sandbox_agent.compaction.budget import derive_budgets
+        from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
+        for cfg in (PRIMARY_LLM_CFG, BACKGROUND_LLM_CFG):
+            b = derive_budgets(cfg["context_window_tokens"],
+                               cfg["generate_cfg"]["max_input_tokens"])
+            assert b.hard <= cfg["generate_cfg"]["max_input_tokens"]
+
+    def test_compacted_output_survives_qwen_agent_truncation(self):
+        """The F2 guard: a history at TARGET must pass through qwen_agent's
+        real truncation with the digest intact. Before this ordering fix a
+        170k-target history hit a 160k backstop that deletes oldest-first —
+        and the digest is oldest."""
+        from qwen_agent.llm.base import _truncate_input_messages_roughly
+        from sandbox_agent.compaction.budget import derive_budgets
+        from sandbox_agent.config import PRIMARY_LLM_CFG
+        from sandbox_agent.token_budget import estimate_messages_tokens
+
+        b = derive_budgets(PRIMARY_LLM_CFG["context_window_tokens"],
+                           PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"])
+        digest = Message(role=USER, content="[Context compacted: 400 messages]\n\nDURABLE facts")
+        msgs = [digest]
+        while estimate_messages_tokens(msgs) < b.target:
+            msgs.append(Message(role=USER, content="q " + "x" * 8_000))
+            msgs.append(Message(role=ASSISTANT, content="a " + "y" * 8_000))
+
+        out = _truncate_input_messages_roughly(
+            msgs, max_tokens=PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"])
+        assert any("[Context compacted" in str(m.content) for m in out), \
+            "digest was deleted by the model's own truncation"
+        assert len(out) == len(msgs), "truncation dropped messages at TARGET"
+
+
+class TestAggregateToolBudget:
+
+    def test_many_results_share_one_budget(self):
+        msgs = []
+        for i in range(60):
+            msgs.append(Message(role=ASSISTANT, content="",
+                                function_call=FunctionCall(name="t", arguments="{}")))
+            msgs.append(Message(role=FUNCTION, name="t", content=f"r{i} " + "z" * 40_000))
+        out = compactor.truncate_tool_results(msgs, total_budget_chars=200_000)
+        total = sum(len(str(m.content)) for m in out if m.role == FUNCTION)
+        # old per-result cap let 60x40k = 2.4M chars all pass "within cap"
+        assert total < 600_000, f"aggregate budget not enforced: {total:,} chars"
+
+    def test_newest_results_keep_most(self):
+        msgs = []
+        for i in range(30):
+            msgs.append(Message(role=FUNCTION, name="t", content=f"r{i} " + "z" * 30_000))
+        out = [m for m in compactor.truncate_tool_results(msgs, total_budget_chars=150_000)
+               if m.role == FUNCTION]
+        assert len(str(out[-1].content)) > len(str(out[0].content))
+
+    def test_truncation_is_idempotent(self):
+        msgs = [Message(role=FUNCTION, name="t", content="z" * 300_000)]
+        once = compactor.truncate_tool_results(msgs, total_budget_chars=50_000)
+        twice = compactor.truncate_tool_results(once, total_budget_chars=50_000)
+        assert str(once[0].content) == str(twice[0].content)

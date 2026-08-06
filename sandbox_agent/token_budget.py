@@ -113,9 +113,14 @@ def trim_to_budget(messages: List[Message], max_tokens: int = MAX_CONTEXT_TOKENS
 
     # Insert a note so the model knows context was trimmed
     if dropped_count > 0:
+        # role="user", NOT "system": a second system message makes
+        # qwen_agent's _truncate_input_messages_roughly reject the entire
+        # request (the 2cb762e bug — reachable through this fallback, and
+        # under persisted compaction it would be written to disk).
         note = Message(
-            role="system",
+            role="user",
             content=f"[Note: {dropped_count} earlier messages were trimmed to stay within the {max_tokens}-token context budget. "
+                    f"This is an automated notice, not a message from the user. "
                     f"Older conversation history is no longer available.]",
         )
         rest.insert(0, note)

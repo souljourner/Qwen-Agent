@@ -117,8 +117,16 @@ class TestBuildPrompt:
 
 class TestDetectPartCompletion:
 
-    def test_explicit_part_completion_signal(self, tmp_data_dir):
-        assert _detect_part_completion(_state(), 5, "Saved progress. Status: part-completion") is True
+    def test_bare_part_completion_signal_not_detected(self, tmp_data_dir):
+        # Writing "part-completion" in narrative/run_notes must NOT trigger
+        # part-completion detection — only the fncall_agent budget-exhausted
+        # marker does. This is the bug that caused infinite stage-2 loops.
+        assert _detect_part_completion(_state(), 5, "Saved progress. Status: part-completion") is False
+
+    def test_budget_exhausted_marker_detected(self, tmp_data_dir):
+        # The marker emitted by fncall_agent._wrap_up_after_budget
+        marker = "⚠️ I ran out of tool calls for this run (part-completion). Here's where I am:"
+        assert _detect_part_completion(_state(), 5, marker) is True
 
     def test_tool_call_exhaustion_signal(self, tmp_data_dir):
         assert _detect_part_completion(_state(), 5, "Ran out of tool calls, will continue next run") is True

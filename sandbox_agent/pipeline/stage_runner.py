@@ -403,9 +403,11 @@ def _build_time_budget_block(stage) -> Optional[str]:
         "\n"
         "This budget is cumulative across many part-completion runs, not a single subprocess "
         "call. Each `exec` call still has a hard 600s cap. Size each chunk to fit under that "
-        "with margin, checkpoint progress to disk, and end your response with \"part-completion\" "
-        "when you've spent most of this run's tool-call budget. Do NOT try to finish the entire "
-        "stage in one run."
+        "with margin, checkpoint progress to disk, and let your reply end normally when "
+        "you've spent most of this run's tool-call budget — the system detects budget "
+        "exhaustion automatically via the wrap-up marker and will re-queue the stage. "
+        "Do NOT write a 'part-completion' marker yourself; it would skip evaluation. "
+        "Do NOT try to finish the entire stage in one run."
     )
 
 
@@ -586,15 +588,18 @@ def _check_verdict_skip(state: PipelineState, stage_number: int) -> Optional[str
 
 def _detect_part_completion(state: PipelineState, stage_number: int, result_text: str) -> bool:
     """Detect if a stage ended due to token/tool call exhaustion (part-completion)."""
-    # Check for explicit part-completion signals
+    # Check for the specific budget-exhausted marker emitted by
+    # fncall_agent._wrap_up_after_budget, which prepends
+    # _BUDGET_EXHAUSTED_MARKER ("⚠️ I ran out of tool calls for this run (part-completion)...").
+    # Only match that specific marker to avoid false positives when the agent
+    # merely *mentions* "part-completion" in its narrative (e.g. in a run_note),
+    # which previously caused every stage-2 trading run to skip evaluation
+    # and loop indefinitely.
+    # Also accept the broader "ran out of tool calls" phrasing for robustness.
     lower = result_text.lower()
     if any(signal in lower for signal in [
-        "part-completion",
+        "ran out of tool calls for this run",
         "ran out of tool calls",
-        "token budget",
-        "will continue",
-        "to be continued",
-        "continuing in next",
     ]):
         return True
 

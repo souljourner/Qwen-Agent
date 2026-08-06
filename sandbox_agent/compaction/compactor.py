@@ -23,6 +23,7 @@ from sandbox_agent.config import (
     COMPACTION_SAFETY_MARGIN,
     COMPACTION_TOOL_RESULT_HARD_CAP,
     COMPACTION_TOOL_RESULT_MAX_SHARE,
+    COMPACTION_PROTECT_LAST_TOOL_RESULTS,
     COMPACTION_TOOL_RESULT_MIN_KEEP,
     MAX_CONTEXT_TOKENS,
     COMPACTION_RESERVE_TOKENS,
@@ -30,6 +31,11 @@ from sandbox_agent.config import (
 from sandbox_agent.token_budget import estimate_message_tokens, estimate_messages_tokens
 
 logger = logging.getLogger(__name__)
+
+# Sentinel emitted by _head_tail_truncate ("[... truncated N chars ...]").
+# Re-truncating already-truncated content must be a no-op, or the markers
+# nest on every compaction pass.
+_ALREADY_TRUNCATED = "... truncated "
 
 
 @dataclass
@@ -43,33 +49,65 @@ class MessageSegments:
 # --- Tier 1: Tool result truncation ---
 
 
-def truncate_tool_results(messages: List[Message]) -> List[Message]:
-    """Truncate oversized tool (function) results.
+def truncate_tool_results(messages: List[Message], *,
+                          total_budget_chars: Optional[int] = None,
+                          protect_last_n: int = None) -> List[Message]:
+    """Shrink tool results to fit an AGGREGATE character budget.
 
-    Uses head/tail split to preserve important beginnings and error endings.
-    Never truncates below COMPACTION_TOOL_RESULT_MIN_KEEP chars.
-    """
-    max_chars_per_result = int(MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN * COMPACTION_TOOL_RESULT_MAX_SHARE)
-    hard_cap = COMPACTION_TOOL_RESULT_HARD_CAP
-    limit = min(max_chars_per_result, hard_cap)
-    min_keep = COMPACTION_TOOL_RESULT_MIN_KEEP
+    Previously each result was capped individually at 40k chars, so sixty
+    40k-char results (2.4M chars ~ 685k tokens) were all "within cap" and
+    this tier did nothing useful. Now the budget is shared: newest results
+    keep their space, older ones fall back to COMPACTION_TOOL_RESULT_MIN_KEEP.
+    The newest `protect_last_n` results are never touched — the agent is
+    usually still working with them."""
+    if protect_last_n is None:
+        protect_last_n = COMPACTION_PROTECT_LAST_TOOL_RESULTS
+    if total_budget_chars is None:
+        total_budget_chars = int(MAX_CONTEXT_TOKENS * CHARS_PER_TOKEN
+                                 * COMPACTION_TOOL_RESULT_MAX_SHARE)
 
-    result = []
-    for msg in messages:
-        if msg.role != "function":
-            result.append(msg)
+    fn_idx = [i for i, m in enumerate(messages) if m.role == "function"]
+    if not fn_idx:
+        return messages
+
+    protected = set(fn_idx[-protect_last_n:]) if protect_last_n else set()
+    remaining = total_budget_chars
+    # Reserve nothing for protected results — they are kept whole regardless.
+    keep_len = {}
+    for i in reversed(fn_idx):  # newest first
+        content = messages[i].content
+        n = len(content) if isinstance(content, str) else 0
+        if i in protected:
+            # Exempt from the shared budget (the agent is likely still using
+            # it) but NOT from the per-result hard cap — otherwise a single
+            # huge recent result makes this tier a no-op.
+            keep_len[i] = min(n, COMPACTION_TOOL_RESULT_HARD_CAP)
             continue
-
-        content = msg.content if isinstance(msg.content, str) else str(msg.content)
-        if len(content) <= limit:
-            result.append(msg)
+        if remaining <= 0:
+            keep_len[i] = COMPACTION_TOOL_RESULT_MIN_KEEP
             continue
+        allow = min(n, remaining, COMPACTION_TOOL_RESULT_HARD_CAP)
+        allow = max(allow, COMPACTION_TOOL_RESULT_MIN_KEEP)
+        keep_len[i] = allow
+        remaining -= allow
 
-        truncated = _head_tail_truncate(content, limit, min_keep)
-        new_msg = Message(role=msg.role, content=truncated, name=msg.name, extra=msg.extra)
-        result.append(new_msg)
-
-    return result
+    out = []
+    for i, msg in enumerate(messages):
+        content = msg.content
+        if msg.role != "function" or not isinstance(content, str):
+            out.append(msg)
+            continue
+        limit = keep_len.get(i, len(content))
+        if len(content) <= limit or _ALREADY_TRUNCATED in content:
+            out.append(msg)
+            continue
+        out.append(Message(
+            role=msg.role,
+            content=_head_tail_truncate(content, limit, COMPACTION_TOOL_RESULT_MIN_KEEP),
+            name=msg.name,
+            extra=msg.extra,
+        ))
+    return out
 
 
 def _head_tail_truncate(text: str, budget: int, min_keep: int) -> str:

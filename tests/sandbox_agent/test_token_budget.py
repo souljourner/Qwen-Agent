@@ -73,7 +73,9 @@ class TestTrimToBudget:
         ]
         result = trim_to_budget(msgs, max_tokens=500)
         # Should have a trim note
-        notes = [m for m in result if m.role == "system" and "trimmed" in m.content]
+        # note is role="user" now: a second system message makes qwen_agent
+        # reject the whole request (2cb762e), and this path can be persisted.
+        notes = [m for m in result if m.role == "user" and "trimmed" in m.content]
         assert len(notes) == 1
         assert "earlier messages were trimmed" in notes[0].content
 

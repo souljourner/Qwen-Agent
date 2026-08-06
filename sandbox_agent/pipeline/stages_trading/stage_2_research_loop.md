@@ -4,14 +4,14 @@
 Either **converge on a strategy that performs on pilot data**, or **conclude no such strategy exists in this problem space**. This stage iterates across many runs — each invocation advances the loop by exactly one step.
 
 ## Core rule — one invocation = one step (NOT one iteration)
-You get a single invocation per scheduler tick: you write code, trigger `exec`, see its stdout, and the run ends. You cannot read a backtest's metrics and respond to them in the same run — that's the next invocation's job. So every full iteration (hypothesis → data → features → backtest → decide) takes several invocations, with each one emitting `part-completion` when it finishes its step.
+You get a single invocation per scheduler tick: you write code, trigger `exec`, see its stdout, and the run ends. You cannot read a backtest's metrics and respond to them in the same run — that's the next invocation's job. So every full iteration (hypothesis → data → features → backtest → decide) takes several invocations, with each one ending its reply normally when it finishes its step (do NOT write any part-completion marker — the evaluator runs automatically).
 
 ## How to decide what to do this run
 1. Read `## Loop State` above. It tells you **`next_step`** — that's what you do, nothing else.
 2. Read the **`run_notes`** (last 3) and **`hypothesis_notes`** (all) in Loop State. They record what the previous runs tried, what worked, what seemed off, and (for abandoned hypotheses) generalizable lessons.
 3. Execute that one step. Write a new `run_note` describing what you did, what worked, what seemed off, and your suggestion for the next step.
 4. Append your `run_note` to `strategy/loop_state.json` under `run_notes`. Do NOT manually set `next_step` or `current_phase` — the evaluator writes those back after acceptance.
-5. End your response with `part-completion`.
+5. End your response normally (do NOT write a part-completion marker — the evaluator runs automatically after your reply).
 
 ## The `next_step` state machine
 
