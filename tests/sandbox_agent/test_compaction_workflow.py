@@ -317,3 +317,112 @@ class TestMergeFailureLosesNothing:
         assert not breaker.is_open(), (
             "a failed merge opened the breaker, blocking the chunk "
             "summarization that actually matters for 900s")
+
+
+class TestResume:
+    """Resuming a large thread: the digest must survive the round-trip, and
+    the turn must summarize ONCE, not once transiently + once persisted."""
+
+    def _big(self, tokens=134_000):
+        from sandbox_agent.compaction.digest import make_digest
+        h = [Message(role="system", content="you are an agent")]
+        h.append(make_digest(["- user said: always use HTML email"], "prior work", 174))
+        i = 0
+        while estimate_messages_tokens(h) < tokens:
+            h += [Message(role=USER, content=f"q{i} " + "x " * 900),
+                  Message(role=ASSISTANT, content=f"a{i} " + "y " * 900)]
+            i += 1
+        return h
+
+    def test_digest_survives_the_sidecar_round_trip(self, tmp_path, monkeypatch):
+        import sandbox_agent.chat_history as CH
+        from sandbox_agent.compaction.digest import make_digest, is_digest, parse_sections
+        monkeypatch.setattr(CH, "DATA_DIR", str(tmp_path))
+
+        d = make_digest(["- user said: always use HTML email"], "state", 174)
+        CH.save_history("t", [d, Message(role=USER, content="hi")])
+        back = CH.load_history("t")
+
+        assert back and is_digest(back[0])
+        # marker, not just the content sentinel — counters must survive too
+        assert back[0].extra["compaction"]["kind"] == "digest"
+        assert back[0].extra["compaction"]["summarized"] == 174
+        assert parse_sections(str(back[0].content))[0] == ["- user said: always use HTML email"]
+
+    def test_trim_never_drops_the_digest(self):
+        """trim_to_budget protected only role=="system"; the digest is
+        role=="user" at position 0, so it was the FIRST thing dropped —
+        the agent kept recent chatter and lost its entire summarized past."""
+        from sandbox_agent.token_budget import trim_to_budget
+        from sandbox_agent.compaction.digest import is_digest
+
+        out = trim_to_budget(self._big(60_000), max_tokens=15_000)
+        assert any(is_digest(m) for m in out), "digest dropped by trim"
+        assert any(m.role == "system" for m in out)
+        assert estimate_messages_tokens(out) <= 15_000
+
+    def test_start_of_turn_does_not_summarize(self, monkeypatch):
+        """Asserts the real CALL SITE in main.create_agent, not just that
+        maybe_compact honours the flag — passing allow_llm=True there must
+        fail this test."""
+        import sandbox_agent.compaction as comp
+        import sandbox_agent.main as m
+        from sandbox_agent.config import PRIMARY_LLM_CFG
+
+        seen = []                      # a list: the mid-run call follows the
+        real = comp.maybe_compact      # entry call and would clobber a dict
+
+        def spy(messages, **kw):
+            before = len(t.calls)
+            try:
+                return real(messages, **kw)
+            finally:
+                seen.append({**kw, "http_calls": len(t.calls) - before})
+
+        t = _Transport(_always_works).install(monkeypatch)
+        monkeypatch.setattr(comp, "maybe_compact", spy)
+
+        agent = m.create_agent("sys", llm_cfg=PRIMARY_LLM_CFG)
+        gen = agent._run(self._big())
+        try:
+            next(gen)          # entry compaction runs before the first yield
+        except Exception:
+            pass               # the LLM call itself is not under test
+        finally:
+            gen.close()
+
+        assert seen, "entry compaction never invoked maybe_compact"
+        entry = seen[0]                # first call is the start-of-turn one
+        assert entry.get("pinned_head", 0) == 0, "not the entry call"
+        assert entry.get("allow_llm") is False, (
+            f"start-of-turn call site passed allow_llm={entry.get('allow_llm')} — "
+            "it summarizes a throwaway copy, duplicating end-of-turn work")
+        # Scoped to the ENTRY call: mid-run compaction summarizing later in
+        # the same turn is correct (test_midrun_may_still_summarize).
+        assert entry["http_calls"] == 0, (
+            f"start-of-turn compaction made {entry['http_calls']} summarizer "
+            "calls on a copy that is discarded at the end of the turn")
+
+    def test_midrun_may_still_summarize(self, monkeypatch):
+        """Inside the tool loop there is no end-of-turn backstop."""
+        from sandbox_agent.compaction import compact_midrun
+        t = _Transport(_always_works).install(monkeypatch)
+        compact_midrun(self._big(), context_tokens=200_000)
+        assert t.calls, "mid-run compaction can no longer summarize"
+
+    def test_resumed_turn_summarizes_once_not_twice(self, monkeypatch):
+        """The whole point: entry + end-of-turn used to each pay ~2 minutes."""
+        from sandbox_agent.compaction import maybe_compact
+        from sandbox_agent.compaction.budget import derive_budgets
+        t = _Transport(_always_works).install(monkeypatch)
+        history = self._big()
+
+        maybe_compact(history, context_tokens=200_000, allow_llm=False)
+        entry_calls = len(t.calls)
+
+        b = derive_budgets(200_000, 160_000)
+        compact_for_persistence(history, target_tokens=b.target)
+        persist_calls = len(t.calls) - entry_calls
+
+        assert entry_calls == 0, f"entry path made {entry_calls} summarizer calls"
+        assert persist_calls > 0, "end-of-turn path did not summarize"

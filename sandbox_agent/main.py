@@ -186,7 +186,12 @@ def create_agent(system_message: str, llm_cfg: dict, name: str = "SandboxAgent")
     def _compacting_run(messages, **kwargs):
         from sandbox_agent import cancellation
         from sandbox_agent.compaction import maybe_compact
-        messages = maybe_compact(messages, context_tokens=_cfg_ctx)
+        # allow_llm=False: this copy is THROWAWAY (the agent deep-copies
+        # per run), so summarizing here would duplicate the end-of-turn
+        # persisted compaction and discard the result. Deterministic
+        # tiers only; _persist_compaction does the one real summarize.
+        messages = maybe_compact(messages, context_tokens=_cfg_ctx,
+                                 allow_llm=False)
         # cancellation.guard raises RunCancelled at each yield point if this
         # run (see cancellation.begin_run) has been cancelled — between tool
         # calls and between streamed chunks. A tool call wedged inside a

@@ -92,16 +92,26 @@ def trim_to_budget(messages: List[Message], max_tokens: int = MAX_CONTEXT_TOKENS
 
     logger.info(f"Token budget exceeded: ~{total} tokens > {max_tokens} limit. Trimming old turns.")
 
-    # Separate system message from the rest
+    # Separate the pinned head (system messages + the compaction digest) from
+    # the rest. The digest MUST be pinned: it is role="user" at position 0, so
+    # an oldest-first drop would delete the entire summarized past FIRST and
+    # keep recent chatter — the agent then "silently forgets and hallucinates
+    # the earlier messages". This is the same failure budget.py documents for
+    # qwen_agent's own truncation, and it was live in our own trim too.
+    from sandbox_agent.compaction.digest import is_digest
     system_msgs = []
+    digest_msgs = []
     rest = []
     for msg in messages:
         if msg.role == "system":
             system_msgs.append(msg)
+        elif is_digest(msg):
+            digest_msgs.append(msg)
         else:
             rest.append(msg)
 
-    system_tokens = estimate_messages_tokens(system_msgs)
+    pinned = system_msgs + digest_msgs
+    system_tokens = estimate_messages_tokens(pinned)
     budget_for_rest = max_tokens - system_tokens
 
     # Drop oldest messages from rest until we fit
@@ -125,7 +135,7 @@ def trim_to_budget(messages: List[Message], max_tokens: int = MAX_CONTEXT_TOKENS
         )
         rest.insert(0, note)
 
-    trimmed = system_msgs + rest
+    trimmed = pinned + rest
     new_total = estimate_messages_tokens(trimmed)
     logger.info(f"Trimmed to ~{new_total} tokens ({len(messages)} -> {len(trimmed)} messages, {dropped_count} dropped)")
     return trimmed

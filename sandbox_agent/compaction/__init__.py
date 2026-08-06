@@ -48,12 +48,20 @@ def _notify(payload: dict) -> None:
 
 
 def maybe_compact(messages: List[Message], pinned_head: int = 0,
-                  context_tokens: Optional[int] = None) -> List[Message]:
+                  context_tokens: Optional[int] = None,
+                  allow_llm: bool = True) -> List[Message]:
     """Compact messages if they exceed the token budget.
 
     `pinned_head` leading messages pass through VERBATIM (but still count
     toward the budget) — mid-run callers pin the system prompt + task message
     so summarization can never eat the agent's instructions.
+
+    `allow_llm=False` runs only the deterministic tiers. The start-of-turn
+    caller uses it because its result is a THROWAWAY copy — summarizing there
+    duplicates the end-of-turn persisted compaction (~2 extra minutes per
+    turn) and produces a second, different digest that is then discarded.
+    Mid-run callers keep allow_llm=True: they have no end-of-turn backstop,
+    so a tool loop that overflows mid-turn must be able to summarize.
 
     Returns the original list unchanged if compaction is disabled or
     unnecessary. All failures are non-fatal — falls back to trimming on error.
@@ -104,14 +112,20 @@ def maybe_compact(messages: List[Message], pinned_head: int = 0,
                             f"{len(head) + len(tail_result)} messages")
                 return head + tail_result
             # Not enough — escalate to tier 2
-            logger.info("Tier 1 insufficient, escalating to summarization")
-            tail_result = _summarize_with_notice(tail_result, est_tokens)
+            if allow_llm:
+                logger.info("Tier 1 insufficient, escalating to summarization")
+                tail_result = _summarize_with_notice(tail_result, est_tokens)
+            else:
+                logger.info("Tier 1 insufficient; deferring summarization to "
+                            "end-of-turn persisted compaction")
 
         elif tier == "compact":
-            tail_result = _summarize_with_notice(tail, est_tokens)
+            tail_result = (_summarize_with_notice(tail, est_tokens) if allow_llm
+                           else truncate_tool_results(tail))
 
         elif tier == "compact_and_truncate":
-            tail_result = _summarize_with_notice(tail, est_tokens)
+            tail_result = (_summarize_with_notice(tail, est_tokens) if allow_llm
+                           else tail)
             tail_result = truncate_tool_results(tail_result)
 
         else:
@@ -178,4 +192,6 @@ def compact_midrun(messages: List[Message],
             break
     if head_end < len(messages) and messages[head_end].role == "user":
         head_end += 1
-    return maybe_compact(messages, pinned_head=head_end, context_tokens=context_tokens)
+    # allow_llm=True: there is no end-of-turn backstop inside the loop.
+    return maybe_compact(messages, pinned_head=head_end,
+                         context_tokens=context_tokens, allow_llm=True)
