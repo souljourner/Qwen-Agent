@@ -368,6 +368,11 @@ class LockingAgent(Assistant):
             for response in agent.run(*args, **kwargs):
                 _stream_tap(response, f"chat: {user_preview}")
                 yield response
+        except Exception:
+            # Feed the tier breaker from chat too, so an outage is detected
+            # whichever kind of traffic hits it first.
+            model_health.record_failure(tier)
+            raise
         finally:
             set_current_preview(None)
             release_slot()
@@ -380,6 +385,7 @@ class LockingAgent(Assistant):
         # issue and replace a 27B answer with a 397B answer of unknown quality.
         # Surface the retry visibly so the user/agent sees what happened.
         has_content = _response_has_assistant_content(response)
+        model_health.record_success(tier) if has_content else model_health.record_failure(tier)
 
         if not has_content:
             logger.warning(f"Empty completion from {model_name} for: {user_preview}")
@@ -422,6 +428,7 @@ class LockingAgent(Assistant):
                 # propagate up — that would lose conversation state in
                 # web_ui.py's history extension. Yield a visible error and
                 # continue cleanly.
+                model_health.record_failure(retry_tier)
                 logger.exception(f"Retry on {retry_model} raised")
                 log_event("silent_failure_retry", detail=f"{retry_model}: {type(e).__name__}: {str(e)[:200]}", model=retry_model)
                 err = Message(
@@ -435,6 +442,10 @@ class LockingAgent(Assistant):
                 model_done(retry_model)
 
             # If retry came back but also empty, surface that visibly too.
+            if _response_has_assistant_content(response):
+                model_health.record_success(retry_tier)
+            else:
+                model_health.record_failure(retry_tier)
             if not _response_has_assistant_content(response):
                 logger.error(f"Both models returned empty content for: {user_preview}")
                 log_event("silent_failure_both", detail="Both models returned empty response")
@@ -471,7 +482,13 @@ class LockingAgent(Assistant):
         tier, release_slot = grant
         agent = self._inner if tier == "primary" else self._backup
         try:
-            return agent.run_nonstream(*args, **kwargs)
+            result = agent.run_nonstream(*args, **kwargs)
+        except Exception:
+            model_health.record_failure(tier)
+            raise
+        else:
+            model_health.record_success(tier)
+            return result
         finally:
             release_slot()
 

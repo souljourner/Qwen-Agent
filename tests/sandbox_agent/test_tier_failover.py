@@ -178,3 +178,92 @@ class TestHealthAwareAcquisition:
         grant = m._acquire_turn_slot(blocking=False, only="primary")
         assert grant is not None and grant[0] == "primary"
         grant[1]()
+
+
+class TestChatFeedsTheBreaker:
+    """Chat already failed over on its own, but reported nothing to the
+    breaker — so an outage was detected ONLY by background work. If a tier
+    died while you were chatting with nothing running in the background, chat
+    kept trying the dead tier first, every turn."""
+
+    class _Fake:
+        def __init__(self, name, boom=None, replies=("hi",)):
+            self.name, self.boom, self.replies, self.calls = name, boom, replies, 0
+            self.llm = type("L", (), {"generate_cfg": {}})()
+
+        def run(self, *a, **k):
+            self.calls += 1
+            if self.boom:
+                raise self.boom
+            for r in self.replies:
+                yield [Message(role="assistant", content=r)]
+
+        def run_nonstream(self, *a, **k):
+            self.calls += 1
+            if self.boom:
+                raise self.boom
+            return [Message(role="assistant", content=self.replies[0])]
+
+    def _drain(self, gen):
+        try:
+            for _ in gen:
+                pass
+        except Exception:
+            raise
+
+    def test_streaming_failure_marks_the_tier(self):
+        agent = m.LockingAgent(self._Fake("p", boom=ConnectionError("down")),
+                               self._Fake("s"))
+        for _ in range(2):
+            with pytest.raises(ConnectionError):
+                self._drain(agent.run(messages=[Message(role="user", content="hi")]))
+        assert not model_health.is_healthy("primary")
+
+    def test_empty_completion_marks_the_tier(self):
+        agent = m.LockingAgent(self._Fake("p", replies=("",)), self._Fake("s"))
+        for _ in range(2):
+            self._drain(agent.run(messages=[Message(role="user", content="hi")]))
+        assert not model_health.is_healthy("primary")
+
+    def test_healthy_chat_keeps_the_tier_open(self):
+        agent = m.LockingAgent(self._Fake("p"), self._Fake("s"))
+        self._drain(agent.run(messages=[Message(role="user", content="hi")]))
+        assert model_health.is_healthy("primary")
+
+    def test_successful_retry_marks_the_other_tier_healthy(self):
+        model_health.record_failure("secondary")
+        agent = m.LockingAgent(self._Fake("p", replies=("",)), self._Fake("s"))
+        self._drain(agent.run(messages=[Message(role="user", content="hi")]))
+        assert model_health.is_healthy("secondary")
+
+    def test_nonstream_failure_marks_the_tier(self):
+        agent = m.LockingAgent(self._Fake("p", boom=ConnectionError("down")),
+                               self._Fake("s"))
+        for _ in range(2):
+            with pytest.raises(ConnectionError):
+                agent.run_nonstream(messages=[Message(role="user", content="hi")])
+        assert not model_health.is_healthy("primary")
+
+    def test_chat_outage_reroutes_background_work(self, tiers):
+        """The point of sharing one breaker: chat discovering the outage
+        spares the next cron run from rediscovering it."""
+        calls, _ = tiers
+        # Hold every primary slot so chat SPILLS to the (dead) secondary —
+        # otherwise the healthy primary serves the turn and nothing is learnt.
+        held = [m._acquire_turn_slot(blocking=False, only="primary")
+                for _ in range(PRIMARY_MODEL_CONCURRENCY)]
+        assert all(h is not None for h in held)
+        chat = m.LockingAgent(self._Fake("p"), self._Fake("s", boom=ConnectionError("down")))
+        try:
+            for _ in range(2):
+                with pytest.raises(ConnectionError):
+                    self._drain(chat.run(messages=[Message(role="user", content="hi")]))
+        finally:
+            for _, rel in held:
+                rel()
+        assert not model_health.is_healthy("secondary")
+
+        calls.clear()
+        m.run_on_best_available("sys", MSGS)   # prefers secondary by default
+        assert calls[0] == "primary", (
+            f"background work still hit the tier chat found dead: {calls}")
