@@ -205,6 +205,102 @@ def _harden_sqlite_engine(engine) -> None:
             cur.close()
 
 
+class _SandboxDataLayer(SQLAlchemyDataLayer):
+    """SQLAlchemyDataLayer with thread deletion that actually finishes the job.
+
+    Chainlit's DELETE /project/thread is a plain HTTP endpoint: it removes the
+    row and returns, never touching the websocket session. So after deleting
+    the thread you are CURRENTLY viewing:
+
+      * `session.thread_id` still points at the deleted thread, and
+        `has_first_interaction` is still True — so `init_thread()` (the only
+        place that sets a thread's name and userId) never fires again;
+      * the next message calls create_step -> update_thread(thread_id) with no
+        name and no user_id, which re-inserts the row with **userId NULL**;
+      * list_threads filters on `WHERE "userId" = :user_id OR "id" = :thread_id`,
+        so a NULL-userId thread can NEVER appear in the sidebar.
+
+    Observed live 2026-08-06: 9 such orphaned threads, the newest holding 13
+    steps of a real conversation that was invisible in the UI.
+
+    Two further leaks, both of which mean "delete" did not delete: the
+    in-session agent history stayed in memory, and the agent-side sidecar
+    stayed on disk — so the apparently-fresh chat still carried the full
+    context of the conversation the user had just deleted.
+    """
+
+    async def delete_thread(self, thread_id: str):
+        await super().delete_thread(thread_id)
+        _reset_sessions_on_thread(thread_id)
+        _delete_history_sidecar(thread_id)
+
+    async def update_thread(self, thread_id: str, name=None, user_id=None,
+                            metadata=None, tags=None):
+        """Backstop: never let a thread row be created without an owner.
+
+        create_step() calls update_thread(thread_id) with no user_id. If the
+        row does not exist that INSERTs an ownerless, permanently invisible
+        thread. Filling the owner from the live session makes that impossible
+        regardless of how we got here.
+        """
+        if user_id is None:
+            user_id = _current_user_id()
+        return await super().update_thread(thread_id, name=name, user_id=user_id,
+                                           metadata=metadata, tags=tags)
+
+
+def _current_user_id():
+    """PersistedUser.id for the active session, or None outside a context."""
+    try:
+        from chainlit.context import context
+        user = getattr(getattr(context, "session", None), "user", None)
+        return getattr(user, "id", None)
+    except Exception:  # noqa: BLE001 — no context (HTTP/background); caller copes
+        return None
+
+
+def _reset_sessions_on_thread(thread_id: str) -> None:
+    """Give any live session viewing `thread_id` a genuinely fresh thread.
+
+    Without this the UI looks like a new chat while the session still writes
+    into the deleted thread id.
+    """
+    import uuid
+    try:
+        from chainlit.session import ws_sessions_id
+        from chainlit.user_session import user_sessions
+    except Exception:  # noqa: BLE001
+        return
+    for session in list(ws_sessions_id.values()):
+        if getattr(session, "thread_id", None) != thread_id:
+            continue
+        session.thread_id = str(uuid.uuid4())
+        session.thread_id_to_resume = None
+        # False so the next message runs init_thread() again, which is what
+        # stamps name + userId onto the new row.
+        session.has_first_interaction = False
+        # Drop the agent-side history: the deleted conversation must not keep
+        # feeding the model through an apparently-new chat.
+        store = user_sessions.get(session.id)
+        if isinstance(store, dict):
+            for key in ("history", "_frozen_metadata"):
+                store.pop(key, None)
+        logger.info("Thread %s deleted — session %s reset to fresh thread %s",
+                    thread_id, session.id, session.thread_id)
+
+
+def _delete_history_sidecar(thread_id: str) -> None:
+    """Remove the agent-side history file; deleting a chat must delete it."""
+    try:
+        from sandbox_agent.chat_history import _path
+        path = _path(thread_id)
+        if os.path.exists(path):
+            os.remove(path)
+            logger.info("Removed agent history sidecar for deleted thread %s", thread_id)
+    except Exception:  # noqa: BLE001 — never fail a delete over cleanup
+        logger.exception("Could not remove sidecar for deleted thread %s", thread_id)
+
+
 def make_data_layer() -> SQLAlchemyDataLayer:
     conninfo = resolve_conninfo()
     _ensure_sqlite_schema(conninfo)
@@ -212,7 +308,7 @@ def make_data_layer() -> SQLAlchemyDataLayer:
     # display_doc) so they survive a reload — without it Chainlit drops elements
     # entirely. LocalFsStorageClient stores them under DATA_DIR/.cl_elements.
     from sandbox_agent.chat_storage import LocalFsStorageClient
-    dl = SQLAlchemyDataLayer(conninfo=conninfo, storage_provider=LocalFsStorageClient())
+    dl = _SandboxDataLayer(conninfo=conninfo, storage_provider=LocalFsStorageClient())
     # Harden the SQLite connection pool against write-lock contention (the cause
     # of the QueuePool-exhaustion + streaming-lag). No-op for non-SQLite backends.
     if _sqlite_path_from_conninfo(conninfo):
