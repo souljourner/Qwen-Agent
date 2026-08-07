@@ -47,6 +47,14 @@ PRIMARY_LLM_CFG = {
 PRIMARY_MODEL_CONCURRENCY = int(os.getenv("PRIMARY_MODEL_CONCURRENCY", "2"))
 SECONDARY_MODEL_CONCURRENCY = int(os.getenv("SECONDARY_MODEL_CONCURRENCY", "10"))
 
+# Per-tier health breaker. Turn slots are local counters with no idea whether
+# the model behind them is up, so a dead tier keeps handing out slots and every
+# caller pays a full timeout to discover it. After this many consecutive
+# failures a tier stops being PREFERRED for the cooldown; it is still used when
+# it is the only tier with capacity, and for pinned turns. See model_health.py.
+MODEL_HEALTH_THRESHOLD = int(os.getenv("MODEL_HEALTH_THRESHOLD", "2"))
+MODEL_HEALTH_COOLDOWN = int(os.getenv("MODEL_HEALTH_COOLDOWN", "300"))
+
 # SECONDARY/overflow tier: qwen3.6-27b-linux on vLLM — hosts background work
 # (cron/heartbeat/pipeline prefer it), chat spillover, and all bulk/unslotted
 # traffic (llm_bridge, llm_call/llm_batch, compaction, digests).

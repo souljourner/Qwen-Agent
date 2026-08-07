@@ -40,6 +40,7 @@ from sandbox_agent.daily_digest import add_digest_entry, cleanup_old_digests
 from sandbox_agent.heartbeat.heartbeat_runner import HeartbeatRunner
 from sandbox_agent.scheduler.task_queue import TaskQueue
 from sandbox_agent.token_budget import compute_request_timeout, estimate_messages_tokens, trim_to_budget
+from sandbox_agent import model_health
 
 # Import tools to trigger @register_tool decorators
 import sandbox_agent.tools.api_tools  # noqa: F401
@@ -85,7 +86,17 @@ def _acquire_turn_slot(blocking: bool, prefer: str = "primary",
         if prefer == "secondary":
             order.reverse()
         if only:
+            # Pinned turns bypass health entirely: pinning is a correctness
+            # constraint (the history only fits there), health is a hint.
             order = [(t, s) for t, s in order if t == only]
+        elif len(order) > 1:
+            # Health-aware ORDERING only — an unhealthy tier stays in the list
+            # and is still used when the healthy one has no free slot. If every
+            # tier is unhealthy, healthy_subset returns all of them so we never
+            # refuse to route.
+            from sandbox_agent.model_health import healthy_subset
+            ok = set(healthy_subset([t for t, _ in order]))
+            order.sort(key=lambda item: item[0] not in ok)
         for tier, sem in order:
             if sem.acquire(blocking=False):
                 released = [False]
@@ -562,68 +573,105 @@ def _summarize_task_result(task_name: str, result_text: str, tool_calls: List[di
         return result_text[:500] if result_text else "Completed"
 
 
-def run_on_best_available(system_message: str, messages: List[Message], task_label: str = "background task") -> List[Message]:
-    """Run a background agent session on a tier slot.
+def _has_assistant_content(response) -> bool:
+    return any(
+        msg.role == "assistant" and msg.content and str(msg.content).strip()
+        for msg in response
+    ) if response else False
 
-    Background work PREFERS the secondary tier (qwen3.6-27b-linux, 10 slots):
-    a long cron task must not eat one of chat's 2 primary slots. It spills
-    INTO the primary tier only when all secondary slots are busy, and blocks
-    when all 12 slots are held.
-    """
-    timeout = compute_request_timeout(messages)
 
-    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="secondary")
+def _run_on_tier(tier: str, system_message: str, messages: List[Message],
+                 timeout: int, task_label: str) -> List[Message]:
+    """One attempt on one tier. Caller owns the slot; this owns the status."""
     tier_cfg = BACKGROUND_LLM_CFG if tier == "secondary" else PRIMARY_LLM_CFG
+    logger.info(f"Background task using {tier} tier ({tier_cfg['model']}, timeout={timeout}s)")
+    set_state(model_in_use=tier_cfg["model"])
+    set_agent_status(status="background", current_task=task_label)
+    log_event("model_select", detail=f"{tier} (background)", model=tier_cfg["model"])
+    model_start(tier_cfg["model"], task_label)
     try:
-        logger.info(f"Background task using {tier} tier ({tier_cfg['model']}, timeout={timeout}s)")
-        set_state(model_in_use=tier_cfg["model"])
-        set_agent_status(status="background", current_task=task_label)
-        log_event("model_select", detail=f"{tier} (background)", model=tier_cfg["model"])
-        model_start(tier_cfg["model"], task_label)
         agent = create_agent(system_message, llm_cfg=tier_cfg)
         agent.llm.generate_cfg["request_timeout"] = timeout
-        # Compact context before running (handled by _compacting_run patch in create_agent,
-        # but also compact the outer messages list for accurate timeout computation)
+        # Compact for THIS tier's window (see _compacting_run in create_agent;
+        # this outer pass also makes the timeout computation accurate).
         from sandbox_agent.compaction import maybe_compact
-        messages = maybe_compact(messages, context_tokens=tier_cfg.get("context_window_tokens"))
+        msgs = maybe_compact(messages, context_tokens=tier_cfg.get("context_window_tokens"))
         response: List[Message] = []
-        for response in agent.run(messages=messages):
+        for response in agent.run(messages=msgs):
             _stream_tap(response, task_label)
-
-        # Detect silent LLM failure — retry once with a fresh agent
-        has_content = any(
-            msg.role == "assistant" and msg.content and str(msg.content).strip()
-            for msg in response
-        ) if response else False
-
-        if not has_content:
-            logger.warning(f"Silent LLM failure in background task: {task_label} — retrying")
-            log_event("silent_failure", detail=f"Empty response for: {task_label}", model=tier_cfg["model"])
-            model_done(tier_cfg["model"])
-
-            # Retry with a fresh agent instance (same tier — slot still held)
-            model_start(tier_cfg["model"], f"Retry: {task_label}")
-            retry_agent = create_agent(system_message, llm_cfg=tier_cfg)
-            retry_agent.llm.generate_cfg["request_timeout"] = timeout
-            response = []
-            for response in retry_agent.run(messages=messages):
-                _stream_tap(response, f"retry: {task_label}")
-
-            has_content_retry = any(
-                msg.role == "assistant" and msg.content and str(msg.content).strip()
-                for msg in response
-            ) if response else False
-
-            if not has_content_retry:
-                logger.error(f"Silent LLM failure on retry for background task: {task_label}")
-                log_event("silent_failure_retry", detail=f"Retry also empty for: {task_label}", model=tier_cfg["model"])
-
         return response
     finally:
         set_current_preview(None)
         model_done(tier_cfg["model"])
         clear_agent_status()
+
+
+def run_on_best_available(system_message: str, messages: List[Message], task_label: str = "background task") -> List[Message]:
+    """Run a background agent session on a tier slot, failing over across tiers.
+
+    Background work PREFERS the secondary tier (qwen3.6-27b-linux, 10 slots):
+    a long cron task must not eat one of chat's 2 primary slots. It spills
+    INTO the primary tier only when all secondary slots are busy, and blocks
+    when all 12 slots are held.
+
+    FAILOVER: if the attempt raises (model down, connection refused, timeout)
+    or returns nothing, it retries once on the OTHER tier. Slot acquisition is
+    a local semaphore with no health awareness, so it will happily hand out a
+    slot for a model that is down; without this, a single dead tier failed
+    every cron run, heartbeat, pipeline stage and evaluation while the other
+    tier sat idle. Pipeline stages have limited attempts, so an outage could
+    burn a strategy's attempts and reject it for infrastructure reasons.
+
+    The chat path (LockingAgent) and llm_call (llm_client._resolve_chain)
+    both already failed over; this function was the only one that did not,
+    and it is the one that runs all unattended work.
+
+    If the preferred tier is full the retry may legitimately land on the same
+    model again — slot caps are never exceeded.
+    """
+    timeout = compute_request_timeout(messages)
+
+    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="secondary")
+    first_failure = None
+    try:
+        response = _run_on_tier(tier, system_message, messages, timeout, task_label)
+        if _has_assistant_content(response):
+            model_health.record_success(tier)
+            return response
+        model_health.record_failure(tier)
+        first_failure = "empty response"
+        log_event("silent_failure", detail=f"Empty response for: {task_label}",
+                  model=(BACKGROUND_LLM_CFG if tier == "secondary" else PRIMARY_LLM_CFG)["model"])
+    except Exception as e:  # noqa: BLE001 — any failure is worth a cross-tier retry
+        model_health.record_failure(tier)
+        first_failure = f"{type(e).__name__}: {e}"
+        logger.warning("Background task %s failed on %s tier (%s) — retrying on the other tier",
+                       task_label, tier, first_failure)
+    finally:
         release_slot()
+
+    other = "primary" if tier == "secondary" else "secondary"
+    logger.warning("Retrying background task %s on the %s tier after: %s",
+                   task_label, other, first_failure)
+    retry_tier, retry_release = _acquire_turn_slot(blocking=True, prefer=other)
+    try:
+        try:
+            response = _run_on_tier(retry_tier, system_message, messages, timeout,
+                                    f"retry: {task_label}")
+        except Exception:
+            model_health.record_failure(retry_tier)
+            raise
+        if _has_assistant_content(response):
+            model_health.record_success(retry_tier)
+        else:
+            model_health.record_failure(retry_tier)
+            logger.error("Background task %s produced nothing on both %s and %s tiers",
+                         task_label, tier, retry_tier)
+            log_event("silent_failure_retry",
+                      detail=f"Retry also empty for: {task_label} ({tier} -> {retry_tier})")
+        return response
+    finally:
+        retry_release()
 
 
 def _run_cron_task(task, system_message: str, task_queue: TaskQueue, events_before: int) -> None:
