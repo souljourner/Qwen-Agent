@@ -5,7 +5,7 @@ before a human noticed; a request_user item (the agent asking for SMTP creds)
 sat unread for three weeks. This module scans the durable signals — the
 activity log, pending user requests, exhausted tasks — and when something
 crosses a threshold it (a) emails the user directly (code path, no LLM
-judgment in the trigger) and (b) hands the items to the heartbeat so
+judgment in the trigger) and (b) hands the items to the hourly heartbeat so
 the agent investigates. Alerts are fingerprint-deduped so a persistent
 condition nags at most once per HEALTH_ALERT_MIN_INTERVAL_S.
 """
@@ -149,7 +149,7 @@ def run_health_check(window_hours: float = 24, data_dir: str = None) -> List[str
 
     body = ("The sandbox agent's health check found:\n\n"
             + "\n".join(f"- {a}" for a in fresh)
-            + "\n\nThe heartbeat has been asked to investigate; check the "
+            + "\n\nThe hourly heartbeat has been asked to investigate; check the "
               "dashboard (`/status`) and `list_tasks` / `view_requests` for detail.")
     sent_ok = False
     try:

@@ -175,9 +175,7 @@ PROJECT_VENV_ENABLED = os.getenv("PROJECT_VENV_ENABLED", "true").lower() == "tru
 UV_BIN = os.getenv("UV_BIN", "uv")
 
 TOOLS_API_BASE = os.getenv("TOOLS_API_BASE", "http://localhost:8080")
-HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "1200"))  # 20 min
-# NOTE: docker/docker-compose.yml sets this env var explicitly, so it wins
-# over this default. Change BOTH or the container keeps the old cadence.
+HEARTBEAT_INTERVAL_SECONDS = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "3600"))  # 1 hour
 DATA_DIR = os.getenv("DATA_DIR", os.path.join(os.path.dirname(__file__), "data"))
 
 
