@@ -267,3 +267,28 @@ class TestChatFeedsTheBreaker:
         m.run_on_best_available("sys", MSGS)   # prefers secondary by default
         assert calls[0] == "primary", (
             f"background work still hit the tier chat found dead: {calls}")
+
+
+class TestHeartbeatCadence:
+    """The interval is set in TWO places: config.py's default and the
+    docker-compose env var, which OVERRIDES it. Changing only the default
+    leaves the container on the old cadence."""
+
+    def test_default_is_twenty_minutes(self):
+        from sandbox_agent.config import HEARTBEAT_INTERVAL_SECONDS
+        assert HEARTBEAT_INTERVAL_SECONDS == 1200
+
+    def test_compose_env_matches_the_default(self):
+        import os
+        import re
+        from sandbox_agent.config import HEARTBEAT_INTERVAL_SECONDS
+        compose = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__)))),
+            "sandbox_agent", "docker", "docker-compose.yml")
+        text = open(compose).read()
+        found = re.search(r"HEARTBEAT_INTERVAL_SECONDS=(\d+)", text)
+        assert found, "compose no longer pins the interval"
+        assert int(found.group(1)) == HEARTBEAT_INTERVAL_SECONDS, (
+            f"compose pins {found.group(1)}s but config defaults to "
+            f"{HEARTBEAT_INTERVAL_SECONDS}s — the container wins, so the "
+            "config change would have no effect")

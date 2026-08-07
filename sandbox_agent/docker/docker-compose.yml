@@ -23,7 +23,7 @@ services:
       - TOOLS_API_BASE=http://host.docker.internal:8080
       - VLLM_BASE=http://192.168.4.66:8000/v1
       - DATA_DIR=/app/data
-      - HEARTBEAT_INTERVAL_SECONDS=3600
+      - HEARTBEAT_INTERVAL_SECONDS=1200
       - QWEN_AGENT_DEFAULT_WORKSPACE=/app/data/workspace
       - GRADIO_SERVER_TIMEOUT=3600
       - TZ=America/Los_Angeles
