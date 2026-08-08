@@ -64,39 +64,39 @@ class TestFailover:
 
     def test_hard_failure_retries_on_the_other_tier(self, tiers):
         calls, behavior = tiers
-        behavior["secondary"] = ConnectionError("linux model is down")
+        behavior["primary"] = ConnectionError("mac model is down")
         out = m.run_on_best_available("sys", MSGS)
-        assert calls == ["secondary", "primary"], f"tiers tried: {calls}"
+        assert calls == ["primary", "secondary"], f"tiers tried: {calls}"
         assert out == _reply()
 
     def test_hard_failure_no_longer_propagates(self, tiers):
         """Previously this raised and failed the cron/pipeline task outright."""
         _, behavior = tiers
-        behavior["secondary"] = ConnectionError("down")
+        behavior["primary"] = ConnectionError("down")
         m.run_on_best_available("sys", MSGS)  # must not raise
 
     def test_empty_response_retries_on_the_other_tier(self, tiers):
         calls, behavior = tiers
-        behavior["secondary"] = []
+        behavior["primary"] = []
         m.run_on_best_available("sys", MSGS)
-        assert calls == ["secondary", "primary"], (
+        assert calls == ["primary", "secondary"], (
             "silent-failure retry re-used the dead tier")
 
     def test_both_tiers_down_raises_rather_than_hanging(self, tiers):
         _, behavior = tiers
-        behavior["secondary"] = ConnectionError("down")
-        behavior["primary"] = ConnectionError("also down")
+        behavior["primary"] = ConnectionError("down")
+        behavior["secondary"] = ConnectionError("also down")
         with pytest.raises(ConnectionError):
             m.run_on_best_available("sys", MSGS)
 
     def test_healthy_run_does_not_retry(self, tiers):
         calls, _ = tiers
         m.run_on_best_available("sys", MSGS)
-        assert calls == ["secondary"], "retried a successful run"
+        assert calls == ["primary"], "retried a successful run"
 
     def test_slots_are_released_after_failover(self, tiers):
         _, behavior = tiers
-        behavior["secondary"] = ConnectionError("down")
+        behavior["primary"] = ConnectionError("down")
         m.run_on_best_available("sys", MSGS)
         grants = [m._acquire_turn_slot(blocking=False)
                   for _ in range(PRIMARY_MODEL_CONCURRENCY + SECONDARY_MODEL_CONCURRENCY)]
@@ -109,31 +109,31 @@ class TestHealthAwareAcquisition:
 
     def test_failures_mark_a_tier_unhealthy(self, tiers):
         _, behavior = tiers
-        behavior["secondary"] = ConnectionError("down")
+        behavior["primary"] = ConnectionError("down")
         for _ in range(2):
             m.run_on_best_available("sys", MSGS)
-        assert not model_health.is_healthy("secondary")
-        assert model_health.is_healthy("primary")
+        assert not model_health.is_healthy("primary")
+        assert model_health.is_healthy("secondary")
 
     def test_unhealthy_tier_is_no_longer_tried_first(self, tiers):
         calls, behavior = tiers
-        behavior["secondary"] = ConnectionError("down")
+        behavior["primary"] = ConnectionError("down")
         for _ in range(2):
             m.run_on_best_available("sys", MSGS)
         calls.clear()
         m.run_on_best_available("sys", MSGS)
-        assert calls[0] == "primary", (
+        assert calls[0] == "secondary", (
             f"still tried the known-dead tier first: {calls}")
 
     def test_success_reopens_the_tier(self, tiers):
         _, behavior = tiers
-        behavior["secondary"] = ConnectionError("down")
+        behavior["primary"] = ConnectionError("down")
         for _ in range(2):
             m.run_on_best_available("sys", MSGS)
-        assert not model_health.is_healthy("secondary")
-        behavior["secondary"] = _reply()
-        model_health.record_success("secondary")
-        assert model_health.is_healthy("secondary")
+        assert not model_health.is_healthy("primary")
+        behavior["primary"] = _reply()
+        model_health.record_success("primary")
+        assert model_health.is_healthy("primary")
 
     def test_cooldown_expiry_lets_it_be_probed_again(self, monkeypatch):
         clock = {"t": 1000.0}
@@ -246,24 +246,22 @@ class TestChatFeedsTheBreaker:
 
     def test_chat_outage_reroutes_background_work(self, tiers):
         """The point of sharing one breaker: chat discovering the outage
-        spares the next cron run from rediscovering it."""
+        spares the next cron run from rediscovering it.
+
+        Both chat and background now PREFER the primary, so the dead tier
+        must be the primary — otherwise background would route to its
+        preferred tier anyway and the test would pass without the breaker
+        doing anything.
+        """
         calls, _ = tiers
-        # Hold every primary slot so chat SPILLS to the (dead) secondary —
-        # otherwise the healthy primary serves the turn and nothing is learnt.
-        held = [m._acquire_turn_slot(blocking=False, only="primary")
-                for _ in range(PRIMARY_MODEL_CONCURRENCY)]
-        assert all(h is not None for h in held)
-        chat = m.LockingAgent(self._Fake("p"), self._Fake("s", boom=ConnectionError("down")))
-        try:
-            for _ in range(2):
-                with pytest.raises(ConnectionError):
-                    self._drain(chat.run(messages=[Message(role="user", content="hi")]))
-        finally:
-            for _, rel in held:
-                rel()
-        assert not model_health.is_healthy("secondary")
+        chat = m.LockingAgent(self._Fake("p", boom=ConnectionError("down")),
+                              self._Fake("s"))
+        for _ in range(2):
+            with pytest.raises(ConnectionError):
+                self._drain(chat.run(messages=[Message(role="user", content="hi")]))
+        assert not model_health.is_healthy("primary")
 
         calls.clear()
-        m.run_on_best_available("sys", MSGS)   # prefers secondary by default
-        assert calls[0] == "primary", (
+        m.run_on_best_available("sys", MSGS)   # prefers primary by default
+        assert calls[0] == "secondary", (
             f"background work still hit the tier chat found dead: {calls}")

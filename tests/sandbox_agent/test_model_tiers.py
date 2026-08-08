@@ -2,9 +2,10 @@
 qwen3.6-27b-linux secondary/overflow (10 turn slots).
 
 Selection is per-TURN: a slot is held for the whole streamed turn. Chat
-prefers primary and spills to secondary; background work prefers secondary
-and spills INTO primary only when all 10 secondary slots are busy; when every
-slot is busy, callers wait (no more ungated pile-on).
+prefers primary and spills to secondary. Background work ALSO prefers primary
+(changed 2026-08-08 — unattended work gets the better model) and spills to
+secondary when the 2 primary slots are full; when every slot is busy, callers
+wait (no more ungated pile-on).
 
 Both tiers run qwen3.6-27b and both are multimodal, so there is deliberately
 NO vision pin — image turns route like any other turn."""
@@ -22,6 +23,18 @@ from sandbox_agent.config import (PRIMARY_MODEL_CONCURRENCY,
                                   SECONDARY_MODEL_CONCURRENCY)
 
 TOTAL_SLOTS = PRIMARY_MODEL_CONCURRENCY + SECONDARY_MODEL_CONCURRENCY
+
+
+@pytest.fixture(autouse=True)
+def _clean_health():
+    """model_health is process-global and reorders tiers. Without this, a
+    leaked unhealthy tier from another test silently flips the routing these
+    tests assert on — test_background_prefers_* passed in the full suite and
+    failed in isolation for exactly that reason."""
+    from sandbox_agent import model_health
+    model_health.reset()
+    yield
+    model_health.reset()
 
 
 @pytest.fixture
@@ -178,7 +191,7 @@ class TestLockingAgentRouting:
 
 class TestRunOnBestAvailable:
 
-    def test_background_prefers_secondary(self, fresh_locks, monkeypatch):
+    def test_background_prefers_primary(self, fresh_locks, monkeypatch):
         used_cfgs = []
 
         def fake_create_agent(system_message, llm_cfg=None):
@@ -191,14 +204,14 @@ class TestRunOnBestAvailable:
         monkeypatch.setattr(m, "model_done", lambda model: done.append(model))
         m.run_on_best_available("sys", [Message(role="user", content="task")],
                                 task_label="test-task")
-        from sandbox_agent.config import BACKGROUND_LLM_CFG
-        assert used_cfgs == [BACKGROUND_LLM_CFG["model"]]
-        assert done == [BACKGROUND_LLM_CFG["model"]]
+        from sandbox_agent.config import PRIMARY_LLM_CFG
+        assert used_cfgs == [PRIMARY_LLM_CFG["model"]]
+        assert done == [PRIMARY_LLM_CFG["model"]]
 
-    def test_background_spills_into_primary_when_secondary_full(self, fresh_locks, monkeypatch):
-        _, secondary = fresh_locks
-        for _ in range(10):
-            secondary.acquire(blocking=False)
+    def test_background_spills_into_secondary_when_primary_full(self, fresh_locks, monkeypatch):
+        primary, _ = fresh_locks
+        for _ in range(PRIMARY_MODEL_CONCURRENCY):
+            primary.acquire(blocking=False)
         used_cfgs = []
 
         def fake_create_agent(system_message, llm_cfg=None):
@@ -210,10 +223,10 @@ class TestRunOnBestAvailable:
         monkeypatch.setattr(m, "model_done", lambda *a, **k: None)
         m.run_on_best_available("sys", [Message(role="user", content="task")],
                                 task_label="test-task")
-        from sandbox_agent.config import PRIMARY_LLM_CFG
-        assert used_cfgs == [PRIMARY_LLM_CFG["model"]]
-        for _ in range(10):
-            secondary.release()
+        from sandbox_agent.config import BACKGROUND_LLM_CFG
+        assert used_cfgs == [BACKGROUND_LLM_CFG["model"]]
+        for _ in range(PRIMARY_MODEL_CONCURRENCY):
+            primary.release()
 
 
 class TestConfigAndBridge:

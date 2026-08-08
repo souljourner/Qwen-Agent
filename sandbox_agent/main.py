@@ -59,12 +59,12 @@ import sandbox_agent.tools.session_search_tools  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-# Concurrency gate for the primary vLLM model. The 27b-linux primary supports
-# `PRIMARY_MODEL_CONCURRENCY` simultaneous requests, so we use a BoundedSemaphore
-# rather than a Mutex: up to N callers (any mix of user chats and background
-# tasks) can hold a slot at once. When all slots are taken, user chat falls
-# through to the 397B backup (LockingAgent.run uses acquire(blocking=False));
-# background tasks block until a slot frees up (run_on_best_available uses
+# Concurrency gate per tier. Each tier sustains a fixed number of simultaneous
+# requests, so these are BoundedSemaphores rather than Mutexes: up to N callers
+# (any mix of user chats and background tasks) hold a slot at once. Both chat
+# and background work now PREFER the primary (Mac) tier; chat falls through
+# non-blocking to the secondary (LockingAgent.run uses acquire(blocking=False))
+# while background work blocks for a slot (run_on_best_available uses
 # acquire(blocking=True)). BoundedSemaphore is preferred over plain Semaphore
 # so an over-release (release without a matching acquire) raises immediately.
 _primary_model_lock = BoundedSemaphore(PRIMARY_MODEL_CONCURRENCY)
@@ -626,10 +626,17 @@ def _run_on_tier(tier: str, system_message: str, messages: List[Message],
 def run_on_best_available(system_message: str, messages: List[Message], task_label: str = "background task") -> List[Message]:
     """Run a background agent session on a tier slot, failing over across tiers.
 
-    Background work PREFERS the secondary tier (qwen3.6-27b-linux, 10 slots):
-    a long cron task must not eat one of chat's 2 primary slots. It spills
-    INTO the primary tier only when all secondary slots are busy, and blocks
-    when all 12 slots are held.
+    Background work PREFERS the primary tier (qwen3.6-27b on the Mac), and
+    spills to the secondary (qwen3.6-27b-linux, 10 slots) when the primary's
+    2 slots are full. It blocks when all 12 are held.
+
+    This is a deliberate reversal (2026-08-08). It previously preferred the
+    secondary so a long cron task could not eat one of chat's 2 primary
+    slots. The tradeoff now runs the other way: unattended work gets the
+    better-behaved Mac model, and chat — which prefers the primary but falls
+    back non-blocking — spills to the secondary when background work holds
+    those slots. Chat therefore still always has somewhere to go; what it
+    loses is the guarantee of getting the Mac.
 
     FAILOVER: if the attempt raises (model down, connection refused, timeout)
     or returns nothing, it retries once on the OTHER tier. Slot acquisition is
@@ -648,7 +655,7 @@ def run_on_best_available(system_message: str, messages: List[Message], task_lab
     """
     timeout = compute_request_timeout(messages)
 
-    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="secondary")
+    tier, release_slot = _acquire_turn_slot(blocking=True, prefer="primary")
     first_failure = None
     try:
         response = _run_on_tier(tier, system_message, messages, timeout, task_label)
