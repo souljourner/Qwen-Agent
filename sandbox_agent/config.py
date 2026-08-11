@@ -1,28 +1,33 @@
 import os
 from pathlib import Path
 
-# PRIMARY tier: qwen3.6-27b on the Mac (MLX-served via the proxy) — the
-# chat-priority model, max 2 concurrent turns (must match the server's real
-# concurrency). Chat turns prefer this tier and spill to the secondary
+# PRIMARY tier: inkling-small (served via the proxy) — the chat-priority
+# model, max 2 concurrent turns (must match the server's real concurrency).
+# Verified 2026-08-10 against the live proxy: text, native tool calls, and
+# IMAGES (an earlier probe got "multimodal input not yet enabled on
+# inkling-server"; it was enabled before this switch landed). Both tiers are
+# multimodal, so there is still no vision routing pin. Chat turns prefer this tier and spill to the secondary
 # (qwen3.6-27b-linux) when its slots are full; background work prefers the
 # secondary and spills INTO this tier only when all 10 secondary slots are
 # busy. See main.py `_acquire_turn_slot`.
 
 PRIMARY_LLM_CFG = {
-    "model": os.getenv("PRIMARY_MODEL", "qwen3.6-27b"),
+    "model": os.getenv("PRIMARY_MODEL", "inkling-small"),
     "model_server": os.getenv("VLLM_BASE", "http://192.168.4.66:8000/v1"),
     "api_key": "EMPTY",
-    # Same 200k window as the secondary tier — both tiers are qwen3.6-27b,
-    # one on the Mac and one on Linux.
-    "context_window_tokens": int(os.getenv("PRIMARY_CONTEXT_TOKENS", "200000")),
+    # 512k window. The secondary is still 200k, so a history above
+    # SPILLABLE_CONTEXT_TOKENS is PINNED here — it cannot fit the other tier.
+    "context_window_tokens": int(os.getenv("PRIMARY_CONTEXT_TOKENS", "512000")),
     "generate_cfg": {
         # Hard backstop, NOT the primary mechanism (compaction is): if the
         # compactor misses, qwen-agent roughly truncates instead of vLLM
         # 400-ing (real ceiling 262144-65536=196608; the char estimators
         # undercounted by ~16% in the 2026-07-15 incident, hence the margin).
         # KV-cache churn from truncation is acceptable in that failure mode.
-        # 160k backstop, same as the secondary tier.
-        "max_input_tokens": 160000,
+        # Truncation backstop, kept ABOVE compaction's hard budget (456k) and
+        # BELOW the real 512k window, so it only ever fires if compaction
+        # failed outright. See compaction/budget.py for the ordering rule.
+        "max_input_tokens": 480000,
         "request_timeout": 1800,       # rescaled per turn by compute_request_timeout
         # No temperature: the host's per-model default applies (each backend
         # knows its own model's recommended sampling better than we do).
@@ -90,13 +95,23 @@ MAX_CONTEXT_TOKENS = int(os.getenv("MAX_CONTEXT_TOKENS", "200000"))
 # matches the secondary. Env-overridable, but raise it ONLY on measured
 # evidence of clean recall at the larger size — a previous tier was budgeted
 # on a vendor's claimed window and confabulated badly well below it.
-PRIMARY_CONTEXT_TOKENS = int(os.getenv("PRIMARY_CONTEXT_TOKENS", "200000"))
+PRIMARY_CONTEXT_TOKENS = int(os.getenv("PRIMARY_CONTEXT_TOKENS", "512000"))
+# Start compacting at 80% of the primary's REAL window ("20% less than the
+# full context"). Expressed against the window, not against `hard` — the
+# default chain would land at ~76%, which is nobody's intent. See
+# compaction/budget.py:derive_budgets.
+PRIMARY_COMPACTION_TRIGGER_FRACTION = float(
+    os.getenv("PRIMARY_COMPACTION_TRIGGER_FRACTION", "0.80"))
 # Pinning threshold: a history too large for the SECONDARY tier gets pinned to
 # the primary. With both windows equal this can never fire (compaction caps
 # every history at budget = window - reserve), which is the intent: no
 # conversation should be trapped on one tier by size. It re-activates
 # automatically if PRIMARY_CONTEXT_TOKENS is ever raised on evidence.
-SPILLABLE_CONTEXT_TOKENS = int(os.getenv("SPILLABLE_CONTEXT_TOKENS", "200000"))
+# Pinning threshold: a history bigger than the SECONDARY tier can hold gets
+# pinned to the primary. Set to the secondary's own hard budget (152k) — above
+# that, the smaller tier would truncate oldest-first and destroy the digest.
+# Now that the tiers have different windows this fires for real.
+SPILLABLE_CONTEXT_TOKENS = int(os.getenv("SPILLABLE_CONTEXT_TOKENS", "152000"))
 # The compaction summarizer window — CHUNK SIZING pins to this, never to a
 # raised history budget (oversized chunks would overflow the summarizer).
 SUMMARIZER_CONTEXT_TOKENS = int(os.getenv("SUMMARIZER_CONTEXT_TOKENS", "200000"))

@@ -1060,15 +1060,32 @@ def _get_turn_lock() -> asyncio.Lock:
 
 
 def _compaction_budgets():
-    """Thresholds for the tier that will serve the NEXT turn. That tier is
-    unknown here, so use the tighter of the two — a history that fits the
-    smaller one fits either."""
-    from sandbox_agent.compaction.budget import derive_budgets
-    from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
-    both = [derive_budgets(c["context_window_tokens"],
-                           c["generate_cfg"]["max_input_tokens"])
-            for c in (PRIMARY_LLM_CFG, BACKGROUND_LLM_CFG)]
-    return min(both, key=lambda b: b.target)
+    """Thresholds for the tier that will serve the NEXT turn.
+
+    TRIGGER comes from the primary tier: compaction starts at 80% of its real
+    window (PRIMARY_COMPACTION_TRIGGER_FRACTION), so the larger window is
+    usable rather than capped at the smaller tier's threshold.
+
+    TARGET deliberately does NOT scale with the window. Scaling it too would
+    leave ~250k tokens in context after every compaction — a floor re-sent on
+    every subsequent turn, minutes of prefill each. The bigger window buys
+    HEADROOM, not a permanently larger prompt.
+
+    Correctness comes from pinning: a history above SPILLABLE_CONTEXT_TOKENS
+    (the secondary's hard budget) is routed to the primary and never offered
+    to the smaller tier — see `_acquire_turn_slot(only=...)` in main.py.
+    """
+    from sandbox_agent.compaction.budget import Budgets, derive_budgets
+    from sandbox_agent.config import (BACKGROUND_LLM_CFG,
+                                      PRIMARY_COMPACTION_TRIGGER_FRACTION,
+                                      PRIMARY_LLM_CFG)
+    primary = derive_budgets(PRIMARY_LLM_CFG["context_window_tokens"],
+                             PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"],
+                             PRIMARY_COMPACTION_TRIGGER_FRACTION)
+    secondary = derive_budgets(BACKGROUND_LLM_CFG["context_window_tokens"],
+                               BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"])
+    return Budgets(hard=primary.hard, trigger=primary.trigger,
+                   target=min(primary.target, secondary.target))
 
 
 def _persist_compaction(thread_id, history) -> None:

@@ -39,11 +39,18 @@ class Budgets:
             f"trigger={self.trigger} hard={self.hard}")
 
 
-def derive_budgets(context_tokens: int = None, max_input_tokens: int = None) -> Budgets:
+def derive_budgets(context_tokens: int = None, max_input_tokens: int = None,
+                   trigger_fraction_of_context: float = None) -> Budgets:
     """Thresholds for a tier, clamped under its real input ceiling.
 
     `max_input_tokens` is the model cfg's truncation backstop; the ceiling is
     whichever of (window - reserve) and that backstop binds first.
+
+    `trigger_fraction_of_context` expresses "start compacting at N% of the
+    real window" directly, instead of the default chain (a fraction of
+    `hard`, which is itself a fraction of the ceiling — ~76% of the window,
+    not a round number anyone asked for). Clamped to `hard` so the ordering
+    invariant cannot be violated by a careless fraction.
     """
     ctx = context_tokens or MAX_CONTEXT_TOKENS
     ceiling = ctx - COMPACTION_RESERVE_TOKENS
@@ -51,8 +58,13 @@ def derive_budgets(context_tokens: int = None, max_input_tokens: int = None) -> 
         ceiling = min(ceiling, max_input_tokens)
     ceiling = max(ceiling, 20_000)  # degenerate configs still get a sane floor
     hard = int(ceiling * COMPACTION_HARD_RATIO)
-    return Budgets(
-        hard=hard,
-        trigger=int(hard * COMPACTION_TRIGGER_RATIO),
-        target=int(hard * COMPACTION_TARGET_RATIO),
-    )
+    if trigger_fraction_of_context:
+        trigger = min(int(ctx * trigger_fraction_of_context), hard)
+    else:
+        trigger = int(hard * COMPACTION_TRIGGER_RATIO)
+    target = int(hard * COMPACTION_TARGET_RATIO)
+    if target >= trigger:
+        # Keep hysteresis meaningful when the trigger is pulled down by the
+        # clamp above: compacting to ~the trigger would re-fire immediately.
+        target = int(trigger * 0.65)
+    return Budgets(hard=hard, trigger=trigger, target=target)

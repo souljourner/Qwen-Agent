@@ -1,4 +1,4 @@
-"""Tests for tiered model concurrency: qwen3.6-27b primary on the Mac (2 turn slots),
+"""Tests for tiered model concurrency: inkling-small primary (2 turn slots),
 qwen3.6-27b-linux secondary/overflow (10 turn slots).
 
 Selection is per-TURN: a slot is held for the whole streamed turn. Chat
@@ -235,7 +235,7 @@ class TestConfigAndBridge:
         from sandbox_agent.config import (BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG,
                                           PRIMARY_MODEL_CONCURRENCY,
                                           SECONDARY_MODEL_CONCURRENCY)
-        assert PRIMARY_LLM_CFG["model"] == "qwen3.6-27b"
+        assert PRIMARY_LLM_CFG["model"] == "inkling-small"
         assert BACKGROUND_LLM_CFG["model"] == "qwen3.6-27b-linux"
         assert PRIMARY_MODEL_CONCURRENCY == 2
         assert SECONDARY_MODEL_CONCURRENCY == 10
@@ -246,7 +246,7 @@ class TestConfigAndBridge:
         models = [c[0] for c in chain]
         # bulk/unslotted traffic belongs on the high-concurrency tier
         assert models[0] == "qwen3.6-27b-linux"
-        assert models[1] == "qwen3.6-27b"
+        assert models[1] == "inkling-small"
 
 
 class TestOnlyTierAcquisition:

@@ -148,17 +148,20 @@ def test_llm_cfg_backstop():
     from sandbox_agent.config import (BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG,
                                       PRIMARY_CONTEXT_TOKENS,
                                       SPILLABLE_CONTEXT_TOKENS)
-    # Both tiers budgeted equally at 200k/160k. A vendor-claimed larger window is
-    # UNVALIDATED (128x YaRN off an 8k base, 36/48 sliding-window-512 layers,
-    # no published long-context eval); measured clean at 85k, confabulating
-    # at 275k-281k live on 2026-08-05. Raising these requires evidence.
-    assert PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"] == 160_000
-    assert BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"] == 160_000
-    assert PRIMARY_LLM_CFG["context_window_tokens"] == 200_000
+    # The tiers now have DIFFERENT windows: inkling-small at 512k, the
+    # secondary still 200k. Each tier's max_input_tokens is the truncation
+    # backstop and must sit under its own real window.
+    assert PRIMARY_LLM_CFG["context_window_tokens"] == 512_000
+    assert PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"] == 480_000
     assert BACKGROUND_LLM_CFG["context_window_tokens"] == 200_000
-    # Size-based pinning must be unreachable: compaction caps every history
-    # at budget (170k) < threshold, so no conversation gets trapped on a tier.
-    assert SPILLABLE_CONTEXT_TOKENS >= PRIMARY_CONTEXT_TOKENS
+    assert BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"] == 160_000
+    for cfg in (PRIMARY_LLM_CFG, BACKGROUND_LLM_CFG):
+        assert cfg["generate_cfg"]["max_input_tokens"] < cfg["context_window_tokens"]
+    # Size-based pinning is now REACHABLE and load-bearing: a history above
+    # the secondary's hard budget must stay on the primary, because the
+    # smaller tier would truncate oldest-first and destroy the digest.
+    assert SPILLABLE_CONTEXT_TOKENS < PRIMARY_CONTEXT_TOKENS
+    assert SPILLABLE_CONTEXT_TOKENS <= BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"]
 
 
 class TestPerTierBudgets:

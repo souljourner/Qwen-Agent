@@ -364,8 +364,22 @@ class TestPersistedCompaction:
     once per overflow. Durability is chat.db's job (Chainlit persists every
     step during the turn), so there is no private archive to gate on."""
 
-    def _history(self, n=40):
-        return [m for i in range(n) for m in _turn(i, tool_chars=20_000, args_chars=8_000)]
+    def _history(self, n=None):
+        """Sized from the LIVE trigger, not a magic turn count — these tests
+        exist to prove compaction fires, and a hardcoded size silently stops
+        exceeding the threshold the moment the budget changes (it did when the
+        primary window moved to 512k: the history no longer reached the
+        trigger, so nothing compacted and the tests failed)."""
+        from sandbox_agent.chat_app import _compaction_budgets
+        from sandbox_agent.token_budget import estimate_messages_tokens
+        target = int(_compaction_budgets().trigger * 1.3)
+        history, i = [], 0
+        while estimate_messages_tokens(history) < target:
+            history += _turn(i, tool_chars=20_000, args_chars=8_000)
+            i += 1
+            if n is not None and i >= n:
+                break
+        return history
 
     def test_compacts_in_place(self, tmp_path, monkeypatch):
         import sandbox_agent.chat_app as ca
@@ -425,13 +439,31 @@ class TestPersistedCompaction:
         ca._persist_compaction("thr", history)
         assert len(history) == 2
 
-    def test_budgets_use_the_tighter_tier(self):
+    def test_trigger_follows_the_primary_window(self):
+        """Compaction starts at 80% of the primary's real window, so the
+        larger window is usable instead of capped at the smaller tier."""
         import sandbox_agent.chat_app as ca
-        from sandbox_agent.config import BACKGROUND_LLM_CFG, PRIMARY_LLM_CFG
+        from sandbox_agent.config import (PRIMARY_COMPACTION_TRIGGER_FRACTION,
+                                          PRIMARY_LLM_CFG)
         b = ca._compaction_budgets()
-        cap = min(PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"],
-                  BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"])
-        assert b.target < b.trigger <= b.hard <= cap
+        expected = int(PRIMARY_LLM_CFG["context_window_tokens"]
+                       * PRIMARY_COMPACTION_TRIGGER_FRACTION)
+        assert b.trigger == expected
+        assert b.target < b.trigger <= b.hard
+        assert b.hard <= PRIMARY_LLM_CFG["generate_cfg"]["max_input_tokens"]
+
+    def test_target_does_not_scale_with_the_window(self):
+        """The bigger window buys HEADROOM, not a bigger steady-state prompt.
+        Scaling the target too would leave ~250k tokens in context after every
+        compaction — re-sent on every following turn, minutes of prefill each.
+        """
+        import sandbox_agent.chat_app as ca
+        from sandbox_agent.compaction.budget import derive_budgets
+        from sandbox_agent.config import BACKGROUND_LLM_CFG
+        secondary = derive_budgets(
+            BACKGROUND_LLM_CFG["context_window_tokens"],
+            BACKGROUND_LLM_CFG["generate_cfg"]["max_input_tokens"])
+        assert ca._compaction_budgets().target <= secondary.target
 
 
 class TestSummarizerResilience:
